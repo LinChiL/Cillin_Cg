@@ -1,0 +1,17 @@
+[package]
+name = "cillin_engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+winit = "0.29"
+wgpu = { version = "0.19", features = ["webgl"] }
+anyhow = "1.0"
+pollster = "0.3"
+env_logger = "0.10"
+log = "0.4"
+tokio = { version = "1.0", features = ["full"] }
+gltf = "1.4"
+image = "0.24"
+glam = "0.24"
+bytemuck = { version = "1.13", features = ["derive"] }
