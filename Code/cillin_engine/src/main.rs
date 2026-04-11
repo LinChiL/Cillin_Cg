@@ -160,6 +160,8 @@ struct State<'a> {
     entity_list_buffer: wgpu::Buffer,
     params_buffer: wgpu::Buffer,
     palette_buffer: wgpu::Buffer,
+    compute_bind_group_layout: wgpu::BindGroupLayout,
+    blit_bind_group_layout: wgpu::BindGroupLayout,
     compute_bind_group: wgpu::BindGroup,
     blit_bind_group: wgpu::BindGroup,
     compute_pipeline: wgpu::ComputePipeline,
@@ -739,6 +741,8 @@ impl<'a> State<'a> {
             entity_list_buffer,
             params_buffer,
             palette_buffer,
+            compute_bind_group_layout,
+            blit_bind_group_layout,
             compute_bind_group,
             blit_bind_group,
             compute_pipeline,
@@ -754,6 +758,52 @@ impl<'a> State<'a> {
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
             self.render_context.resize(new_size);
+            
+            // 更新输出纹理
+            let device = &self.render_context.device;
+            
+            // 创建新的输出纹理
+            let new_output_texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Output Texture"),
+                size: wgpu::Extent3d {
+                    width: new_size.width,
+                    height: new_size.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let new_output_texture_view = new_output_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            
+            // 更新绑定组
+            let new_compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &self.compute_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&new_output_texture_view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: self.entity_list_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.global_sdf_view) },
+                    wgpu::BindGroupEntry { binding: 4, resource: self.params_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: self.palette_buffer.as_entire_binding() },
+                ],
+                label: Some("Compute Bind Group"),
+            });
+            
+            let new_blit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &self.blit_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&new_output_texture_view) },
+                ],
+                label: Some("Blit Bind Group"),
+            });
+            
+            // 更新状态
+            self.output_texture = new_output_texture;
+            self.compute_bind_group = new_compute_bind_group;
+            self.blit_bind_group = new_blit_bind_group;
         }
     }
 
@@ -913,7 +963,7 @@ impl<'a> State<'a> {
                             println!("调试模式已切换为: {}", mode);
                         }
                     } else {
-                        println!("用法: debug <0|1|2> (0:关, 1:距离场, 2:坐标映射)");
+                        println!("用法: debug <0|1|2|3|4> (0:关, 1:距离场(红正绿负), 2:坐标映射, 3:法线, 4:原始颜色)");
                     }
                 }
                 _ => println!("未知命令: {}", cmd),
@@ -941,7 +991,7 @@ impl<'a> State<'a> {
             45.0f32.to_radians(), 
             self.render_context.size.width as f32 / self.render_context.size.height as f32, 
             0.1, 
-            100.0
+            1000.0
         );
         
         // 更新相机缓冲区

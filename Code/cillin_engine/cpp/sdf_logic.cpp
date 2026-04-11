@@ -1,4 +1,4 @@
-﻿#include "sdf_logic.hpp"
+﻿﻿#include "sdf_logic.hpp"
 #include "cillin_engine/src/lib.rs.h" // 必须包含这个！cxx 会自动生成它
 
 float point_to_triangle_dist_sq(Vec3 p, Vec3 a, Vec3 b, Vec3 c) {

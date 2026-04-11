@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+    <title>CPAL_S</title>
+    <style>
+        /* 极简重置：只展示颜色网格 + 右下角无干扰滑条 */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            user-select: none; /* 避免拖拽干扰，但滑条本身可正常操作 */
+        }
+
+        body {
+            background: #000000;
+            min-height: 100vh;
+            position: relative;
+        }
+
+        /* 颜色网格容器：flex 自动换行 */
+        .color-grid {
+            display: flex;
+            flex-wrap: wrap;
+            width: 100%;
+            max-width: 100vw;
+            margin: 0;
+            padding: 0;
+            line-height: 0;
+        }
+
+        /* 每个色块：保持正方形，宽度由JavaScript动态设置 */
+        .color-cell {
+            aspect-ratio: 1 / 1;
+            background-color: #000;
+            flex-shrink: 0;
+            flex-grow: 0;
+            transition: background-color 0.05s linear;
+        }
+
+        /* 悬浮小效果 */
+        .color-cell:hover {
+            transform: scale(1.02);
+            z-index: 2;
+            box-shadow: 0 0 0 2px rgba(255,255,255,0.7), 0 0 0 4px rgba(0,0,0,0.4);
+            border-radius: 4px;
+            transition: transform 0.08s ease, box-shadow 0.1s ease;
+        }
+
+        /* 右下角浮动滑条容器 */
+        .slider-panel {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: rgba(30, 30, 40, 0.75);
+            backdrop-filter: blur(8px);
+            border-radius: 32px;
+            padding: 12px 20px;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            z-index: 999;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+            border: 1px solid rgba(255,255,255,0.2);
+            font-family: system-ui, 'Segoe UI', 'Helvetica Neue', monospace;
+        }
+
+        /* 滑条样式 */
+        input[type="range"] {
+            width: 200px;
+            height: 4px;
+            -webkit-appearance: none;
+            background: rgba(255,255,255,0.5);
+            border-radius: 4px;
+            outline: none;
+            cursor: pointer;
+        }
+
+        input[type="range"]:focus {
+            outline: none;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: white;
+            border: none;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+            cursor: pointer;
+            transition: 0.1s;
+        }
+
+        input[type="range"]::-webkit-slider-thumb:hover {
+            transform: scale(1.2);
+            background: #f0f0f0;
+        }
+
+        /* 数值标签 */
+        .multiplier-value {
+            color: white;
+            font-weight: 600;
+            font-size: 1rem;
+            background: rgba(0,0,0,0.5);
+            padding: 4px 10px;
+            border-radius: 40px;
+            letter-spacing: 0.5px;
+            font-family: monospace;
+            min-width: 70px;
+            text-align: center;
+            backdrop-filter: blur(4px);
+        }
+
+        /* 响应式 */
+        @media (max-width: 640px) {
+            .slider-panel {
+                padding: 8px 14px;
+                gap: 12px;
+                bottom: 12px;
+                right: 12px;
+            }
+            input[type="range"] {
+                width: 140px;
+            }
+            .multiplier-value {
+                font-size: 0.85rem;
+                min-width: 55px;
+            }
+        }
+
+        /* 保证网格滚动时滑条固定不遮挡操作区域 */
+        html, body {
+            overflow-x: hidden;
+            overflow-y: auto;
+        }
+        .color-grid {
+            padding-bottom: 200px; /* 为多个滑条留出空间 */
+        }
+    </style>
+</head>
+<body>
+<div class="color-grid" id="colorGrid"></div>
+<div id="colorInfo" style="position: fixed; bottom: 20px; left: 20px; background: rgba(30, 30, 40, 0.75); backdrop-filter: blur(8px); border-radius: 32px; padding: 12px 20px; color: white; font-family: system-ui, 'Segoe UI', 'Helvetica Neue', monospace; font-size: 1rem; z-index: 999; box-shadow: 0 4px 15px rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.2);">色块数量: 0</div>
+
+<!-- 饱和度步进级别调整滑条 -->
+<div class="slider-panel" style="bottom: 20px;">
+    <input type="range" id="saturationStepsSlider" min="1" max="32" step="1" value="32">
+    <div class="multiplier-value" id="saturationStepsDisplay">32级</div>
+</div>
+
+<!-- 每行色块数量调整滑条 -->
+<div class="slider-panel" style="bottom: 80px;">
+    <input type="range" id="columnsSlider" min="16" max="64" step="1" value="32">
+    <div class="multiplier-value" id="columnsDisplay">32</div>
+</div>
+
+<!-- 色相步进级别调整滑条 -->
+<div class="slider-panel" style="bottom: 140px;">
+    <input type="range" id="hueStepsSlider" min="1" max="32" step="1" value="32">
+    <div class="multiplier-value" id="hueStepsDisplay">32级</div>
+</div>
+
+<script>
+    (function() {
+        // 常量定义
+        let PER_ROW = 32;             // 每行32个
+        
+        // 状态变量
+        let currentSaturationSteps = 32; // 饱和度步进级别，默认32级
+        let currentHueSteps = 32; // 色相步进级别，默认32级
+        
+        // 获取容器
+        const container = document.getElementById('colorGrid');
+        const colorInfo = document.getElementById('colorInfo');
+        if (!container) return;
+        
+        // 存储颜色元素
+        let colorCells = [];
+        
+        // HSL转RGB函数
+        function hslToRgb(h, s, l) {
+            h /= 360;
+            s /= 100;
+            l /= 100;
+            let r, g, b;
+            if (s === 0) {
+                r = g = b = l; // achromatic
+            } else {
+                const hue2rgb = (p, q, t) => {
+                    if (t < 0) t += 1;
+                    if (t > 1) t -= 1;
+                    if (t < 1/6) return p + (q - p) * 6 * t;
+                    if (t < 1/2) return q;
+                    if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+                    return p;
+                };
+                const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+                const p = 2 * l - q;
+                r = hue2rgb(p, q, h + 1/3);
+                g = hue2rgb(p, q, h);
+                b = hue2rgb(p, q, h - 1/3);
+            }
+            return {
+                r: Math.round(r * 255),
+                g: Math.round(g * 255),
+                b: Math.round(b * 255)
+            };
+        }
+        
+        // 生成颜色网格的函数
+        function generateColorGrid() {
+            // 清空容器
+            container.innerHTML = '';
+            colorCells = [];
+            const fragment = document.createDocumentFragment();
+            
+            // 计算每个色块的宽度
+            const cellWidth = (100 / PER_ROW) + '%';
+            
+            // 计算饱和度步长
+            const saturationStep = 100 / (currentSaturationSteps - 1);
+            
+            // 计算色相步长
+            const hueStep = 360 / currentHueSteps;
+            
+            // 计算总行数（色相转完所需的行数）
+            const totalRows = currentHueSteps;
+            
+            // 计算总色块数
+            const totalColors = totalRows * PER_ROW;
+            
+            for (let i = 0; i < totalColors; i++) {
+                const cell = document.createElement('div');
+                cell.className = 'color-cell';
+                cell.style.width = cellWidth;
+                
+                // 计算当前行和列
+                const row = Math.floor(i / PER_ROW);
+                const col = i % PER_ROW;
+                
+                // 计算当前饱和度（横向）
+                const saturationIndex = col % currentSaturationSteps;
+                const saturation = saturationIndex * saturationStep;
+                
+                // 计算当前色相（纵向）
+                const hueIndex = row;
+                const hue = hueIndex * hueStep;
+                
+                // 设置颜色
+                const color = `hsl(${hue}deg, ${saturation}%, 50%)`;
+                cell.style.backgroundColor = color;
+                
+                // 添加点击事件，打印RGB和色相值到控制台
+                cell.addEventListener('click', () => {
+                    const rgb = hslToRgb(hue, saturation, 50);
+                    console.log(`Color #${i}: RGB(${rgb.r}, ${rgb.g}, ${rgb.b}), Hue: ${hue.toFixed(2)}°`);
+                });
+                
+                colorCells.push(cell);
+                fragment.appendChild(cell);
+            }
+            container.appendChild(fragment);
+            
+            // 更新色块数量信息
+            if (colorInfo) {
+                colorInfo.textContent = `色块数量: ${totalColors}`;
+            }
+        }
+        
+        // 初始化滑块
+        const saturationStepsSlider = document.getElementById('saturationStepsSlider');
+        const saturationStepsDisplay = document.getElementById('saturationStepsDisplay');
+        const columnsSlider = document.getElementById('columnsSlider');
+        const columnsDisplay = document.getElementById('columnsDisplay');
+        const hueStepsSlider = document.getElementById('hueStepsSlider');
+        const hueStepsDisplay = document.getElementById('hueStepsDisplay');
+        
+        // 监听饱和度步进级别滑块事件
+        function handleSaturationStepsChange() {
+            currentSaturationSteps = parseInt(saturationStepsSlider.value);
+            if (isNaN(currentSaturationSteps)) currentSaturationSteps = 32;
+            saturationStepsDisplay.textContent = currentSaturationSteps + '级';
+            generateColorGrid();
+        }
+        
+        // 监听列数滑块事件
+        function handleColumnsChange() {
+            let val = parseInt(columnsSlider.value);
+            if (isNaN(val)) val = 32;
+            PER_ROW = val;
+            columnsDisplay.textContent = PER_ROW;
+            generateColorGrid();
+        }
+        
+        // 监听色相步进级别滑块事件
+        function handleHueStepsChange() {
+            currentHueSteps = parseInt(hueStepsSlider.value);
+            if (isNaN(currentHueSteps)) currentHueSteps = 16;
+            hueStepsDisplay.textContent = currentHueSteps + '级';
+            generateColorGrid();
+        }
+        
+        // 添加事件监听器
+        saturationStepsSlider.addEventListener('input', handleSaturationStepsChange);
+        saturationStepsSlider.addEventListener('change', handleSaturationStepsChange);
+        
+        columnsSlider.addEventListener('input', handleColumnsChange);
+        columnsSlider.addEventListener('change', handleColumnsChange);
+        
+        hueStepsSlider.addEventListener('input', handleHueStepsChange);
+        hueStepsSlider.addEventListener('change', handleHueStepsChange);
+        
+        // 初始生成颜色网格
+        generateColorGrid();
+    })();
+</script>
+</body>
+</html>

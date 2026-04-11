@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+    <title>CPAL_H</title>
+    <style>
+        /* 极简重置：只展示颜色网格 + 右下角无干扰滑条 */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            user-select: none; /* 避免拖拽干扰，但滑条本身可正常操作 */
+        }
+
+        body {
+            background: #000000;
+            min-height: 100vh;
+            position: relative;
+            /* 让网格可以完整滚动，滑条浮动在右下角 */
+        }
+
+        /* 颜色网格容器：flex 自动换行，每行32个 */
+        .color-grid {
+            display: flex;
+            flex-wrap: wrap;
+            width: 100%;
+            max-width: 100vw;
+            margin: 0;
+            padding: 0;
+            line-height: 0;
+        }
+
+        /* 每个色块：保持正方形，宽度由JavaScript动态设置 */
+        .color-cell {
+            aspect-ratio: 1 / 1;
+            background-color: #000;
+            flex-shrink: 0;
+            flex-grow: 0;
+            transition: background-color 0.05s linear; /* 滑动时顺滑更新 */
+        }
+
+        /* 悬浮小效果（不添加任何文字/标签，只增强交互） */
+        .color-cell:hover {
+            transform: scale(1.02);
+            z-index: 2;
+            box-shadow: 0 0 0 2px rgba(255,255,255,0.7), 0 0 0 4px rgba(0,0,0,0.4);
+            border-radius: 4px;
+            transition: transform 0.08s ease, box-shadow 0.1s ease;
+        }
+
+        /* 右下角浮动滑条容器：干净、半透明、不遮挡主要颜色区域 */
+        .slider-panel {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: rgba(30, 30, 40, 0.75);
+            backdrop-filter: blur(8px);
+            border-radius: 32px;
+            padding: 12px 20px;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            z-index: 999;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+            border: 1px solid rgba(255,255,255,0.2);
+            font-family: system-ui, 'Segoe UI', 'Helvetica Neue', monospace;
+            /* 无额外文字干扰，但需要显示数值和滑条本身，符合“加个滑条”的交互需求 */
+        }
+
+        /* 滑条样式：干净现代 */
+        input[type="range"] {
+            width: 200px;
+            height: 4px;
+            -webkit-appearance: none;
+            background: rgba(255,255,255,0.5);
+            border-radius: 4px;
+            outline: none;
+            cursor: pointer;
+        }
+
+        input[type="range"]:focus {
+            outline: none;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: white;
+            border: none;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+            cursor: pointer;
+            transition: 0.1s;
+        }
+
+        input[type="range"]::-webkit-slider-thumb:hover {
+            transform: scale(1.2);
+            background: #f0f0f0;
+        }
+
+        /* 数值标签：极简显示倍数，不喧宾夺主 */
+        .multiplier-value {
+            color: white;
+            font-weight: 600;
+            font-size: 1rem;
+            background: rgba(0,0,0,0.5);
+            padding: 4px 10px;
+            border-radius: 40px;
+            letter-spacing: 0.5px;
+            font-family: monospace;
+            min-width: 70px;
+            text-align: center;
+            backdrop-filter: blur(4px);
+        }
+
+        /* 响应式：小屏幕上滑条稍窄一些 */
+        @media (max-width: 640px) {
+            .slider-panel {
+                padding: 8px 14px;
+                gap: 12px;
+                bottom: 12px;
+                right: 12px;
+            }
+            input[type="range"] {
+                width: 140px;
+            }
+            .multiplier-value {
+                font-size: 0.85rem;
+                min-width: 55px;
+            }
+        }
+
+        /* 保证网格滚动时滑条固定不遮挡操作区域 */
+        html, body {
+            overflow-x: hidden;
+            overflow-y: auto;
+        }
+        .color-grid {
+            padding-bottom: 10px; /* 避免滑条遮盖最底部色块太严重，但无伤大雅 */
+        }
+    </style>
+</head>
+<body>
+<div class="color-grid" id="colorGrid"></div>
+<div class="slider-panel">
+    <input type="range" id="brightnessMultiplier" min="0" max="2" step="0.01" value="1.0">
+    <div class="multiplier-value" id="multiplierDisplay">1.00x</div>
+</div>
+<div class="slider-panel" style="bottom: 80px;">
+    <input type="range" id="columnsSlider" min="1" max="64" step="1" value="32">
+    <div class="multiplier-value" id="columnsDisplay">32</div>
+</div>
+<div class="slider-panel" style="bottom: 140px;">
+    <input type="range" id="saturationSlider" min="0" max="100" step="1" value="100">
+    <div class="multiplier-value" id="saturationDisplay">100%</div>
+</div>
+<div id="colorTooltip" 
+style="
+position: absolute; 
+background: rgba(0,0,0,0.8); 
+color: white; 
+padding: 8px; 
+border-radius: 4px; 
+font-family: monospace; 
+font-size: 12px; 
+z-index: 1000; 
+pointer-events: none; 
+display: none;
+"></div>
+
+<script>
+    (function() {
+        // --------------------------------------------------------------
+        // 1. 生成原始 1024 个 HSL 颜色数据 (色相完整一圈，饱和度100%，亮度50%)
+        //    每个颜色保存其原始 HSL 分量 (hue, saturation, lightness)
+        //    以便滑条改变时对 lightness 进行乘法操作 (范围限制 0% ~ 100%)
+        // --------------------------------------------------------------
+        const TOTAL_COLORS = 1024;      // 1024个颜色
+        let PER_ROW = 32;             // 每行32个
+        const DEFAULT_LIGHTNESS = 50;   // 基础亮度 50%
+        
+        // 存储原始颜色数据 (hue值, 以及原始饱和度与基准亮度)
+        // 由于乘法操作只改变亮度，饱和度保持不变，色相保持不变。
+        const colorData = [];
+        
+        // 生成色相均匀分布的颜色原始数据
+        for (let i = 0; i < TOTAL_COLORS; i++) {
+            const hue = (i / TOTAL_COLORS) * 360;   // 0 ~ 359.648...
+            const saturation = 100;                  // 固定100% 鲜艳
+            const baseLightness = DEFAULT_LIGHTNESS; // 50%
+            colorData.push({
+                hue: hue,
+                saturation: saturation,
+                baseLightness: baseLightness
+            });
+        }
+        
+        // 获取容器
+        const container = document.getElementById('colorGrid');
+        if (!container) return;
+        
+        // 创建所有色块元素，并存储它们的引用，以便实时更新背景色
+        let colorCells = [];
+        
+        // 特殊颜色索引数组
+        const specialColors = [0, 24, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 176, 200, 224, 256, 296, 320, 360, 384, 408, 440, 472, 488, 496, 504, 512, 520, 528, 536, 544, 552, 560, 568, 576, 584, 592, 600, 608, 616, 624, 632, 640, 648, 656, 672, 688, 712, 728, 736, 744, 752, 760, 768, 776, 784, 792, 800, 808, 816, 824, 832, 840, 848, 856, 872, 888, 912, 936, 960, 992, 1008];
+        
+        // 生成颜色网格的函数
+        function generateColorGrid() {
+            // 清空容器
+            container.innerHTML = '';
+            colorCells = [];
+            const fragment = document.createDocumentFragment();
+            
+            // 计算每个色块的宽度
+            const cellWidth = (100 / PER_ROW) + '%';
+            
+            for (let i = 0; i < TOTAL_COLORS; i++) {
+                const cell = document.createElement('div');
+                cell.className = 'color-cell';
+                cell.style.width = cellWidth;
+                // 初始背景色: 原始亮度 50%
+                const initColor = `hsl(${colorData[i].hue}deg, ${colorData[i].saturation}%, ${colorData[i].baseLightness}%)`;
+                cell.style.backgroundColor = initColor;
+                
+                // 为特殊颜色添加黑框
+                if (specialColors.includes(i)) {
+                    cell.style.border = '2px solid black';
+                    cell.style.boxSizing = 'border-box';
+                }
+                
+                colorCells.push(cell);
+                fragment.appendChild(cell);
+            }
+            container.appendChild(fragment);
+            
+            // 重新添加悬停事件
+            addHoverEvents();
+        }
+        
+        // 添加悬停事件的函数
+        function addHoverEvents() {
+            colorCells.forEach((cell, idx) => {
+                cell.addEventListener('mouseenter', (e) => {
+                    const data = colorData[idx];
+                    const newLightness = Math.min(100, Math.max(0, data.baseLightness * currentMultiplier));
+                    const rgb = hslToRgb(data.hue, currentSaturation, newLightness);
+                    const hue = rgbToHue(rgb.r, rgb.g, rgb.b);
+                    tooltip.textContent = `RGB: ${rgb.r},${rgb.g},${rgb.b}\nHue: ${hue.toFixed(2)}°`;
+                    tooltip.style.display = 'block';
+                    tooltip.style.left = (e.pageX + 10) + 'px';
+                    tooltip.style.top = (e.pageY + 10) + 'px';
+                });
+                
+                cell.addEventListener('mousemove', (e) => {
+                    tooltip.style.left = (e.pageX + 10) + 'px';
+                    tooltip.style.top = (e.pageY + 10) + 'px';
+                });
+                
+                cell.addEventListener('mouseleave', () => {
+                    tooltip.style.display = 'none';
+                });
+                
+                // 添加点击事件，打印色相和RGB值到控制台
+                cell.addEventListener('click', () => {
+                    const data = colorData[idx];
+                    const newLightness = Math.min(100, Math.max(0, data.baseLightness * currentMultiplier));
+                    const rgb = hslToRgb(data.hue, currentSaturation, newLightness);
+                    const hue = rgbToHue(rgb.r, rgb.g, rgb.b);
+                    console.log(`Color #${idx}: RGB(${rgb.r}, ${rgb.g}, ${rgb.b}), Hue: ${hue.toFixed(2)}°`);
+                });
+            });
+        }
+        
+        // 初始生成颜色网格
+        generateColorGrid();
+        
+        // --------------------------------------------------------------
+        // 2. 乘法滑条逻辑: 范围 10 到 0 (滑块值 0~10)
+        //    乘法系数 multiplier = 滑条数值 (0~10)
+        //    作用: 将所有颜色的亮度乘以 multiplier 系数。
+        //    但亮度值不能超过 100%，也不能低于 0% 。
+        //    计算公式: newLightness = clamp(baseLightness * multiplier, 0, 100)
+        //    其中 baseLightness = 50 (原始亮度)
+        //    因为原始亮度为50%，乘以系数后范围 0% ~ 500% 但是限制在 0~100%。
+        //    这样实现视觉效果: 系数=1 → 亮度50% (原始纯色)
+        //                     系数=0 → 亮度0% (全黑)
+        //                     系数=10 → 亮度500% 但限制到100% → 纯白 (所有颜色变白)
+        //    为了更好的色彩表现，让乘法操作直观调节明暗，同时色相和饱和度不变。
+        //    完全符合 "把所有颜色进行一个乘法操作，实时显示效果"
+        // --------------------------------------------------------------
+        const slider = document.getElementById('brightnessMultiplier');
+        const displaySpan = document.getElementById('multiplierDisplay');
+        
+        // 更新所有颜色的函数
+        function updateColors(multiplier, saturation) {
+            // multiplier 范围 0~10
+            for (let idx = 0; idx < TOTAL_COLORS; idx++) {
+                const data = colorData[idx];
+                // 原始亮度 50%
+                let newLightness = data.baseLightness * multiplier;
+                // 限制范围 0% ~ 100%
+                if (newLightness > 100) newLightness = 100;
+                if (newLightness < 0) newLightness = 0;
+                // 保留一位小数让背景色更精确，也可以直接使用整数或小数
+                const finalLightness = newLightness;
+                const newColor = `hsl(${data.hue}deg, ${saturation}%, ${finalLightness}%)`;
+                colorCells[idx].style.backgroundColor = newColor;
+                
+                // 确保特殊颜色保持黑框
+                if (specialColors.includes(idx)) {
+                    colorCells[idx].style.border = '2px solid black';
+                    colorCells[idx].style.boxSizing = 'border-box';
+                }
+            }
+        }
+        
+        // 初始化: 滑条默认值 = 1 (因为原始亮度50%，系数1展示原始效果)
+        // 但题目要求“值是10到0”，范围包含10,9,8...0，默认我们可以设为1，也可以设为1。
+        // 为了符合直观，设置初始 multiplier = 1，显示1.00x
+        let currentMultiplier = 1.0;
+        let currentSaturation = 100; // 初始饱和度100%
+        
+        slider.value = currentMultiplier;
+        displaySpan.textContent = currentMultiplier.toFixed(2) + 'x';
+        updateColors(currentMultiplier, currentSaturation);
+        
+        // HSL转RGB函数
+        function hslToRgb(h, s, l) {
+            h /= 360;
+            s /= 100;
+            l /= 100;
+            let r, g, b;
+            if (s === 0) {
+                r = g = b = l; // achromatic
+            } else {
+                const hue2rgb = (p, q, t) => {
+                    if (t < 0) t += 1;
+                    if (t > 1) t -= 1;
+                    if (t < 1/6) return p + (q - p) * 6 * t;
+                    if (t < 1/2) return q;
+                    if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+                    return p;
+                };
+                const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+                const p = 2 * l - q;
+                r = hue2rgb(p, q, h + 1/3);
+                g = hue2rgb(p, q, h);
+                b = hue2rgb(p, q, h - 1/3);
+            }
+            return {
+                r: Math.round(r * 255),
+                g: Math.round(g * 255),
+                b: Math.round(b * 255)
+            };
+        }
+        
+        // RGB转色相函数（使用用户提供的算法）
+        function rgbToHue(r, g, b) {
+            // 归一化到[0, 1]范围
+            r /= 255;
+            g /= 255;
+            b /= 255;
+            
+            const max = Math.max(r, g, b);
+            const min = Math.min(r, g, b);
+            const delta = max - min;
+            
+            let hue = 0;
+            if (delta === 0) {
+                hue = 0; // 无彩色
+            } else {
+                if (max === r) {
+                    hue = 60 * (((g - b) / delta) % 6);
+                } else if (max === g) {
+                    hue = 60 * (((b - r) / delta) + 2);
+                } else if (max === b) {
+                    hue = 60 * (((r - g) / delta) + 4);
+                }
+            }
+            
+            // 确保色相在0-360范围内
+            return (hue + 360) % 360;
+        }
+        
+        // 初始化tooltip
+        const tooltip = document.getElementById('colorTooltip');
+        
+        // 监听亮度滑条事件
+        function handleSliderChange() {
+            let val = parseFloat(slider.value);
+            if (isNaN(val)) val = 1;
+            // 保留两位小数精度
+            currentMultiplier = val;
+            displaySpan.textContent = currentMultiplier.toFixed(2) + 'x';
+            updateColors(currentMultiplier, currentSaturation);
+        }
+        
+        slider.addEventListener('input', handleSliderChange);
+        slider.addEventListener('change', handleSliderChange);
+        
+        // 初始化列数滑条
+        const columnsSlider = document.getElementById('columnsSlider');
+        const columnsDisplay = document.getElementById('columnsDisplay');
+        
+        // 监听列数滑条事件
+        function handleColumnsChange() {
+            let val = parseInt(columnsSlider.value);
+            if (isNaN(val)) val = 32;
+            PER_ROW = val;
+            columnsDisplay.textContent = PER_ROW;
+            generateColorGrid();
+            updateColors(currentMultiplier, currentSaturation); // 重新应用当前亮度和饱和度
+        }
+        
+        columnsSlider.addEventListener('input', handleColumnsChange);
+        columnsSlider.addEventListener('change', handleColumnsChange);
+        
+        // 初始化饱和度滑条
+        const saturationSlider = document.getElementById('saturationSlider');
+        const saturationDisplay = document.getElementById('saturationDisplay');
+        
+        // 监听饱和度滑条事件
+        function handleSaturationChange() {
+            let val = parseInt(saturationSlider.value);
+            if (isNaN(val)) val = 100;
+            currentSaturation = val;
+            saturationDisplay.textContent = currentSaturation + '%';
+            updateColors(currentMultiplier, currentSaturation);
+        }
+        
+        saturationSlider.addEventListener('input', handleSaturationChange);
+        saturationSlider.addEventListener('change', handleSaturationChange);
+        
+        // 可选: 为了流畅度，已经使用 input 实时更新，乘法操作在每次滑动时重新计算所有颜色。
+        // 1024个颜色的 DOM 样式更新在现代浏览器中非常流畅，完全满足实时效果。
+        // 额外说明: 乘法系数为0时全部变黑，系数>1时亮度提高直至全部变白(系数≥2即可达到100%亮度)，
+        // 系数10也是限制为100%亮度 => 全白。符合乘法概念并且保证效果明显。
+        // 乘法操作真正实现了对所有颜色分量（亮度通道）的乘法运算。
+        // 同时不改变色相与饱和度，保证"色相一圈"特性依然存在，只是明度发生变化。
+    })();
+</script>
+</body>
+</html>

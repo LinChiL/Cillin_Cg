@@ -318,7 +318,7 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
         
         // 关键：增加安全步长上限，防止射线在表面反复横跳
         t += max(final_v.dist * 0.75, 0.0005); 
-        if (t > 80.0) { break; }
+        if (t > 800.0) { break; }
     }
 
     if (hit) {
@@ -333,10 +333,28 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
         let base_color = final_v.color * final_v.modifier;
         let dot_nl = max(0.0, dot(normal, L));
         
-        // 如果是 debug 4，看原始颜色
-        if (params.debug_mode == 4u) {
+        // 调试模式
+        if (params.debug_mode == 1u) {
+            // 模式 1：距离场可视化（红正绿负）
+            let dist_color = debug_color(final_v.dist * 10.0);
+            textureStore(output_texture, id.xy, vec4<f32>(dist_color, 1.0));
+        } else if (params.debug_mode == 2u) {
+            // 模式 2：UVW 映射可视化
+            // 计算 UVW 坐标
+            let e = scene.entities[final_v.entity_id];
+            let local_p = (e.inv_model_matrix * vec4<f32>(hit_p, 1.0)).xyz;
+            let dims = e.aabb_max.xyz - e.aabb_min.xyz;
+            let uvw = (local_p - e.aabb_min.xyz) / dims;
+            textureStore(output_texture, id.xy, vec4<f32>(uvw, 1.0));
+        } else if (params.debug_mode == 3u) {
+            // 模式 3：法线可视化
+            let normal_color = (normal + 1.0) * 0.5; // 将法线从 [-1,1] 映射到 [0,1]
+            textureStore(output_texture, id.xy, vec4<f32>(normal_color, 1.0));
+        } else if (params.debug_mode == 4u) {
+            // 模式 4：原始颜色
             textureStore(output_texture, id.xy, vec4<f32>(final_v.color, 1.0));
         } else {
+            // 正常渲染
             let lighting = mix(0.35, 1.0, luoer * smoothstep(0.0, 0.05, dot_nl));
             textureStore(output_texture, id.xy, vec4<f32>(base_color * lighting, 1.0));
         }
