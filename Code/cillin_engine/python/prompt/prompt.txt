@@ -1,0 +1,3256 @@
+build.rs
+
+fn main() {
+    let mut build = cxx_build::bridge("src/lib.rs");
+    build.file("cpp/sdf_logic.cpp")
+        .include("cpp")
+        .std("c++20"); // 这样写更标准，cc-rs 会自动处理不同平台的 flag
+
+    build.compile("cillin_math");
+
+    println!("cargo:rerun-if-changed=src/lib.rs");
+    println!("cargo:rerun-if-changed=cpp/sdf_logic.cpp");
+    println!("cargo:rerun-if-changed=cpp/sdf_logic.hpp");
+}
+
+
+cpp\cem_compiler_v2.cpp
+
+#define CGLTF_IMPLEMENTATION
+#include "cgltf.h"
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
+#include <vector>
+#include <cmath>
+#include <iostream>
+#include <fstream>
+#include <algorithm>
+#include <map>
+
+// --- 基础数学结构 ---
+struct Vec3 {
+    float x, y, z;
+    Vec3 operator-(const Vec3& v) const { return {x - v.x, y - v.y, z - v.z}; }
+    Vec3 operator+(const Vec3& v) const { return {x + v.x, y + v.y, z + v.z}; }
+    Vec3 operator*(float s) const { return {x * s, y * s, z * s}; }
+    float dot(const Vec3& v) const { return x * v.x + y * v.y + z * v.z; }
+    Vec3 cross(const Vec3& v) const { return {y * v.z - z * v.y, z * v.x - x * v.z, x * v.y - y * v.x}; }
+    float length_sq() const { return x * x + y * y + z * z; }
+    float length() const { return std::sqrt(length_sq()); }
+};
+
+struct Color { uint8_t r, g, b; };
+
+struct MeshData {
+    std::vector<Vec3> vertices;
+    std::vector<Color> colors;
+    std::vector<uint32_t> indices;
+    Vec3 min_b, max_b;
+};
+
+// --- 色彩空间工具 ---
+float color_dist(Color c1, Color c2) {
+    return std::pow(c1.r - c2.r, 2) + std::pow(c1.g - c2.g, 2) + std::pow(c1.b - c2.b, 2);
+}
+
+class GlobalPalette {
+public:
+    std::vector<Color> colors;
+
+    void load(const std::string& path) {
+        std::ifstream ifs(path, std::ios::binary);
+        if (!ifs.is_open()) {
+            std::cout << "Warning: Palette not found, generating a default rainbow palette." << std::endl;
+            generate_default();
+            return;
+        }
+        colors.resize(1024);
+        ifs.seekg(4); // 跳过魔数
+        ifs.read((char*)colors.data(), 1024 * 3);
+    }
+
+    void generate_default() {
+        colors.resize(1024);
+        for(int i=0; i<1024; ++i) colors[i] = {(uint8_t)(i/4), (uint8_t)(i%255), (uint8_t)((i*7)%255)};
+    }
+
+    // 撞库逻辑：在 1024 种公用色里找最像的
+    int find_best_match(Color target) {
+        int best_id = 0;
+        float min_d = 1e10f;
+        for(int i=0; i<colors.size(); ++i) {
+            float d = color_dist(target, colors[i]);
+            if(d < min_d) { min_d = d; best_id = i; }
+        }
+        return best_id;
+    }
+
+    void save(const std::string& path) {
+        std::ofstream ofs(path, std::ios::binary);
+        ofs.write("CPAL", 4);
+        uint32_t count = 1024;
+        ofs.write((char*)&count, 4);
+        ofs.write((char*)colors.data(), 1024 * 3);
+        ofs.close();
+        std::cout << "Saved palette to: " << path << std::endl;
+    }
+};
+
+// --- 点到三角形距离函数 ---
+float point_to_tri_dist_sq(Vec3 p, Vec3 a, Vec3 b, Vec3 c, Vec3& out_normal) {
+    Vec3 ab = b - a; Vec3 bc = c - b; Vec3 ca = a - c;
+    Vec3 ap = p - a; Vec3 bp = p - b; Vec3 cp = p - c;
+    Vec3 n = ab.cross(ca);
+    out_normal = n;
+
+    auto project_on_seg = [](Vec3 p, Vec3 a, Vec3 b) {
+        Vec3 ab = b - a;
+        float t = std::clamp((p - a).dot(ab) / ab.length_sq(), 0.0f, 1.0f);
+        return (p - (a + ab * t)).length_sq();
+    };
+
+    bool inside = ab.cross(n).dot(ap) >= 0.0f && bc.cross(n).dot(bp) >= 0.0f && ca.cross(n).dot(cp) >= 0.0f;
+    if (inside) return (n.dot(ap) * n.dot(ap)) / n.length_sq();
+    return std::min({project_on_seg(p, a, b), project_on_seg(p, b, c), project_on_seg(p, c, a)});
+}
+
+// --- 核心：.cem v2 打包逻辑 ---
+// [Dist: 12bit] [ColorID: 10bit] [Modifier: 8bit] [Flag: 2bit]
+uint32_t pack_voxel_v2(float dist, int color_id, float modifier, float world_size) {
+    // 1. 距离映射 (-2048 to 2047)
+    float normalized_d = std::clamp(dist / world_size, -1.0f, 1.0f);
+    int32_t d_int = (int32_t)(normalized_d * 2047.0f);
+    uint32_t d_bits = (uint32_t)d_int & 0xFFF;
+
+    // 2. 颜色 ID (0 to 1023)
+    uint32_t id_bits = (uint32_t)color_id & 0x3FF;
+
+    // 3. 亮度微调 (0 to 255)
+    uint32_t mod_bits = (uint32_t)(std::clamp(modifier, 0.0f, 1.0f) * 255.0f);
+
+    // 4. 组装
+    return (d_bits << 20) | (id_bits << 10) | (mod_bits << 2) | 0u;
+}
+
+// --- 加载GLB模型 ---
+MeshData load_glb(const std::string& path) {
+    cgltf_options options = {};
+    cgltf_data* data = nullptr;
+    std::cout << "Loading GLB: " << path << std::endl;
+    cgltf_result result = cgltf_parse_file(&options, path.c_str(), &data);
+    if (result != cgltf_result_success) {
+        std::cout << "Failed to parse GLB file. Error code: " << result << std::endl;
+        exit(-1);
+    }
+    result = cgltf_load_buffers(&options, data, path.c_str());
+    if (result != cgltf_result_success) {
+        std::cout << "Failed to load buffers. Error code: " << result << std::endl;
+        exit(-1);
+    }
+
+    MeshData mesh;
+    mesh.min_b = {1e10, 1e10, 1e10}; mesh.max_b = {-1e10, -1e10, -1e10};
+
+    for (size_t m_idx = 0; m_idx < data->meshes_count; ++m_idx) {
+        cgltf_mesh* g_mesh = &data->meshes[m_idx];
+        for (int i = 0; i < g_mesh->primitives_count; ++i) {
+            cgltf_primitive* prim = &g_mesh->primitives[i];
+            
+            // --- 核心：处理贴图 ---
+            uint8_t* img_data = nullptr;
+            int img_w, img_h, img_comp;
+            if (prim->material && prim->material->has_pbr_metallic_roughness && 
+                prim->material->pbr_metallic_roughness.base_color_texture.texture) {
+                
+                auto* image = prim->material->pbr_metallic_roughness.base_color_texture.texture->image;
+                auto* view = image->buffer_view;
+                // 从内存中读取 GLB 内嵌的图片
+                img_data = stbi_load_from_memory((uint8_t*)view->buffer->data + view->offset, view->size, &img_w, &img_h, &img_comp, 3);
+            }
+
+            // 获取当前 Primitive 的基础颜色（从材质球拿）
+            Color mat_color = {255, 255, 255}; // 默认白
+            if (prim->material && prim->material->has_pbr_metallic_roughness) {
+                float* c = prim->material->pbr_metallic_roughness.base_color_factor;
+                mat_color = { (uint8_t)(c[0] * 255), (uint8_t)(c[1] * 255), (uint8_t)(c[2] * 255) };
+            }
+
+            size_t vertex_offset = mesh.vertices.size();
+            cgltf_accessor* pos_acc = nullptr;
+            cgltf_accessor* uv_acc = nullptr;
+            cgltf_accessor* col_acc = nullptr;
+
+            for (int j = 0; j < prim->attributes_count; ++j) {
+                if (prim->attributes[j].type == cgltf_attribute_type_position) pos_acc = prim->attributes[j].data;
+                if (prim->attributes[j].type == cgltf_attribute_type_texcoord) uv_acc = prim->attributes[j].data;
+                if (prim->attributes[j].type == cgltf_attribute_type_color) col_acc = prim->attributes[j].data;
+            }
+
+            if (pos_acc) {
+                for (int k = 0; k < pos_acc->count; ++k) {
+                    float v[3]; cgltf_accessor_read_float(pos_acc, k, v, 3);
+                    Vec3 p = {v[0], v[1], v[2]};
+                    mesh.vertices.push_back(p);
+                    mesh.min_b.x = std::min(mesh.min_b.x, p.x); mesh.max_b.x = std::max(mesh.max_b.x, p.x);
+                    mesh.min_b.y = std::min(mesh.min_b.y, p.y); mesh.max_b.y = std::max(mesh.max_b.y, p.y);
+                    mesh.min_b.z = std::min(mesh.min_b.z, p.z); mesh.max_b.z = std::max(mesh.max_b.z, p.z);
+                    
+                    // 颜色逻辑：优先顶点色，其次贴图采样，最后材质颜色
+                    Color final_c = mat_color;
+                    if (col_acc) {
+                        float c[4]; cgltf_accessor_read_float(col_acc, k, c, 4);
+                        final_c = {(uint8_t)(c[0]*255), (uint8_t)(c[1]*255), (uint8_t)(c[2]*255)};
+                    } else if (img_data && uv_acc) {
+                        float uv[2]; cgltf_accessor_read_float(uv_acc, k, uv, 2);
+                        int x = (int)(uv[0] * img_w) % img_w;
+                        int y = (int)(uv[1] * img_h) % img_h;
+                        if(x < 0) x += img_w;
+                        if(y < 0) y += img_h;
+                        int idx = (y * img_w + x) * 3;
+                        final_c = {img_data[idx], img_data[idx+1], img_data[idx+2]};
+                    }
+                    mesh.colors.push_back(final_c);
+                }
+            }
+
+            if (prim->indices) {
+                for (int k = 0; k < prim->indices->count; ++k) {
+                    mesh.indices.push_back(vertex_offset + cgltf_accessor_read_index(prim->indices, k));
+                }
+            }
+            
+            // 释放贴图数据
+            if (img_data) {
+                stbi_image_free(img_data);
+            }
+        }
+    }
+    cgltf_free(data);
+    return mesh;
+}
+
+// --- 生成全局色板 ---
+void generate_global_palette(const std::string& glb_dir, const std::string& output_cpal) {
+    std::vector<std::string> glb_files = {
+        "ComeCube.glb",
+        "tree.glb"
+    };
+
+    std::map<uint32_t, int> color_counts;
+
+    for (const auto& filename : glb_files) {
+        std::string path = glb_dir + "\\" + filename;
+        std::cout << "Processing: " << path << std::endl;
+        MeshData mesh = load_glb(path);
+        
+        std::cout << "Mesh vertices: " << mesh.vertices.size() << ", colors: " << mesh.colors.size() << std::endl;
+        
+        for (const auto& c : mesh.colors) {
+            uint32_t key = (c.r << 16) | (c.g << 8) | c.b;
+            color_counts[key]++;
+        }
+    }
+
+    std::vector<std::pair<uint32_t, int>> sorted_colors(color_counts.begin(), color_counts.end());
+    std::sort(sorted_colors.begin(), sorted_colors.end(), [](const auto& a, const auto& b) {
+        return a.second > b.second;
+    });
+
+    GlobalPalette pal;
+    pal.colors.resize(1024, {0, 0, 0});
+
+    for (int i = 0; i < std::min((size_t)1024, sorted_colors.size()); ++i) {
+        uint32_t key = sorted_colors[i].first;
+        pal.colors[i] = {
+            (uint8_t)(key >> 16),
+            (uint8_t)((key >> 8) & 0xFF),
+            (uint8_t)(key & 0xFF)
+        };
+    }
+
+    pal.save(output_cpal);
+    std::cout << "Generated global palette with " << std::min((size_t)1024, sorted_colors.size()) << " colors" << std::endl;
+}
+
+// --- CEM 2.0 导出逻辑 ---
+void cook_cem_v2(const std::string& input_glb, const std::string& output_cem, GlobalPalette& pal) {
+    MeshData mesh = load_glb(input_glb);
+
+    int res = 64;
+    std::vector<uint32_t> voxels(res * res * res);
+    Vec3 size = mesh.max_b - mesh.min_b;
+    float world_size = std::max({size.x, size.y, size.z});
+
+    for (int z = 0; z < res; ++z) {
+        for (int y = 0; y < res; ++y) {
+            for (int x = 0; x < res; ++x) {
+                Vec3 p = {
+                    mesh.min_b.x + (x / (float)(res-1)) * size.x,
+                    mesh.min_b.y + (y / (float)(res-1)) * size.y,
+                    mesh.min_b.z + (z / (float)(res-1)) * size.z
+                };
+
+                float min_d_sq = 1e10f;
+                Vec3 closest_n = {0,0,0};
+                int closest_tri = 0;
+
+                for (size_t i = 0; i < mesh.indices.size(); i += 3) {
+                    Vec3 a = mesh.vertices[mesh.indices[i]];
+                    Vec3 b = mesh.vertices[mesh.indices[i+1]];
+                    Vec3 c = mesh.vertices[mesh.indices[i+2]];
+                    Vec3 tri_n;
+                    float d_sq = point_to_tri_dist_sq(p, a, b, c, tri_n);
+                    if (d_sq < min_d_sq) { min_d_sq = d_sq; closest_n = tri_n; closest_tri = i; }
+                }
+
+                float dist = std::sqrt(min_d_sq);
+                if ((p - mesh.vertices[mesh.indices[closest_tri]]).dot(closest_n) < 0) dist = -dist;
+
+                Color original_c = mesh.colors.empty() ? Color{255,255,255} : mesh.colors[mesh.indices[closest_tri]];
+                
+                // --- 核心改变：向公用色板撞库 ---
+                int color_id = pal.find_best_match(original_c);
+                
+                // --- 计算微调值 (Modifier) ---
+                float mod = (original_c.r + original_c.g + original_c.b + 1) /
+                            (float)(pal.colors[color_id].r + pal.colors[color_id].g + pal.colors[color_id].b + 1);
+
+                voxels[x + y*res + z*res*res] = pack_voxel_v2(dist, color_id, mod, world_size);
+            }
+        }
+    }
+
+    // 写入 .cem 文件 (不再包含 Palette)
+    std::ofstream ofs(output_cem, std::ios::binary);
+    ofs.write("CEM2", 4); // 版本 2
+    ofs.write((char*)&res, 4);
+    ofs.write((char*)&mesh.min_b, 12); ofs.write((char*)&mesh.max_b, 12);
+    ofs.write((char*)voxels.data(), voxels.size() * 4);
+    ofs.close();
+
+    std::cout << "Cooked CEM v2: " << output_cem << std::endl;
+}
+
+int main(int argc, char** argv) {
+    if (argc < 4) {
+        std::cout << "Usage: cem_cooker_v2 <mode> <input> <output>" << std::endl;
+        std::cout << "Modes:" << std::endl;
+        std::cout << "  generate-palette <glb_directory> <output.cpal>" << std::endl;
+        std::cout << "  cook <input.glb> <palette.cpal> <output.cem>" << std::endl;
+        return -1;
+    }
+
+    std::string mode = argv[1];
+
+    if (mode == "generate-palette") {
+        generate_global_palette(argv[2], argv[3]);
+    } else if (mode == "cook") {
+        if (argc < 5) {
+            std::cout << "Usage: cem_cooker_v2 cook <input.glb> <palette.cpal> <output.cem>" << std::endl;
+            return -1;
+        }
+        GlobalPalette pal;
+        pal.load(argv[3]);
+        cook_cem_v2(argv[2], argv[4], pal);
+    } else {
+        std::cout << "Unknown mode: " << mode << std::endl;
+        return -1;
+    }
+
+    return 0;
+}
+
+
+cpp\sdf_logic.cpp
+
+﻿#include "sdf_logic.hpp"
+#include "cillin_engine/src/lib.rs.h" // 必须包含这个！cxx 会自动生成它
+
+float point_to_triangle_dist_sq(Vec3 p, Vec3 a, Vec3 b, Vec3 c) {
+    Vec3 ab = b - a;
+    Vec3 bc = c - b;
+    Vec3 ca = a - c;
+    Vec3 ap = p - a;
+    Vec3 bp = p - b;
+    Vec3 cp = p - c;
+
+    Vec3 n = ab.cross(ca);
+
+    auto project_on_segment = [](Vec3 p, Vec3 a, Vec3 b) {
+        Vec3 ab = b - a;
+        float t = (p - a).dot(ab) / ab.length_sq();
+        t = std::max(0.0f, std::min(1.0f, t));
+        Vec3 proj = {a.x + t * ab.x, a.y + t * ab.y, a.z + t * ab.z};
+        Vec3 diff = p - proj;
+        return diff.length_sq();
+    };
+
+    bool inside = 
+        ab.cross(n).dot(ap) >= 0.0f && 
+        bc.cross(n).dot(bp) >= 0.0f && 
+        ca.cross(n).dot(cp) >= 0.0f;
+
+    if (inside) {
+        float dist_n = n.dot(ap);
+        return (dist_n * dist_n) / n.length_sq();
+    } else {
+        return std::min({
+            project_on_segment(p, a, b),
+            project_on_segment(p, b, c),
+            project_on_segment(p, c, a)
+        });
+    }
+}
+
+rust::Vec<float> generate_sdf_baked_aabb(
+    rust::Slice<const float> vertices,
+    rust::Slice<const uint32_t> indices,
+    int res,
+    float min_x, float min_y, float min_z,
+    float max_x, float max_y, float max_z
+) {
+    rust::Vec<float> output_grid;
+    output_grid.reserve(res * res * res);
+
+    Vec3 min_b = { min_x, min_y, min_z };
+    Vec3 max_b = { max_x, max_y, max_z };
+    Vec3 size = { max_x - min_x, max_y - min_y, max_z - min_z };
+
+    for (int z = 0; z < res; ++z) {
+        for (int y = 0; y < res; ++y) {
+            for (int x = 0; x < res; ++x) {
+                // 精准映射：根据格子索引算出世界坐标
+                Vec3 p = {
+                    min_b.x + (x / (float)(res - 1)) * size.x,
+                    min_b.y + (y / (float)(res - 1)) * size.y,
+                    min_b.z + (z / (float)(res - 1)) * size.z
+                };
+
+                float min_d_sq = 1e10f;
+                Vec3 closest_normal = {0, 0, 0};
+                Vec3 closest_p_to_v = {0, 0, 0};
+
+                for (size_t i = 0; i < indices.size(); i += 3) {
+                    Vec3 a = { vertices[indices[i]*8], vertices[indices[i]*8+1], vertices[indices[i]*8+2] };
+                    Vec3 b = { vertices[indices[i+1]*8], vertices[indices[i+1]*8+1], vertices[indices[i+1]*8+2] };
+                    Vec3 c = { vertices[indices[i+2]*8], vertices[indices[i+2]*8+1], vertices[indices[i+2]*8+2] };
+                    
+                    // 计算该三角形的法线
+                    Vec3 edge1 = b - a;
+                    Vec3 edge2 = c - a;
+                    Vec3 tri_normal = edge1.cross(edge2); // 未归一化的法线
+
+                    float d_sq = point_to_triangle_dist_sq(p, a, b, c);
+                    if (d_sq < min_d_sq) {
+                        min_d_sq = d_sq;
+                        closest_normal = tri_normal;
+                        closest_p_to_v = p - a; // 从面上一点指向采样点 p 的向量
+                    }
+                }
+
+                float dist = std::sqrt(min_d_sq);
+                
+                // --- 核心：判定符号 ---
+                // 如果点 p 到面的向量与法线方向相反（点积为负），说明在模型内部
+                if (closest_p_to_v.dot(closest_normal) < 0) {
+                    dist = -dist; // 标记为内部！
+                }
+                
+                output_grid.push_back(dist);
+            }
+        }
+    }
+    return output_grid;
+}
+
+// 辅助函数：矩阵变换点
+Vec3 transform_vec(Vec3 p, const float* matrix) {
+    float x = p.x * matrix[0] + p.y * matrix[4] + p.z * matrix[8] + matrix[12];
+    float y = p.x * matrix[1] + p.y * matrix[5] + p.z * matrix[9] + matrix[13];
+    float z = p.x * matrix[2] + p.y * matrix[6] + p.z * matrix[10] + matrix[14];
+    float w = p.x * matrix[3] + p.y * matrix[7] + p.z * matrix[11] + matrix[15];
+    
+    if (w != 0.0f) {
+        return {x / w, y / w, z / w};
+    }
+    return {x, y, z};
+}
+
+// 解包体素数据
+float unpack_voxel(uint32_t data) {
+    // 手动处理 12 位补码，确保负数正确还原
+    uint32_t d_bits = data >> 20;
+    int32_t d_int = (int32_t)d_bits;
+    if (d_bits >= 2048) {
+        d_int -= 4096;
+    }
+    return (float)d_int / 2047.0f;
+}
+
+// 三线性插值采样（支持 Uint32 全息数据）
+float sample_local_sdf(Vec3 p_local, const uint32_t* data, int res) {
+    // 将 -1~1 的局部坐标转为 0~res-1 的索引坐标
+    float x = (p_local.x * 0.5f + 0.5f) * (res - 1);
+    float y = (p_local.y * 0.5f + 0.5f) * (res - 1);
+    float z = (p_local.z * 0.5f + 0.5f) * (res - 1);
+
+    // 如果坐标在模型包围盒外，返回一个很大的距离
+    if (x < 0 || x > res-1 || y < 0 || y > res-1 || z < 0 || z > res-1) return 10.0f;
+
+    int x0 = (int)x; int x1 = std::min(x0 + 1, res - 1);
+    int y0 = (int)y; int y1 = std::min(y0 + 1, res - 1);
+    int z0 = (int)z; int z1 = std::min(z0 + 1, res - 1);
+
+    float fx = x - x0; float fy = y - y0; float fz = z - z0;
+
+    // 8 点采样插值 (标准的 GPU 纹理采样算法的 CPU 实现)
+    auto get_v = [&](int ix, int iy, int iz) { 
+        return unpack_voxel(data[ix + iy * res + iz * res * res]); 
+    };
+
+    float v000 = get_v(x0, y0, z0); float v100 = get_v(x1, y0, z0);
+    float v010 = get_v(x0, y1, z0); float v110 = get_v(x1, y1, z0);
+    float v001 = get_v(x0, y0, z1); float v101 = get_v(x1, y0, z1);
+    float v011 = get_v(x0, y1, z1); float v111 = get_v(x1, y1, z1);
+
+    float i1 = v000 * (1 - fx) + v100 * fx;
+    float i2 = v010 * (1 - fx) + v110 * fx;
+    float j1 = v001 * (1 - fx) + v101 * fx;
+    float j2 = v011 * (1 - fx) + v111 * fx;
+
+    float w1 = i1 * (1 - fy) + i2 * fy;
+    float w2 = j1 * (1 - fy) + j2 * fy;
+
+    return w1 * (1 - fz) + w2 * fz;
+}
+
+// 核心：合并所有实体到全局 SDF
+rust::Vec<float> merge_global_sdf(
+    rust::Slice<const EntitySdfInfo> entities, // 修改这里：去掉 ffi::
+    int global_res,
+    float world_box_size
+) {
+    rust::Vec<float> global_grid;
+    global_grid.reserve(global_res * global_res * global_res);
+
+    float step = world_box_size / (float)global_res;
+    float offset = world_box_size * 0.5f;
+    float half_step = step * 0.5f;
+
+    for (int z = 0; z < global_res; ++z) {
+        for (int y = 0; y < global_res; ++y) {
+            for (int x = 0; x < global_res; ++x) {
+                Vec3 p_world = { 
+                    x * step - offset + half_step, 
+                    y * step - offset + half_step, 
+                    z * step - offset + half_step 
+                };
+                float min_dist = 10.0f;
+
+                for (const auto& entity : entities) {
+                    // 使用 entity.inv_matrix.data() 访问数组
+                    Vec3 p_local = transform_vec(p_world, entity.inv_matrix.data());
+                    float d = sample_local_sdf(p_local, entity.sdf_ptr, entity.res);
+                    if (d < min_dist) min_dist = d;
+                }
+                global_grid.push_back(min_dist);
+            }
+        }
+    }
+    return global_grid;
+}
+
+
+cpp\sdf_logic.hpp
+
+﻿#pragma once
+#include "rust/cxx.h"
+#include <cmath>
+#include <algorithm>
+#include <vector>
+#include <cstdint> // 确保 uint32_t 可用
+
+// 1. 全局命名空间的 Vec3 定义，供 cxx 使用
+struct Vec3 {
+    float x, y, z;
+    Vec3 operator-(const Vec3& v) const { return {x - v.x, y - v.y, z - v.z}; }
+    Vec3 operator+(const Vec3& v) const { return {x + v.x, y + v.y, z + v.z}; }
+    float dot(const Vec3& v) const { return x * v.x + y * v.y + z * v.z; }
+    Vec3 cross(const Vec3& v) const {
+        return {y * v.z - z * v.y, z * v.x - x * v.z, x * v.y - y * v.x};
+    }
+    float length_sq() const { return this->dot(*this); }
+};
+
+// 2. 前置声明 Rust 中定义的结构体，这样编译器就知道它是一个结构体
+struct EntitySdfInfo;
+
+float point_to_triangle_dist_sq(Vec3 p, Vec3 a, Vec3 b, Vec3 c);
+Vec3 transform_vec(Vec3 p, const float* matrix);
+float unpack_voxel(uint32_t data);
+float sample_local_sdf(Vec3 p_local, const uint32_t* data, int res);
+
+// 2. 去掉 ffi:: 前缀
+rust::Vec<float> generate_sdf_baked_aabb(
+    rust::Slice<const float> vertices,
+    rust::Slice<const uint32_t> indices,
+    int res,
+    float min_x, float min_y, float min_z,
+    float max_x, float max_y, float max_z
+);
+
+rust::Vec<float> merge_global_sdf(
+    rust::Slice<const EntitySdfInfo> entities, // 修改这里：去掉 ffi::
+    int global_res,
+    float world_box_size
+);
+
+
+src\camera\mod.rs
+
+use glam::{Vec3, Mat4};
+
+#[derive(Debug, Clone, Copy)]
+pub struct Camera {
+    pub eye: Vec3,
+    pub yaw: f32,   // 左右看 (弧度)
+    pub pitch: f32, // 上下看 (弧度)
+}
+
+impl Camera {
+    pub fn new(eye: Vec3, yaw: f32, pitch: f32) -> Self {
+        Self { eye, yaw, pitch }
+    }
+
+    pub fn get_view_matrix(&self) -> Mat4 {
+        let forward = self.get_forward();
+        Mat4::look_to_rh(self.eye, forward, Vec3::Y)
+    }
+
+    pub fn get_forward(&self) -> Vec3 {
+        Vec3::new(
+            self.yaw.cos() * self.pitch.cos(),
+            self.pitch.sin(),
+            self.yaw.sin() * self.pitch.cos(),
+        ).normalize()
+    }
+
+    pub fn get_right(&self) -> Vec3 {
+        Vec3::new(-self.yaw.sin(), 0.0, self.yaw.cos()).normalize()
+    }
+}
+
+#[derive(Debug)]
+pub struct CameraController {
+    pub speed: f32,
+    pub is_up_pressed: bool,
+    pub is_down_pressed: bool,
+    pub is_left_pressed: bool,
+    pub is_right_pressed: bool,
+    pub is_q_pressed: bool,
+    pub is_e_pressed: bool,
+}
+
+impl CameraController {
+    pub fn new(speed: f32) -> Self {
+        Self {
+            speed,
+            is_up_pressed: false,
+            is_down_pressed: false,
+            is_left_pressed: false,
+            is_right_pressed: false,
+            is_q_pressed: false,
+            is_e_pressed: false,
+        }
+    }
+
+    pub fn update(&mut self, camera: &mut Camera, delta_time: f32) {
+        let forward = camera.get_forward();
+        let right = camera.get_right();
+        let speed = self.speed * delta_time;
+
+        if self.is_up_pressed {
+            camera.eye += forward * speed;
+        }
+        if self.is_down_pressed {
+            camera.eye -= forward * speed;
+        }
+        if self.is_left_pressed {
+            camera.eye -= right * speed;
+        }
+        if self.is_right_pressed {
+            camera.eye += right * speed;
+        }
+        if self.is_q_pressed {
+            camera.eye.y -= speed;
+        }
+        if self.is_e_pressed {
+            camera.eye.y += speed;
+        }
+    }
+}
+
+
+
+src\console\mod.rs
+
+use wgpu::{Device, Queue, TextureView, CommandEncoder};
+use std::collections::VecDeque;
+
+pub struct Console {
+    pub is_open: bool,
+    pub buffer: String,
+    pub history: VecDeque<String>,
+    pub history_index: Option<usize>,
+    pub visible_lines: usize,
+}
+
+impl Console {
+    pub fn new() -> Self {
+        Self {
+            is_open: false,
+            buffer: String::new(),
+            history: VecDeque::with_capacity(50),
+            history_index: None,
+            visible_lines: 10,
+        }
+    }
+
+    pub fn add_char(&mut self, c: char) {
+        self.buffer.push(c);
+        println!("> {}", self.buffer);
+    }
+
+    pub fn remove_char(&mut self) {
+        if self.buffer.pop().is_some() {
+            println!("> {}", self.buffer);
+        }
+    }
+
+    pub fn execute(&mut self) -> String {
+        let command = self.buffer.trim().to_string();
+        if !command.is_empty() {
+            self.history.push_front(command.clone());
+            if self.history.len() > 50 {
+                self.history.pop_back();
+            }
+        }
+        self.buffer.clear();
+        self.history_index = None;
+        command
+    }
+
+    pub fn navigate_history(&mut self, direction: i32) {
+        let len = self.history.len();
+        if len == 0 {
+            return;
+        }
+
+        self.history_index = match self.history_index {
+            None => {
+                if direction > 0 {
+                    Some(0)
+                } else {
+                    None
+                }
+            }
+            Some(index) => {
+                let new_index = (index as i32 + direction).clamp(0, len as i32 - 1) as usize;
+                Some(new_index)
+            }
+        };
+
+        if let Some(index) = self.history_index {
+            self.buffer = self.history[index].clone();
+        } else {
+            self.buffer.clear();
+        }
+    }
+
+    pub fn render(&self, _device: &Device, _queue: &Queue, _view: &TextureView, _encoder: &mut CommandEncoder) {
+        if !self.is_open {
+            return;
+        }
+
+        // 这里将来可以用实际的文本渲染库实现
+        // 暂时只是占位
+    }
+}
+
+
+
+src\input\mod.rs
+
+use winit::event::{WindowEvent, ElementState, MouseButton, MouseScrollDelta, KeyEvent};
+
+#[derive(Debug, Default)]
+pub struct InputState {
+    pub is_w_pressed: bool,
+    pub is_s_pressed: bool,
+    pub is_a_pressed: bool,
+    pub is_d_pressed: bool,
+    pub is_q_pressed: bool,
+    pub is_e_pressed: bool,
+    pub mouse_pos: (f64, f64),
+    pub is_middle_mouse_pressed: bool,
+    pub last_mouse_pos: Option<(f64, f64)>,
+    pub scroll_delta: f32,
+}
+
+impl InputState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn process_event(&mut self, event: &WindowEvent) {
+        match event {
+            WindowEvent::KeyboardInput { event: input, .. } => {
+                self.process_key_event(input);
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.mouse_pos = (position.x, position.y);
+            }
+            WindowEvent::MouseInput { button, state, .. } => {
+                if button == &MouseButton::Middle {
+                    self.is_middle_mouse_pressed = state == &ElementState::Pressed;
+                    if self.is_middle_mouse_pressed {
+                        self.last_mouse_pos = Some(self.mouse_pos);
+                    } else {
+                        self.last_mouse_pos = None;
+                    }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                match delta {
+                    MouseScrollDelta::LineDelta(_, y) => {
+                        self.scroll_delta += *y;
+                    }
+                    MouseScrollDelta::PixelDelta(_) => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn process_key_event(&mut self, input: &KeyEvent) {
+        let pressed = input.state == ElementState::Pressed;
+        match &input.logical_key {
+            winit::keyboard::Key::Character(c) => match c.as_str() {
+                "w" => self.is_w_pressed = pressed,
+                "s" => self.is_s_pressed = pressed,
+                "a" => self.is_a_pressed = pressed,
+                "d" => self.is_d_pressed = pressed,
+                "q" => self.is_q_pressed = pressed,
+                "e" => self.is_e_pressed = pressed,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    pub fn reset_scroll(&mut self) {
+        self.scroll_delta = 0.0;
+    }
+}
+
+
+
+src\lib.rs
+
+#[cxx::bridge]
+pub mod ffi {
+    unsafe extern "C++" {
+        include!("sdf_logic.hpp");
+
+        // 新增支持 AABB 的烘焙函数
+        fn generate_sdf_baked_aabb(
+            vertices: &[f32],
+            indices: &[u32],
+            res: i32,
+            min_x: f32, min_y: f32, min_z: f32,
+            max_x: f32, max_y: f32, max_z: f32,
+        ) -> Vec<f32>;
+
+        fn merge_global_sdf(
+            entities: &[EntitySdfInfo],
+            global_res: i32,
+            world_box_size: f32
+        ) -> Vec<f32>;
+    }
+
+    #[derive(Debug)]
+    pub struct EntitySdfInfo {
+        pub inv_matrix: [f32; 16],
+        pub sdf_ptr: *const u32,
+        pub res: i32,
+    }
+}
+
+pub mod camera;
+pub mod console;
+pub mod input;
+pub mod models;
+pub mod rendering;
+pub mod scene;
+pub mod undo;
+
+
+
+src\main.rs
+
+use std::{collections::HashMap, fs, sync::Arc};
+use wgpu::util::DeviceExt;
+use winit::{
+    event::*,
+    event_loop::EventLoop,
+    window::{Window, WindowBuilder},
+};
+use serde::{Serialize, Deserialize};
+use glam::{Vec3, Mat4, Vec4Swizzles};
+
+fn load_cpal_to_vec4(file_path: &str) -> Vec<[f32; 4]> {
+    let data = fs::read(file_path).expect("读取色板失败");
+    let mut colors = Vec::with_capacity(1024);
+    
+    // 1. 跳过 8 字节头 (CPAL魔数 4 字节 + Count 4 字节)
+    let color_data = &data[8..];
+    
+    // 2. 每 3 个字节 (RGB) 转为一个 [f32; 4] (RGBA)
+    for chunk in color_data.chunks_exact(3) {
+        let r = chunk[0] as f32 / 255.0;
+        let g = chunk[1] as f32 / 255.0;
+        let b = chunk[2] as f32 / 255.0;
+        colors.push([r, g, b, 1.0]);
+    }
+    
+    // 补齐到 1024 个
+    while colors.len() < 1024 {
+        colors.push([0.0, 0.0, 0.0, 1.0]);
+    }
+    colors
+}
+
+
+
+// --- 导入模块 ---
+use cillin_engine::{camera, console, input, models, rendering, scene, undo};
+
+// --- 配置路径（请确保路径正确） ---
+const MODEL_DIR: &str = "../../Asset/cemModel"; 
+const SCENE_FILE: &str = "scene_data.json";
+
+// --- 数据结构定义 ---
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct Vertex {
+    position: [f32; 3],
+    tex_coords: [f32; 2],
+    normal: [f32; 3],
+}
+
+impl Vertex {
+    fn desc() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x3 },
+                wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x2 },
+                wgpu::VertexAttribute { offset: 20, shader_location: 2, format: wgpu::VertexFormat::Float32x3 },
+            ],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct LightUniform {
+    direction: [f32; 3],
+    _padding: u32,
+    color: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct RenderUniforms {
+    shadows_enabled: u32,
+    ao_enabled: u32,
+    debug_mode: u32, // 0: 正常渲染, 1: SDF 场可视化, 2: UVW 映射可视化
+    _padding: [u32; 5], // 确保大小为 32 字节（4 * 8）
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct Params {
+    view_inv: [[f32; 4]; 4], // 64
+    proj_inv: [[f32; 4]; 4], // 64
+    cam_pos: [f32; 4],       // 16
+    light_dir: [f32; 4],     // 16
+    entity_count: u32,       // 4
+    debug_mode: u32,         // 4
+    _pad1: [f32; 2],         // 8 (vec2<f32>)
+    _pad2: [[f32; 4]; 3],    // 48 (3个vec4<f32>)
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ModelEntry {
+    id: u32,
+    name: String,
+    file: String,
+    default_scale: [f32; 3],
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct AssetManifest {
+    models: Vec<ModelEntry>,
+}
+
+#[derive(PartialEq)]
+enum EditMode { Idle, Grab, Rotate, Scale }
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Axis {
+    None,
+    X,
+    Y,
+    Z,
+}
+
+// --- 核心状态 ---
+
+struct State<'a> {
+    window: Arc<Window>,
+    render_context: rendering::RenderContext<'a>,
+    
+    manifest: HashMap<u32, ModelEntry>,
+    models: HashMap<u32, models::ModelAsset>,
+    entities: Vec<scene::Entity>,
+    instance_counters: std::collections::HashMap<u32, usize>,
+    
+    camera: camera::Camera,
+    controller: camera::CameraController,
+    input_state: input::InputState,
+    camera_buffer: wgpu::Buffer,
+    light_buffer: wgpu::Buffer,
+    render_uniforms_buffer: wgpu::Buffer,
+    
+    edit_mode: EditMode,
+    selected_idx: Option<usize>,
+    active_model_id: u32,
+    selected_axis: Axis,
+    
+    console: console::Console,
+    undo_manager: undo::UndoManager,
+    
+    edit_start_state: Option<undo::EntityAction>,
+    
+    // 全局 SDF 相关
+    global_sdf_texture: wgpu::Texture,
+    global_sdf_view: wgpu::TextureView,
+    global_sdf_sampler: wgpu::Sampler,
+    global_sdf_bind_group: wgpu::BindGroup,
+    
+    // 渲染控制标志
+    shadows_enabled: bool,
+    ao_enabled: bool,
+    debug_mode: u32,
+    
+    // 曦罗混合相关
+    entity_list_buffer: wgpu::Buffer,
+    params_buffer: wgpu::Buffer,
+    palette_buffer: wgpu::Buffer,
+    compute_bind_group: wgpu::BindGroup,
+    blit_bind_group: wgpu::BindGroup,
+    compute_pipeline: wgpu::ComputePipeline,
+    output_texture: wgpu::Texture,
+}
+
+
+
+impl<'a> State<'a> {
+    async fn new(window: Arc<Window>) -> Self {
+        let size = window.inner_size();
+        let instance = wgpu::Instance::default();
+        let surface = instance.create_surface(window.clone()).unwrap();
+        let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: Some(&surface),
+            ..Default::default()
+        }).await.unwrap();
+
+        let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor::default(), None).await.unwrap();
+
+        let caps = surface.get_capabilities(&adapter);
+        // 选择支持的 sRGB 格式
+        let format = caps.formats.iter()
+            .find(|f| **f == wgpu::TextureFormat::Bgra8UnormSrgb)
+            .copied()
+            .unwrap_or(caps.formats[0]);
+        
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.width, height: size.height,
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &config);
+
+        // 1. 加载清单与模型
+        let manifest_raw = fs::read_to_string(format!("{}/manifest.json", MODEL_DIR)).expect("Manifest.json 没找到");
+        let manifest_data: AssetManifest = serde_json::from_str(&manifest_raw).unwrap();
+        let mut manifest_map = HashMap::new();
+        let mut loaded_models = HashMap::new();
+
+        // 创建 BindGroupLayout（只包含纹理和采样器）
+        let texture_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { multisampled: false, view_dimension: wgpu::TextureViewDimension::D2, sample_type: wgpu::TextureSampleType::Float { filterable: true } }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { multisampled: false, view_dimension: wgpu::TextureViewDimension::D3, sample_type: wgpu::TextureSampleType::Uint }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering), count: None },
+            ],
+            label: Some("Texture Layout"),
+        });
+
+        for entry in manifest_data.models {
+            manifest_map.insert(entry.id, entry.clone());
+            
+            let file_path = format!("{}/{}", MODEL_DIR, entry.file);
+            
+            // 尝试加载 CEM 文件，如果文件不存在则跳过
+            if let Ok((voxel_data, aabb_min, aabb_max)) = std::fs::File::open(&file_path).map(|_| {
+                models::load_cem_data(&file_path)
+            }) {
+                // 创建一个空的 ModelAsset（后续会更新为真正的 .cem 加载逻辑）
+                let empty_model = models::ModelAsset {
+                    vertex_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("Empty Vertex Buffer"),
+                        size: 0,
+                        usage: wgpu::BufferUsages::VERTEX,
+                        mapped_at_creation: false,
+                    }),
+                    index_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("Empty Index Buffer"),
+                        size: 0,
+                        usage: wgpu::BufferUsages::INDEX,
+                        mapped_at_creation: false,
+                    }),
+                    num_indices: 0,
+                    bind_group: device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        layout: &texture_bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&device.create_texture(&wgpu::TextureDescriptor {
+                                label: Some("Empty Texture"),
+                                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                                mip_level_count: 1,
+                                sample_count: 1,
+                                dimension: wgpu::TextureDimension::D2,
+                                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                                view_formats: &[],
+                            }).create_view(&wgpu::TextureViewDescriptor::default())) },
+                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&device.create_sampler(&wgpu::SamplerDescriptor::default())) },
+                            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&device.create_texture(&wgpu::TextureDescriptor {
+                                label: Some("Empty SDF Texture"),
+                                size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
+                                mip_level_count: 1,
+                                sample_count: 1,
+                                dimension: wgpu::TextureDimension::D3,
+                                format: wgpu::TextureFormat::R32Uint,
+                                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                                view_formats: &[],
+                            }).create_view(&wgpu::TextureViewDescriptor::default())) },
+                            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&device.create_sampler(&wgpu::SamplerDescriptor::default())) },
+                        ],
+                        label: Some("Empty Bind Group"),
+                    }),
+                    instance_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("Empty Instance Buffer"),
+                        size: 0,
+                        usage: wgpu::BufferUsages::VERTEX,
+                        mapped_at_creation: false,
+                    }),
+                    instance_capacity: 0,
+                    sdf_view: device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("Empty SDF View"),
+                        size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D3,
+                        format: wgpu::TextureFormat::R32Uint,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    }).create_view(&wgpu::TextureViewDescriptor::default()),
+                    dna_data: voxel_data,
+                    albedo_data: None,
+                    aabb_min,
+                    aabb_max,
+                };
+                
+                loaded_models.insert(entry.id, empty_model);
+                println!("Loaded CEM model: {} (id: {})", entry.name, entry.id);
+            } else {
+                println!("Skipping missing CEM model: {} (id: {})", entry.name, entry.id);
+            }
+        }
+
+        // 2. 加载场景
+        let mut instance_counters: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        let entities: Vec<scene::Entity> = fs::read_to_string(SCENE_FILE)
+            .map(|raw| {
+                let scene_data: scene::SceneData = serde_json::from_str(&raw).unwrap();
+                scene_data.entities.into_iter().map(|mut entity| {
+                    if entity.code.is_empty() {
+                        let instance_index = *instance_counters.get(&entity.model_id).unwrap_or(&0);
+                        entity.code = format!("{}s{:06}", entity.model_id, instance_index);
+                        *instance_counters.entry(entity.model_id).or_insert(0) += 1;
+                    }
+                    entity
+                }).collect()
+            })
+            .unwrap_or_default();
+
+        // 3. 相机与管线
+        let camera_pos = Vec3::new(3.0, 3.0, 3.0);
+        let view = Mat4::look_at_rh(camera_pos, Vec3::ZERO, Vec3::Y);
+        let proj = Mat4::perspective_rh(45.0f32.to_radians(), size.width as f32 / size.height as f32, 0.1, 100.0);
+        let camera_matrix = proj * view;
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Camera"),
+            contents: bytemuck::cast_slice(camera_matrix.as_ref()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        
+        let camera_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None }],
+            label: None,
+        });
+        
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &camera_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: camera_buffer.as_entire_binding() }],
+            label: None,
+        });
+
+        // 灯光设置
+        let light_uniform = LightUniform {
+            direction: [-0.5, -0.5, -1.0],
+            _padding: 0,
+            color: [1.0, 1.0, 1.0, 1.0],
+        };
+        let light_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Light"),
+            contents: bytemuck::cast_slice(&[light_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        
+        // 创建渲染控制 uniforms buffer
+        let render_uniforms = RenderUniforms {
+            shadows_enabled: 1,
+            ao_enabled: 1,
+            debug_mode: 0,
+            _padding: [0; 5],
+        };
+        let render_uniforms_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Render Uniforms"),
+            contents: bytemuck::cast_slice(&[render_uniforms]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        
+        let light_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None }],
+            label: None,
+        });
+        
+        let light_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &light_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: light_buffer.as_entire_binding() }],
+            label: None,
+        });
+
+        // 全局 SDF bind group layout
+        let global_sdf_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering), count: None },
+            ],
+            label: None,
+        });
+
+        let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+
+        // --- 1. 大脑布局 (Compute 专用) ---
+        let compute_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Compute Brain Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: wgpu::TextureFormat::Rgba8Unorm, view_dimension: wgpu::TextureViewDimension::D2 }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 5, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        });
+
+        // --- 2. 眼睛布局 (Render 专用) ---
+        let blit_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Blit Eye Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+            ],
+        });
+
+        // --- 创建计算管线布局 ---
+        let compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Compute Pipeline Layout"),
+            bind_group_layouts: &[&compute_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        // --- 创建渲染管线布局 ---
+        let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Render Pipeline Layout"),
+            bind_group_layouts: &[&blit_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        // 1. 创建计算管线 (大脑)
+        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Xi-Luoer Brain Pipeline"),
+            layout: Some(&compute_pipeline_layout),
+            module: &shader,
+            entry_point: "cs_main",
+        });
+
+        // 2. 创建 Blit 管线 (眼睛)
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Blit Display Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_blit",
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_blit",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+
+        let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Depth Texture"),
+            size: wgpu::Extent3d {
+                width: config.width,
+                height: config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // 1. 计算需要盖多少层楼
+        let model_count = loaded_models.len() as u32;
+        let sdf_res = 64;
+        let atlas_depth = sdf_res * model_count;
+
+        // 2. 创建一个超深的 3D 纹理堆栈
+        let global_sdf_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("CEM Holographic Data"),
+            size: wgpu::Extent3d {
+                width: sdf_res,
+                height: sdf_res,
+                depth_or_array_layers: atlas_depth, // 关键：深度是 64 * 模型数
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::R32Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        // 3. 将每个模型的 SDF 数据搬进对应的"楼层"
+        for (id, model) in &loaded_models {
+            // 假设 id 是从 1 开始的，我们映射到 index 0, 1, 2...
+            let index = *id - 1;
+            
+            // 安全检查：防止 Source buffer of size 0
+            if model.dna_data.is_empty() {
+                println!("跳过模型 {} 的纹理上传，数据为空", id);
+                continue;
+            }
+
+            queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &global_sdf_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: index * sdf_res }, // 关键：纵向偏移
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytemuck::cast_slice(&model.dna_data),
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * sdf_res),
+                    rows_per_image: Some(sdf_res),
+                },
+                wgpu::Extent3d { width: sdf_res, height: sdf_res, depth_or_array_layers: sdf_res },
+            );
+        }
+
+        let global_sdf_view = global_sdf_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // 1. 创建纹理阵列（假设贴图都是 512x512）
+        let tex_size = 512;
+        let albedo_array = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Albedo Texture Array"),
+            size: wgpu::Extent3d { width: tex_size, height: tex_size, depth_or_array_layers: model_count },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2, // 2D 数组
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        // 2. 将每个模型的贴图写进去
+        for (id, model) in &loaded_models {
+            // 假设 id 是从 1 开始的，我们映射到 index 0, 1, 2...
+            let index = *id - 1;
+            if let Some(texture_data) = &model.albedo_data {
+                queue.write_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &albedo_array,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x: 0, y: 0, z: index },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    texture_data,
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(4 * tex_size),
+                        rows_per_image: Some(tex_size),
+                    },
+                    wgpu::Extent3d { width: tex_size, height: tex_size, depth_or_array_layers: 1 },
+                );
+            }
+        }
+
+        let albedo_array_view = albedo_array.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // 创建全局 SDF 采样器
+        let global_sdf_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Global SDF Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        // 创建贴图采样器
+        let albedo_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Albedo Sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        // 创建全局 SDF bind group
+        let global_sdf_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &global_sdf_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: camera_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: render_uniforms_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&global_sdf_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&global_sdf_sampler) },
+            ],
+            label: None,
+        });
+
+        // 创建实体清单缓冲区 - 预分配1024个物体的空间
+        let entity_list_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Entity List Buffer"),
+            // 预留 1024 个物体的空间 (每个 256 字节)
+            size: (1024 * 256) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // 创建参数缓冲区
+        let params = Params {
+            view_inv: view.inverse().to_cols_array_2d(),
+            proj_inv: proj.inverse().to_cols_array_2d(),
+            cam_pos: camera_pos.extend(1.0).to_array(),
+            light_dir: Vec3::new(0.5, 1.0, 0.5).normalize().extend(0.0).to_array(), // 从上往下斜着照射
+            entity_count: entities.len() as u32,
+            debug_mode: 0, // 默认关闭调试模式
+            _pad1: [0.0; 2],
+            _pad2: [[0.0; 4]; 3],
+        };
+        
+        let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Params Buffer"),
+            contents: bytemuck::cast_slice(&[params]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // 加载全局色板
+        let palette_data = load_cpal_to_vec4("../../Asset/Global/master.cpal");
+        let palette_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Global Palette Buffer"),
+            contents: bytemuck::cast_slice(&palette_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        // 创建输出纹理视图
+        let output_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Output Texture"),
+            size: wgpu::Extent3d {
+                width: config.width,
+                height: config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            // 关键：必须包含这三个用途
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let output_texture_view = output_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // 创建主绑定组 - 使用第一个模型的SDF
+        let sdf_view = if let Some(model) = loaded_models.get(&1) {
+            &model.sdf_view
+        } else {
+            &global_sdf_view
+        };
+        
+        // --- 创建对应的绑定组 ---
+        let compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &compute_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&output_texture_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: entity_list_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&global_sdf_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: palette_buffer.as_entire_binding() },
+            ],
+            label: Some("Compute Bind Group"),
+        });
+
+        let blit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &blit_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&output_texture_view) },
+            ],
+            label: Some("Blit Bind Group"),
+        });
+
+        // 创建渲染上下文
+        let render_context = rendering::RenderContext::new(
+            surface,
+            device,
+            queue,
+            render_pipeline,
+            None,
+            camera_bind_group,
+            light_bind_group,
+            None,
+            depth_texture,
+            depth_view,
+            size,
+            format,
+        );
+
+        // 摄像机从 (1.5, 1.5, 1.5) 看向原点 (0, 0, 0)，距离更近以增强透视效果
+        let camera = camera::Camera::new(
+            Vec3::new(1.5, 1.5, 1.5),
+            -135.0f32.to_radians(), // 朝向原点的水平角度
+            -35.0f32.to_radians(), // 向下看的垂直角度
+        );
+        
+        let controller = camera::CameraController::new(0.25); // 降低移动速度
+        
+        let input_state = input::InputState::new();
+
+        let mut state = Self {
+            window,
+            render_context,
+            manifest: manifest_map,
+            models: loaded_models,
+            entities,
+            instance_counters,
+            camera,
+            controller,
+            input_state,
+            camera_buffer,
+            light_buffer,
+            render_uniforms_buffer,
+            edit_mode: EditMode::Idle,
+            selected_idx: None,
+            active_model_id: 1,
+            selected_axis: Axis::None,
+            console: console::Console::new(),
+            undo_manager: undo::UndoManager::new(50),
+            edit_start_state: None,
+            
+            // --- 补充下面这四个缺失的字段 ---
+            global_sdf_texture,
+            global_sdf_view,
+            global_sdf_sampler,
+            global_sdf_bind_group,
+            
+            // 初始化渲染控制标志
+            shadows_enabled: true,
+            ao_enabled: true,
+            debug_mode: 0,
+            
+            // 曦罗混合相关
+            entity_list_buffer,
+            params_buffer,
+            palette_buffer,
+            compute_bind_group,
+            blit_bind_group,
+            compute_pipeline,
+            output_texture,
+        };
+
+        // 关键：启动时先计算一次场景 SDF
+        // state.update_global_sdf(); // 暂时停用，因为 C++ 还没支持 DNA 合并
+
+        state
+    }
+
+    fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+        if new_size.width > 0 && new_size.height > 0 {
+            self.render_context.resize(new_size);
+        }
+    }
+
+    fn save_scene(&self) {
+        let scene_manager = scene::SceneManager {
+            entities: self.entities.clone(),
+            next_entity_id: self.entities.len(),
+            models: HashMap::new(),
+            instance_counters: HashMap::new(),
+        };
+        
+        if scene_manager.save_scene(SCENE_FILE).is_ok() {
+            println!("场景已存至 {}", SCENE_FILE);
+        } else {
+            println!("保存失败");
+        }
+    }
+
+
+
+    fn get_click_ground_pos(&self) -> Vec3 {
+        let (x, y) = self.input_state.mouse_pos;
+        let ndc = glam::vec4(
+            (x as f32 / self.render_context.size.width as f32) * 2.0 - 1.0,
+            1.0 - (y as f32 / self.render_context.size.height as f32) * 2.0,
+            0.0, 1.0
+        );
+        let inv_vp = (self.render_context.current_proj * self.render_context.current_view).inverse();
+        let world_pos = inv_vp * ndc;
+        let world_pos = world_pos.xyz() / world_pos.w;
+        let ray_dir = (world_pos - self.camera.eye).normalize();
+        
+        let t = -self.camera.eye.y / ray_dir.y;
+        self.camera.eye + ray_dir * t
+    }
+
+    fn get_clicked_entity(&self) -> Option<&scene::Entity> {
+        let (x, y) = self.input_state.mouse_pos;
+        let ndc = glam::vec4(
+            (x as f32 / self.render_context.size.width as f32) * 2.0 - 1.0,
+            1.0 - (y as f32 / self.render_context.size.height as f32) * 2.0,
+            0.0, 1.0
+        );
+        let inv_vp = (self.render_context.current_proj * self.render_context.current_view).inverse();
+        let world_pos = inv_vp * ndc;
+        let world_pos = world_pos.xyz() / world_pos.w;
+        let ray_dir = (world_pos - self.camera.eye).normalize();
+
+        let mut closest_entity: Option<&scene::Entity> = None;
+        let mut closest_t = f32::MAX;
+
+        for entity in &self.entities {
+            let model_matrix = Mat4::from_cols_array_2d(&entity.get_model_matrix());
+            let entity_center = model_matrix.transform_point3(Vec3::ZERO);
+            let entity_scale = entity.scale.max_element();
+            
+            let offset = entity_center - self.camera.eye;
+            let b = offset.dot(ray_dir);
+            let c = offset.dot(offset) - entity_scale * entity_scale * 0.5;
+            
+            let discriminant = b * b - c;
+            if discriminant< 0.0 {
+                continue;
+            }
+            
+            let t = b - discriminant.sqrt();
+            if t >0.0 && t< closest_t {
+                closest_t = t;
+                closest_entity = Some(entity);
+            }
+        }
+
+        closest_entity
+    }
+
+    fn undo(&mut self) {
+        self.undo_manager.undo(&mut self.entities);
+    }
+
+    fn redo(&mut self) {
+        self.undo_manager.redo(&mut self.entities);
+    }
+
+    fn execute_command(&mut self) {
+        let command = self.console.execute();
+        if command.is_empty() {
+            self.console.is_open = false;
+            self.edit_mode = EditMode::Idle;
+            return;
+        }
+
+        println!("执行命令: {}", command);
+        
+        let parts: Vec<&str> = command.split_whitespace().collect();
+        if let Some(cmd) = parts.first() {
+            match *cmd {
+                "help" => println!("可用命令: help, exit, spawn <model_id>, cmr <x> <y> <z>, cmr now, sdf, shadow, ao, debug <0|1|2>"),
+                "exit" => println!("控制台已关闭"),
+                "spawn" => {
+                    if parts.len() >= 2 {
+                        if let Ok(model_id) = parts[1].parse::<u32>() {
+                            let pos = self.get_click_ground_pos();
+                            let instance_index = *self.instance_counters.get(&model_id).unwrap_or(&0);
+                            let entity = scene::Entity::new(
+                                self.entities.len(),
+                                model_id,
+                                instance_index,
+                                pos,
+                                Vec3::ZERO,
+                                Vec3::ONE,
+                                [1.0, 1.0, 1.0, 1.0],
+                            );
+                            self.entities.push(entity);
+                            *self.instance_counters.entry(model_id).or_insert(0) += 1;
+                            println!("已在位置 {:?} 生成模型 {}", pos, model_id);
+                        } else {
+                            println!("错误: 无效的模型 ID");
+                        }
+                    } else {
+                        println!("错误: 请提供模型 ID");
+                    }
+                }
+                "cmr" => {
+                    if parts.len() >= 2 && parts[1] == "now" {
+                        println!("摄像机当前位置: ({}, {}, {})", 
+                            self.camera.eye.x, 
+                            self.camera.eye.y, 
+                            self.camera.eye.z);
+                    } else if parts.len() >= 4 {
+                        if let (Ok(x), Ok(y), Ok(z)) = (
+                            parts[1].parse::<f32>(),
+                            parts[2].parse::<f32>(),
+                            parts[3].parse::<f32>(),
+                        ) {
+                            self.camera.eye = Vec3::new(x, y, z);
+                            println!("摄像机已移动到位置 ({}, {}, {})", x, y, z);
+                        } else {
+                            println!("错误: 无效的坐标");
+                        }
+                    } else {
+                        println!("错误: 使用方法: cmr <x> <y> <z> 或 cmr now");
+                    }
+                }
+
+                "shadow" => {
+                    self.shadows_enabled = !self.shadows_enabled;
+                    println!("影子已{}", if self.shadows_enabled { "开启" } else { "关闭" });
+                }
+                "ao" => {
+                    self.ao_enabled = !self.ao_enabled;
+                    println!("环境光遮蔽已{}", if self.ao_enabled { "开启" } else { "关闭" });
+                }
+                "debug" => {
+                    if parts.len() >= 2 {
+                        if let Ok(mode) = parts[1].parse::<u32>() {
+                            self.debug_mode = mode;
+                            println!("调试模式已切换为: {}", mode);
+                        }
+                    } else {
+                        println!("用法: debug <0|1|2> (0:关, 1:距离场, 2:坐标映射)");
+                    }
+                }
+                _ => println!("未知命令: {}", cmd),
+            }
+        }
+        self.console.is_open = false;
+        self.edit_mode = EditMode::Idle;
+    }
+
+    fn update(&mut self) {
+        // 从输入状态更新控制器状态
+        self.controller.is_up_pressed = self.input_state.is_w_pressed;
+        self.controller.is_down_pressed = self.input_state.is_s_pressed;
+        self.controller.is_left_pressed = self.input_state.is_a_pressed;
+        self.controller.is_right_pressed = self.input_state.is_d_pressed;
+        self.controller.is_q_pressed = self.input_state.is_q_pressed;
+        self.controller.is_e_pressed = self.input_state.is_e_pressed;
+        
+        // 更新相机位置
+        self.controller.update(&mut self.camera, 1.0);
+        
+        // 更新视图和投影矩阵
+        self.render_context.current_view = self.camera.get_view_matrix();
+        self.render_context.current_proj = Mat4::perspective_rh(
+            45.0f32.to_radians(), 
+            self.render_context.size.width as f32 / self.render_context.size.height as f32, 
+            0.1, 
+            100.0
+        );
+        
+        // 更新相机缓冲区
+        let camera_matrix = self.render_context.current_proj * self.render_context.current_view;
+        self.render_context.queue.write_buffer(
+            &self.camera_buffer, 
+            0, 
+            bytemuck::cast_slice(camera_matrix.as_ref())
+        );
+    }
+
+    fn update_instance_buffer(&mut self, model_id: u32) {
+        // 1. 收集当前模型的所有实例数据
+        let instances: Vec<scene::InstanceRaw> = self.entities
+            .iter()
+            .filter(|e| e.model_id == model_id)
+            .map(|e| e.to_raw())
+            .collect();
+            
+        if instances.is_empty() {
+            return;
+        }
+
+        let model_asset = self.models.get_mut(&model_id).unwrap();
+        let instance_count = instances.len();
+
+        // 2. 检查容量：如果现有的 Buffer 装不下了，就扩容
+        if instance_count > model_asset.instance_capacity {
+            // 策略：扩容到当前需求的 2 倍，防止频繁重分配
+            model_asset.instance_capacity = instance_count * 2;
+            
+            model_asset.instance_buffer = self.render_context.device.create_buffer(&wgpu::BufferDescriptor { 
+                label: Some(&format!("Model {} Instance Buffer", model_id)), 
+                size: (model_asset.instance_capacity * std::mem::size_of::<scene::InstanceRaw>()) as u64, 
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, 
+                mapped_at_creation: false, 
+            }); 
+            println!("Model {} 显存扩容至: {}", model_id, model_asset.instance_capacity); 
+        }
+
+        // 3. 高效同步数据：只把改变的数据写入显存
+        self.render_context.queue.write_buffer( 
+            &model_asset.instance_buffer, 
+            0, 
+            bytemuck::cast_slice(&instances), 
+        ); 
+    }
+
+    fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        // 更新实体清单缓冲区
+        let entity_data: Vec<scene::EntityData> = self.entities.iter()
+            .map(|e| {
+                let model = self.models.get(&e.model_id).unwrap();
+                // 关键修复：这里的 0 必须改为对应的层索引 (ID - 1)
+                let layer_index = e.model_id - 1;
+                e.to_entity_data(layer_index, model.aabb_min, model.aabb_max)
+            })
+            .collect();
+        
+        self.render_context.queue.write_buffer(
+            &self.entity_list_buffer,
+            0,
+            bytemuck::cast_slice(&entity_data),
+        );
+        
+        // 更新参数缓冲区
+        let params = Params {
+            view_inv: self.render_context.current_view.inverse().to_cols_array_2d(),
+            proj_inv: self.render_context.current_proj.inverse().to_cols_array_2d(),
+            cam_pos: self.camera.eye.extend(1.0).to_array(),
+            light_dir: Vec3::new(0.5, 1.0, 0.5).normalize().extend(0.0).to_array(), // 从上往下斜着照射
+            entity_count: self.entities.len() as u32,
+            debug_mode: self.debug_mode,
+            _pad1: [0.0; 2],
+            _pad2: [[0.0; 4]; 3],
+        };
+        
+        self.render_context.queue.write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&[params]));
+        
+        let mut encoder = self.render_context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+        // 第一步：计算大脑
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            cpass.set_pipeline(&self.compute_pipeline);
+            cpass.set_bind_group(0, &self.compute_bind_group, &[]); // 使用计算专用组
+            cpass.dispatch_workgroups((self.render_context.size.width + 7) / 8, (self.render_context.size.height + 7) / 8, 1);
+        }
+
+        // 第二步：眼睛展示
+        let output = self.render_context.surface.get_current_texture()?;
+        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Blit Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            rpass.set_pipeline(&self.render_context.render_pipeline);
+            rpass.set_bind_group(0, &self.blit_bind_group, &[]); // 使用展示专用组
+            rpass.draw(0..3, 0..1); // 画一个全屏三角形
+        }
+
+        self.render_context.queue.submit(std::iter::once(encoder.finish()));
+        output.present();
+        Ok(())
+    }
+}
+
+// --- 程序入口 ---
+
+fn main() {
+    env_logger::init();
+    let event_loop = EventLoop::new().unwrap();
+    let window = Arc::new(WindowBuilder::new().with_title("Developer Mode Engine").build(&event_loop).unwrap());
+
+    let mut state: State<'_> = pollster::block_on(State::new(window.clone()));
+
+    event_loop.run(move |event, elwt| match event {
+        Event::WindowEvent { ref event, window_id } if window_id == state.window.id() => match event {
+            WindowEvent::CloseRequested => elwt.exit(),
+            WindowEvent::Resized(s) => state.resize(*s),
+            WindowEvent::MouseInput { button, state: button_state, .. } => {
+                if button == &MouseButton::Middle {
+                    state.input_state.is_middle_mouse_pressed = *button_state == ElementState::Pressed;
+                    if state.input_state.is_middle_mouse_pressed {
+                        state.input_state.last_mouse_pos = Some(state.input_state.mouse_pos);
+                    } else {
+                        state.input_state.last_mouse_pos = None;
+                    }
+                } else if button == &MouseButton::Left {
+                    if *button_state == ElementState::Pressed {
+                        if let Some(entity) = state.get_clicked_entity() {
+                            println!("{}", entity.model_id);
+                            println!("{}", entity.code);
+                            state.selected_idx = Some(state.entities.iter().position(|e| e.id == entity.id).unwrap());
+                            state.edit_mode = EditMode::Idle;
+                        } else if state.selected_idx.is_some() {
+                            println!("cancel");
+                            if let Some(mut action) = state.edit_start_state.take() {
+                                if let Some(idx) = state.selected_idx {
+                                    action.new_position = state.entities[idx].position;
+                                    action.new_rotation = state.entities[idx].rotation;
+                                    action.new_scale = state.entities[idx].scale;
+                                    state.undo_manager.push(action);
+                                }
+                            }
+                            state.selected_idx = None;
+                            state.edit_mode = EditMode::Idle;
+                            state.selected_axis = Axis::None;
+                        }
+                    } else if state.edit_mode != EditMode::Idle {
+                        if let Some(mut action) = state.edit_start_state.take() {
+                            if let Some(idx) = state.selected_idx {
+                                action.new_position = state.entities[idx].position;
+                                action.new_rotation = state.entities[idx].rotation;
+                                action.new_scale = state.entities[idx].scale;
+                                state.undo_manager.push(action);
+                            }
+                        }
+                        state.edit_mode = EditMode::Idle;
+                        state.selected_axis = Axis::None;
+                    }
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let new_pos = (position.x, position.y);
+                if let Some(last_pos) = state.input_state.last_mouse_pos {
+                    let dx = -(new_pos.0 - last_pos.0) as f32;
+                    let dy = (new_pos.1 - last_pos.1) as f32;
+                    
+                    state.camera.yaw -= dx * 0.001;
+                    state.camera.pitch -= dy * 0.001;
+                    
+                    state.camera.pitch = state.camera.pitch.max(-std::f32::consts::FRAC_PI_2).min(std::f32::consts::FRAC_PI_2);
+                } else if state.selected_idx.is_some() && state.edit_mode != EditMode::Idle {
+                    match state.edit_mode {
+                        EditMode::Grab => {
+                            if let Some(idx) = state.selected_idx {
+                                let dx = (new_pos.0 - state.input_state.mouse_pos.0) as f32 * 0.01;
+                                let dy = (state.input_state.mouse_pos.1 - new_pos.1) as f32 * 0.01;
+                                
+                                match state.selected_axis {
+                                    Axis::X => {
+                                        state.entities[idx].position.x += dx;
+                                    }
+                                    Axis::Y => {
+                                        state.entities[idx].position.y += dy;
+                                    }
+                                    Axis::Z => {
+                                        state.entities[idx].position.z += dy;
+                                    }
+                                    Axis::None => {}
+                                }
+                                
+
+                            }
+                        }
+                        EditMode::Scale => {
+                            if let Some(idx) = state.selected_idx {
+                                let dy = (new_pos.1 - state.input_state.mouse_pos.1) as f32 * 0.005;
+                                let scale_factor = 1.0 + dy;
+                                
+                                state.entities[idx].scale *= scale_factor;
+                                
+
+                            }
+                        }
+                        EditMode::Rotate => {
+                            if let Some(idx) = state.selected_idx {
+                                let dx = (new_pos.0 - state.input_state.mouse_pos.0) as f32 * 0.01;
+                                let dy = (new_pos.1 - state.input_state.mouse_pos.1) as f32 * 0.01;
+                                
+                                state.entities[idx].rotation.y += dx;
+                                state.entities[idx].rotation.x += dy;
+                                
+
+                            }
+                        }
+                        EditMode::Idle => {}
+                    }
+                };
+                state.input_state.last_mouse_pos = if state.input_state.is_middle_mouse_pressed {
+                    Some(new_pos)
+                } else {
+                    None
+                };
+                state.input_state.mouse_pos = new_pos;
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if state.console.is_open {
+                    if event.state == ElementState::Pressed {
+                        if matches!(event.logical_key, winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace)) {
+                            state.console.remove_char();
+                        } else if let Some(text) = &event.text {
+                            if text == "\r" {
+                                state.execute_command();
+                            } else if text != "\x08" { // 跳过退格符
+                                state.console.add_char(text.chars().next().unwrap());
+                            }
+                        } else if matches!(event.logical_key, winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)) {
+                            state.console.is_open = false;
+                            state.edit_mode = EditMode::Idle;
+                        }
+                    }
+                    return;
+                }
+                
+                // 使用输入模块处理按键
+                state.input_state.process_key_event(event);
+                
+                // 处理特殊按键
+                if let winit::keyboard::Key::Character(c) = &event.logical_key {
+                    if event.state == ElementState::Pressed {
+                        match c.as_str() {
+                            "p" => state.save_scene(),
+                            "/" => state.console.is_open = true,
+                            "g" | "G" => {
+                                if let Some(idx) = state.selected_idx {
+                                    state.edit_mode = EditMode::Grab;
+                                    state.selected_axis = Axis::None;
+                                    state.edit_start_state = Some(undo::EntityAction {
+                                        entity_id: idx,
+                                        old_position: state.entities[idx].position,
+                                        old_rotation: state.entities[idx].rotation,
+                                        old_scale: state.entities[idx].scale,
+                                        new_position: state.entities[idx].position,
+                                        new_rotation: state.entities[idx].rotation,
+                                        new_scale: state.entities[idx].scale,
+                                    });
+                                }
+                            }
+                            "x" | "X" => {
+                                if state.edit_mode == EditMode::Grab {
+                                    state.selected_axis = Axis::X;
+                                }
+                            }
+                            "y" | "Y" => {
+                                if state.edit_mode == EditMode::Grab {
+                                    state.selected_axis = Axis::Y;
+                                } else {
+                                    state.redo();
+                                }
+                            }
+                            "z" | "Z" => {
+                                if state.edit_mode == EditMode::Grab {
+                                    state.selected_axis = Axis::Z;
+                                }
+                            }
+                            "s" | "S" => {
+                                if let Some(idx) = state.selected_idx {
+                                    state.edit_mode = EditMode::Scale;
+                                    state.edit_start_state = Some(undo::EntityAction {
+                                        entity_id: idx,
+                                        old_position: state.entities[idx].position,
+                                        old_rotation: state.entities[idx].rotation,
+                                        old_scale: state.entities[idx].scale,
+                                        new_position: state.entities[idx].position,
+                                        new_rotation: state.entities[idx].rotation,
+                                        new_scale: state.entities[idx].scale,
+                                    });
+                                }
+                            }
+                            "r" | "R" => {
+                                if let Some(idx) = state.selected_idx {
+                                    state.edit_mode = EditMode::Rotate;
+                                    state.edit_start_state = Some(undo::EntityAction {
+                                        entity_id: idx,
+                                        old_position: state.entities[idx].position,
+                                        old_rotation: state.entities[idx].rotation,
+                                        old_scale: state.entities[idx].scale,
+                                        new_position: state.entities[idx].position,
+                                        new_rotation: state.entities[idx].rotation,
+                                        new_scale: state.entities[idx].scale,
+                                    });
+                                }
+                            }
+                            "u" | "U" => {
+                                state.undo();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            WindowEvent::MouseWheel { delta: _, .. } => {
+                state.input_state.process_event(event);
+                // 使用滚轮调整相机位置
+                state.camera.eye += state.camera.get_forward() * state.input_state.scroll_delta * 0.1;
+                state.input_state.reset_scroll();
+            }
+            WindowEvent::RedrawRequested => {
+                state.update();
+                match state.render() {
+                    Ok(_) => {}
+                    Err(wgpu::SurfaceError::Lost) => state.resize(state.render_context.size),
+                    Err(e) => eprintln!("{:?}", e),
+                }
+            }
+            _ => {}
+        },
+        Event::AboutToWait => state.window.request_redraw(),
+        _ => {}
+    }).unwrap();
+}
+
+
+
+src\models\mod.rs
+
+use wgpu::{Device, Queue, BindGroup, BindGroupLayout, Buffer};
+use wgpu::util::DeviceExt;
+use bytemuck::{Pod, Zeroable};
+use std::error::Error;
+use std::fs::File;
+use std::io::Read;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct Vertex {
+    pub position: [f32; 3],
+    pub tex_coords: [f32; 2],
+    pub normal: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct ModelInfo {
+    pub aabb_min: [f32; 4],
+    pub aabb_max: [f32; 4],
+}
+
+
+
+pub struct ModelAsset {
+    pub vertex_buffer: Buffer,
+    pub index_buffer: Buffer,
+    pub num_indices: u32,
+    pub bind_group: BindGroup,
+    
+    // 持久化实例数据
+    pub instance_buffer: Buffer,
+    pub instance_capacity: usize,
+    
+    // SDF 3D 贴图
+    pub sdf_view: wgpu::TextureView,
+    
+    // 关键改变：统一使用 u32 存储 DNA 数据
+    pub dna_data: Vec<u32>,
+    
+    // 原始贴图数据（用于贴图阵列）
+    pub albedo_data: Option<Vec<u8>>,
+    
+    // AABB 信息
+    pub aabb_min: [f32; 4],
+    pub aabb_max: [f32; 4],
+}
+
+pub fn load_glb(
+    device: &Device,
+    queue: &Queue,
+    path: &str,
+    layout: &BindGroupLayout,
+) -> Result<ModelAsset, Box<dyn Error>> {
+    let (gltf, buffers, images) = gltf::import(path)?;
+    
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let mut min = glam::Vec3::splat(f32::MAX);
+    let mut max = glam::Vec3::splat(f32::MIN);
+
+    for mesh in gltf.meshes() {
+        for primitive in mesh.primitives() {
+            let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
+            let pos_reader = reader.read_positions().ok_or("Failed to read positions")?;
+            let tex_reader = reader.read_tex_coords(0).ok_or("Failed to read tex coords")?.into_f32();
+            let norm_reader = reader.read_normals().ok_or("Failed to read normals")?;
+
+            for ((pos, tex), norm) in pos_reader.zip(tex_reader).zip(norm_reader) {
+                vertices.push(Vertex { position: pos, tex_coords: tex, normal: norm });
+                let pos_vec3 = glam::Vec3::from(pos);
+                min = min.min(pos_vec3);
+                max = max.max(pos_vec3);
+            }
+            if let Some(idx) = reader.read_indices() {
+                indices.extend(idx.into_u32());
+            }
+        }
+    }
+
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Vertex Buffer"),
+        contents: bytemuck::cast_slice(&vertices),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+
+    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Index Buffer"),
+        contents: bytemuck::cast_slice(&indices),
+        usage: wgpu::BufferUsages::INDEX,
+    });
+
+    // --- 核心修复：优先加载 .cem DNA ---
+    let cem_path = path.replace(".glb", ".cem");
+    let (dna_data, aabb_min, aabb_max) = if std::path::Path::new(&cem_path).exists() {
+        println!("检测到全息 DNA 资产，正在加载: {}", cem_path);
+        load_cem_data(&cem_path)
+    } else {
+        // 如果没有 .cem，我们降级生成一个空的或者报错
+        // 既然你已经有了 cem_compiler，建议先运行编译工具生成 .cem
+        println!("警告: 未找到 .cem 文件，该模型将无法在 DNA 模式下渲染!");
+        (vec![0u32; 64*64*64], [0.0; 4], [0.0; 4])
+    };
+
+    let (_texture, diffuse_view, sampler, albedo_data) = if let Some(image) = images.iter().next() {
+        let texture_size = wgpu::Extent3d { 
+            width: image.width, 
+            height: image.height, 
+            depth_or_array_layers: 1 
+        };
+
+        // --- 核心修复逻辑：RGB 转 RGBA --- 
+        let rgba_pixels = if image.pixels.len() == (image.width * image.height * 3) as usize { 
+            // 如果是 RGB，手动补上 A 通道 (255) 
+            let mut temp = Vec::with_capacity((image.width * image.height * 4) as usize); 
+            for chunk in image.pixels.chunks(3) { 
+                temp.push(chunk[0]); // R 
+                temp.push(chunk[1]); // G 
+                temp.push(chunk[2]); // B 
+                temp.push(255);      // A (不透明) 
+            } 
+            temp 
+        } else { 
+            // 如果已经是 RGBA，直接用 
+            image.pixels.clone() 
+        }; 
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor { 
+            label: Some("Diffuse Texture"), 
+            size: texture_size, 
+            mip_level_count: 1, 
+            sample_count: 1, 
+            dimension: wgpu::TextureDimension::D2, 
+            format: wgpu::TextureFormat::Rgba8UnormSrgb, // 对应 4 通道 
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, 
+            view_formats: &[], 
+        }); 
+        
+        queue.write_texture( 
+            wgpu::ImageCopyTexture { 
+                texture: &texture, 
+                mip_level: 0, 
+                origin: wgpu::Origin3d::ZERO, 
+                aspect: wgpu::TextureAspect::All, 
+            }, 
+            &rgba_pixels, // 使用转换后的像素 
+            wgpu::ImageDataLayout { 
+                offset: 0, 
+                bytes_per_row: Some(4 * image.width), // 必须是 4 
+                rows_per_image: Some(image.height), 
+            }, 
+            texture_size, 
+        );
+        
+        let diffuse_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Diffuse Sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        
+        (texture, diffuse_view, sampler, Some(rgba_pixels))
+    } else {
+        let texture_size = wgpu::Extent3d { width: 256, height: 256, depth_or_array_layers: 1 };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Default Texture"), 
+            size: texture_size, 
+            mip_level_count: 1, 
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2, 
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, 
+            view_formats: &[],
+        });
+        
+        let mut pixels = vec![0u8; (256 * 256 * 4) as usize];
+        for y in 0..256 {
+            for x in 0..256 {
+                let idx = (y * 256 + x) * 4;
+                if (x / 32 + y / 32) % 2 == 0 {
+                    pixels[idx] = 255;
+                    pixels[idx + 1] = 255;
+                    pixels[idx + 2] = 255;
+                    pixels[idx + 3] = 255;
+                } else {
+                    pixels[idx] = 128;
+                    pixels[idx + 1] = 128;
+                    pixels[idx + 2] = 128;
+                    pixels[idx + 3] = 255;
+                }
+            }
+        }
+        
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &pixels,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * 256),
+                rows_per_image: Some(256),
+            },
+            texture_size,
+        );
+        
+        let diffuse_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Default Sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        
+        (texture, diffuse_view, sampler, Some(pixels))
+    };
+
+    // 创建一个占位的纹理视图（因为现在 Shader 统一走 global_sdf_texture）
+    let dummy_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Dummy"),
+        size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        mip_level_count: 1, 
+        sample_count: 1, 
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::R32Uint,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let sdf_view = dummy_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let sdf_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("SDF Sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&diffuse_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&sdf_view) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&sdf_sampler) },
+        ],
+        label: None,
+    });
+
+    // 初始化实例缓冲区（初始容量为 16）
+    let initial_capacity = 16;
+    let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Instance Buffer"),
+        size: (initial_capacity * std::mem::size_of::<super::scene::InstanceRaw>()) as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    Ok(ModelAsset {
+        vertex_buffer,
+        index_buffer,
+        num_indices: indices.len() as u32,
+        bind_group,
+        instance_buffer,
+        instance_capacity: initial_capacity,
+        sdf_view,
+        dna_data,
+        albedo_data,
+        aabb_min,
+        aabb_max,
+    })
+}
+
+pub fn load_cem_data(path: &str) -> (Vec<u32>, [f32; 4], [f32; 4]) {
+    let mut file = File::open(path).expect("找不到 CEM 模型文件");
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).expect("读取文件失败");
+
+    // 1. 验证魔数
+    let magic = &buffer[0..4];
+    if magic != b"CEM2" {
+        panic!("模型格式不匹配！期望 CEM2，得到 {:?}", magic);
+    }
+
+    // 2. 提取 AABB (12字节 min + 12字节 max)
+    let min_x = f32::from_le_bytes(buffer[8..12].try_into().unwrap());
+    let min_y = f32::from_le_bytes(buffer[12..16].try_into().unwrap());
+    let min_z = f32::from_le_bytes(buffer[16..20].try_into().unwrap());
+    
+    let max_x = f32::from_le_bytes(buffer[20..24].try_into().unwrap());
+    let max_y = f32::from_le_bytes(buffer[24..28].try_into().unwrap());
+    let max_z = f32::from_le_bytes(buffer[28..32].try_into().unwrap());
+
+    // 3. 提取 Voxel 数据 (从第 32 字节开始，全是 u32)
+    let voxel_data_u32: Vec<u32> = buffer[32..].chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+
+    println!("🚀 已成功加载全息资产: {} | 数据量: {}", path, voxel_data_u32.len());
+
+    let min_b: [f32; 4] = [min_x, min_y, min_z, 1.0];
+    let max_b: [f32; 4] = [max_x, max_y, max_z, 1.0];
+
+    (voxel_data_u32, min_b, max_b)
+}
+
+
+
+src\rendering\mod.rs
+
+use wgpu::{Device, Queue, Surface, TextureView, CommandEncoder, RenderPass, BindGroup, RenderPipeline, ComputePipeline};
+use glam::Mat4;
+
+pub struct RenderContext<'a> {
+    pub surface: Surface<'a>,
+    pub device: Device,
+    pub queue: Queue,
+    pub render_pipeline: RenderPipeline,
+    pub compute_pipeline: Option<ComputePipeline>,
+    pub camera_bind_group: BindGroup,
+    pub light_bind_group: BindGroup,
+    pub main_bind_group: Option<BindGroup>,
+    pub depth_texture: wgpu::Texture,
+    pub depth_view: TextureView,
+    pub size: winit::dpi::PhysicalSize<u32>,
+    pub format: wgpu::TextureFormat,
+    pub current_view: Mat4,
+    pub current_proj: Mat4,
+}
+
+impl<'a> RenderContext<'a> {
+    pub fn new(
+        surface: Surface<'a>,
+        device: Device,
+        queue: Queue,
+        render_pipeline: RenderPipeline,
+        compute_pipeline: Option<ComputePipeline>,
+        camera_bind_group: BindGroup,
+        light_bind_group: BindGroup,
+        main_bind_group: Option<BindGroup>,
+        depth_texture: wgpu::Texture,
+        depth_view: TextureView,
+        size: winit::dpi::PhysicalSize<u32>,
+        format: wgpu::TextureFormat,
+    ) -> Self {
+        Self {
+            surface,
+            device,
+            queue,
+            render_pipeline,
+            compute_pipeline,
+            camera_bind_group,
+            light_bind_group,
+            main_bind_group,
+            depth_texture,
+            depth_view,
+            size,
+            format,
+            current_view: Mat4::from_cols_array_2d(&[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]),
+            current_proj: Mat4::from_cols_array_2d(&[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]),
+        }
+    }
+
+    pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+        self.size = new_size;
+        self.surface.configure(&self.device, &wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: self.format,
+            width: new_size.width,
+            height: new_size.height,
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        });
+
+        let depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Depth Texture"),
+            size: wgpu::Extent3d {
+                width: new_size.width,
+                height: new_size.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        self.depth_texture = depth_texture;
+        self.depth_view = self.depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    }
+
+    pub fn begin_render_pass<'b>(
+        &'b self,
+        encoder: &'b mut CommandEncoder,
+        view: &'b TextureView,
+    ) -> RenderPass<'b> {
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Render Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.1, g: 0.2, b: 0.3, a: 1.0 }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        })
+    }
+}
+
+
+
+src\scene\mod.rs
+
+use glam::{Vec3, Quat, Mat4};
+use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
+use bytemuck::{Pod, Zeroable};
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct InstanceRaw {
+    pub model_matrix: [[f32; 4]; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct EntityData {
+    pub model_matrix: [[f32; 4]; 4],     // 64
+    pub inv_model_matrix: [[f32; 4]; 4], // 64
+    pub base_color: [f32; 4],           // 16
+    pub aabb_min: [f32; 4],             // 16
+    pub aabb_max: [f32; 4],             // 16
+    pub sdf_index: u32,                 // 4
+    pub instance_scale: f32,            // 4
+    // 修改：补齐到 256 字节 (256 - 184 = 72字节 = 18个u32)
+    pub _padding: [u32; 18],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Entity {
+    pub id: usize,
+    pub model_id: u32,
+    pub position: Vec3,
+    pub rotation: Vec3,
+    pub scale: Vec3,
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub base_color: [f32; 4],
+}
+
+impl Entity {
+    pub fn new(id: usize, model_id: u32, instance_index: usize, position: Vec3, rotation: Vec3, scale: Vec3, base_color: [f32; 4]) -> Self {
+        let code = format!("{}s{:06}", model_id, instance_index);
+        Self {
+            id,
+            model_id,
+            position,
+            rotation,
+            scale,
+            code,
+            base_color,
+        }
+    }
+
+    pub fn get_model_matrix(&self) -> [[f32; 4]; 4] {
+        let rotation = Quat::from_euler(glam::EulerRot::YXZ, 
+            self.rotation.y, 
+            self.rotation.x, 
+            self.rotation.z
+        );
+        
+        let matrix = Mat4::from_scale_rotation_translation(
+            self.scale,
+            rotation,
+            self.position
+        );
+        
+        matrix.to_cols_array_2d()
+    }
+
+    pub fn get_inv_model_matrix(&self) -> [[f32; 4]; 4] {
+        let rotation = Quat::from_euler(glam::EulerRot::YXZ, 
+            self.rotation.y, 
+            self.rotation.x, 
+            self.rotation.z
+        );
+        
+        let matrix = Mat4::from_scale_rotation_translation(
+            self.scale,
+            rotation,
+            self.position
+        );
+        
+        matrix.inverse().to_cols_array_2d()
+    }
+
+    pub fn to_raw(&self) -> InstanceRaw {
+        InstanceRaw {
+            model_matrix: self.get_model_matrix(),
+        }
+    }
+
+    pub fn to_entity_data(&self, sdf_index: u32, aabb_min: [f32; 4], aabb_max: [f32; 4]) -> EntityData {
+        let model_matrix = self.get_model_matrix();
+        let inv_model_matrix = self.get_inv_model_matrix();
+
+        EntityData {
+            model_matrix,
+            inv_model_matrix,
+            base_color: self.base_color,
+            aabb_min,
+            aabb_max,
+            sdf_index,
+            instance_scale: self.scale.max_element(), // 缩放补偿系数
+            _padding: [0; 18],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SceneData {
+    pub entities: Vec<Entity>,
+}
+
+pub struct SceneManager {
+    pub entities: Vec<Entity>,
+    pub next_entity_id: usize,
+    pub models: HashMap<String, super::models::ModelAsset>,
+    pub instance_counters: HashMap<u32, usize>,
+}
+
+impl SceneManager {
+    pub fn new() -> Self {
+        Self {
+            entities: Vec::new(),
+            next_entity_id: 0,
+            models: HashMap::new(),
+            instance_counters: HashMap::new(),
+        }
+    }
+
+    pub fn add_entity(&mut self, model_id: u32, position: Vec3, rotation: Vec3, scale: Vec3, base_color: [f32; 4]) -> Entity {
+        let instance_index = *self.instance_counters.get(&model_id).unwrap_or(&0);
+        let entity = Entity::new(self.next_entity_id, model_id, instance_index, position, rotation, scale, base_color);
+        self.entities.push(entity.clone());
+        self.next_entity_id += 1;
+        *self.instance_counters.entry(model_id).or_insert(0) += 1;
+        entity
+    }
+
+    pub fn save_scene(&self, file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let scene_data = SceneData {
+            entities: self.entities.clone(),
+        };
+        
+        let json = serde_json::to_string_pretty(&scene_data)?;
+        std::fs::write(file_path, json)?;
+        
+        Ok(())
+    }
+
+    pub fn load_scene(&mut self, file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let json = std::fs::read_to_string(file_path)?;
+        let scene_data: SceneData = serde_json::from_str(&json)?;
+        
+        // 重置实例计数器
+        self.instance_counters.clear();
+        
+        // 为每个实体生成 code
+        self.entities = scene_data.entities.into_iter().map(|mut entity| {
+            if entity.code.is_empty() {
+                let instance_index = *self.instance_counters.get(&entity.model_id).unwrap_or(&0);
+                entity.code = format!("{}s{:06}", entity.model_id, instance_index);
+                *self.instance_counters.entry(entity.model_id).or_insert(0) += 1;
+            }
+            entity
+        }).collect();
+        
+        self.next_entity_id = self.entities.len();
+        
+        Ok(())
+    }
+}
+
+
+
+src\shader.wgsl
+
+@group(0) @binding(0) var output_texture: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(1) var<storage, read> scene: Scene;
+@group(0) @binding(2) var t_cem_data: texture_3d<u32>;
+@group(0) @binding(4) var<uniform> params: Params;
+@group(0) @binding(5) var<storage, read> palette: array<vec4<f32>>;
+
+struct Params {
+    view_inv: mat4x4<f32>,
+    proj_inv: mat4x4<f32>,
+    cam_pos: vec4<f32>,
+    light_dir: vec4<f32>,
+    entity_count: u32,
+    debug_mode: u32,
+    _pad1: vec2<f32>,
+    _pad2: array<vec4<f32>, 3>,
+};
+
+struct Entity {
+    model_matrix: mat4x4<f32>,
+    inv_model_matrix: mat4x4<f32>,
+    base_color: vec4<f32>,
+    aabb_min: vec4<f32>,
+    aabb_max: vec4<f32>,
+    sdf_index: u32,
+    instance_scale: f32,
+    _pad: array<u32, 18>,
+};
+
+struct Scene { entities: array<Entity, 64>, };
+
+struct Voxel {
+    dist: f32,
+    color: vec3<f32>, // 修改：从 color_id 变为直接存储颜色
+    modifier: f32,
+    entity_id: u32, // 记录所属实体ID，用于法线隔离
+};
+
+fn unpack_voxel_safe(data: u32) -> Voxel {
+    var v: Voxel;
+    // 1. 距离还原：显式处理 12bit 补码
+    let d_bits = (data >> 20u) & 0xFFFu;
+    var d_f32: f32;
+    if (d_bits >= 2048u) {
+        d_f32 = f32(i32(d_bits) - 4096i);
+    } else {
+        d_f32 = f32(d_bits);
+    }
+    // 关键：还原到 -1.0 到 1.0 的标准范围
+    v.dist = d_f32 / 2047.0;
+
+    // 2. 颜色还原：撞库
+    let id = (data >> 10u) & 0x3FFu;
+    v.color = palette[id].rgb;
+    
+    // 3. 微调值
+    v.modifier = f32((data >> 2u) & 0xFFu) / 255.0;
+    return v;
+}
+
+fn sample_dna_smooth(uvw: vec3<f32>, sdf_index: u32) -> Voxel {
+    // 这里的 63.0 是为了保证索引不越界
+    let tex_coord = clamp(uvw, vec3<f32>(0.0), vec3<f32>(1.0)) * 63.0;
+    let i0 = vec3<i32>(floor(tex_coord));
+    let i1 = min(i0 + vec3<i32>(1), vec3<i32>(63));
+    let f = fract(tex_coord);
+    let z_off = i32(sdf_index) * 64;
+
+    // 采样周围 8 个点
+    let v000 = unpack_voxel_safe(textureLoad(t_cem_data, vec3<i32>(i0.x, i0.y, i0.z + z_off), 0).r);
+    let v100 = unpack_voxel_safe(textureLoad(t_cem_data, vec3<i32>(i1.x, i0.y, i0.z + z_off), 0).r);
+    let v010 = unpack_voxel_safe(textureLoad(t_cem_data, vec3<i32>(i0.x, i1.y, i0.z + z_off), 0).r);
+    let v110 = unpack_voxel_safe(textureLoad(t_cem_data, vec3<i32>(i1.x, i1.y, i0.z + z_off), 0).r);
+    let v001 = unpack_voxel_safe(textureLoad(t_cem_data, vec3<i32>(i0.x, i0.y, i1.z + z_off), 0).r);
+    let v101 = unpack_voxel_safe(textureLoad(t_cem_data, vec3<i32>(i1.x, i0.y, i1.z + z_off), 0).r);
+    let v011 = unpack_voxel_safe(textureLoad(t_cem_data, vec3<i32>(i0.x, i1.y, i1.z + z_off), 0).r);
+    let v111 = unpack_voxel_safe(textureLoad(t_cem_data, vec3<i32>(i1.x, i1.y, i1.z + z_off), 0).r);
+
+    var res: Voxel;
+    // 距离和颜色全插值
+    res.dist = mix(mix(mix(v000.dist, v100.dist, f.x), mix(v010.dist, v110.dist, f.x), f.y),
+                   mix(mix(v001.dist, v101.dist, f.x), mix(v011.dist, v111.dist, f.x), f.y), f.z);
+    res.color = mix(mix(mix(v000.color, v100.color, f.x), mix(v010.color, v110.color, f.x), f.y),
+                    mix(mix(v001.color, v101.color, f.x), mix(v011.color, v111.color, f.x), f.y), f.z);
+    res.modifier = mix(mix(mix(v000.modifier, v100.modifier, f.x), mix(v010.modifier, v110.modifier, f.x), f.y),
+                       mix(mix(v001.modifier, v101.modifier, f.x), mix(v011.modifier, v111.modifier, f.x), f.y), f.z);
+    return res;
+}
+
+fn sdAABB(p: vec3<f32>, b_min: vec3<f32>, b_max: vec3<f32>) -> f32 {
+    let center = (b_min + b_max) * 0.5;
+    let half_extents = (b_max - b_min) * 0.5;
+    let q = abs(p - center) - half_extents;
+    return length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+
+fn get_scene_sdf_full(world_p: vec3<f32>) -> Voxel {
+    var min_v: Voxel;
+    min_v.dist = 100.0;
+    min_v.color = vec3<f32>(0.2, 0.2, 0.2); // 默认背景色
+
+    for (var i: u32 = 0u; i < params.entity_count; i++) {
+        let e = scene.entities[i];
+        let local_p = (e.inv_model_matrix * vec4<f32>(world_p, 1.0)).xyz;
+        
+        let dims = e.aabb_max.xyz - e.aabb_min.xyz;
+        let model_world_size = max(dims.x, max(dims.y, dims.z));
+        
+        // 核心：计算 AABB 的物理距离（带 instance_scale）
+        let d_box = sdAABB(local_p, e.aabb_min.xyz, e.aabb_max.xyz) * e.instance_scale;
+        
+        // 只有当射线足够靠近 AABB 时，才进入 DNA 采样
+        if (d_box < min_v.dist) {
+            let uvw = (local_p - e.aabb_min.xyz) / dims;
+            
+            // 判定是否在盒子内或非常接近边缘
+            if (all(uvw >= vec3<f32>(-0.01)) && all(uvw <= vec3<f32>(1.01))) {
+                let voxel = sample_dna_smooth(uvw, e.sdf_index);
+                // 还原 DNA 的绝对世界距离
+                let d_dna = voxel.dist * model_world_size * e.instance_scale;
+                
+                // 联合判断：必须真的比 AABB 距离更近才更新
+                if (d_dna < min_v.dist) {
+                    min_v = voxel;
+                    min_v.dist = d_dna;
+                    min_v.entity_id = i;
+                }
+            } else {
+                // 盒子外，作为占位符更新距离，方便跳跃
+                if (d_box < min_v.dist) {
+                    min_v.dist = d_box;
+                    min_v.entity_id = i;
+                }
+            }
+        }
+    }
+    return min_v;
+}
+
+fn get_normal(p: vec3<f32>) -> vec3<f32> {
+    let h = 0.015; // 采样步长
+    let k = vec2<f32>(1.0, -1.0);
+    return normalize(
+        k.xyy * get_scene_sdf_full(p + k.xyy * h).dist +
+        k.yyx * get_scene_sdf_full(p + k.yyx * h).dist +
+        k.yxy * get_scene_sdf_full(p + k.yxy * h).dist +
+        k.xxx * get_scene_sdf_full(p + k.xxx * h).dist
+    );
+}
+
+fn get_normal_custom(p: vec3<f32>, h: f32) -> vec3<f32> {
+    let k = vec2<f32>(1.0, -1.0);
+    return normalize(
+        k.xyy * get_scene_sdf_full(p + k.xyy * h).dist +
+        k.yyx * get_scene_sdf_full(p + k.yyx * h).dist +
+        k.yxy * get_scene_sdf_full(p + k.yxy * h).dist +
+        k.xxx * get_scene_sdf_full(p + k.xxx * h).dist
+    );
+}
+
+// 专门采样某个特定实体的距离场（法线计算专用，杜绝干扰）
+fn get_entity_sdf_only(world_p: vec3<f32>, entity_idx: u32) -> f32 {
+    let e = scene.entities[entity_idx];
+    let local_p = (e.inv_model_matrix * vec4<f32>(world_p, 1.0)).xyz;
+    
+    let dims = e.aabb_max.xyz - e.aabb_min.xyz;
+    let model_world_size = max(dims.x, max(dims.y, dims.z));
+    
+    // UVW 映射
+    let uvw = (local_p - e.aabb_min.xyz) / dims;
+    
+    // 即使在盒子外也返回插值后的 DNA 距离，保证导数连续
+    let voxel = sample_dna_smooth(clamp(uvw, vec3<f32>(0.0), vec3<f32>(1.0)), e.sdf_index);
+    
+    // 如果在盒子外面，我们要补上到盒子的欧几里得距离，确保法线方向正确
+    let d_box = sdAABB(local_p, e.aabb_min.xyz, e.aabb_max.xyz);
+    
+    // 核心公式：将 DNA 比例还原为世界空间距离
+    return (voxel.dist * model_world_size + max(d_box, 0.0)) * e.instance_scale;
+}
+
+// 智能法线函数 - 将 entity ID 传进去，实现"采样锁定"
+fn get_normal_isolated(p: vec3<f32>, entity_idx: u32) -> vec3<f32> {
+    let e = scene.entities[entity_idx];
+    
+    // 关键：h 必须随缩放自适应！
+    // 确保 h 在局部空间始终占用大约 0.5 个体素的宽度
+    let h = 0.01 * e.instance_scale;
+    
+    let k = vec2<f32>(1.0, -1.0);
+    return normalize(
+        k.xyy * get_entity_sdf_only(p + k.xyy * h, entity_idx) +
+        k.yyx * get_entity_sdf_only(p + k.yyx * h, entity_idx) +
+        k.yxy * get_entity_sdf_only(p + k.yxy * h, entity_idx) +
+        k.xxx * get_entity_sdf_only(p + k.xxx * h, entity_idx)
+    );
+}
+
+fn calculate_luoer(p: vec3<f32>, normal: vec3<f32>, L: vec3<f32>) -> f32 {
+    var t: f32 = 0.25; // 起跳偏置，防止自遮挡
+    var res: f32 = 1.0;
+    let k: f32 = 8.0;   // 软阴影硬度
+    
+    for (var i = 0; i < 24; i++) {
+        let d = get_scene_sdf_full(p + normal * 0.1 + L * t).dist;
+        if (d < 0.001) { return 0.0; }
+        res = min(res, k * d / t);
+        t += max(d, 0.08);
+        if (t > 15.0) { break; }
+    }
+    return clamp(res, 0.0, 1.0);
+}
+
+// 1. 增加一个极其快速的伪随机函数（打碎干涉条纹）
+fn interleavedGradientNoise(n: vec2<f32>) -> f32 {
+    let f = fract(sin(dot(n, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+    return f;
+}
+
+// 2. 改进版罗尔值计算（影子逻辑）
+fn calculate_luoer_smooth(p: vec3<f32>, normal: vec3<f32>, L: vec3<f32>, id_xy: vec2<u32>) -> f32 {
+    // 关键修正 1：利用像素坐标产生抖动偏移
+    let dither = interleavedGradientNoise(vec2<f32>(id_xy));
+    
+    // 关键修正 2：初始偏移量。从 0.1 增加到 0.2，并加上随机抖动
+    // 这样每一根阴影射线的起始点都不一样，彻底打破相干性
+    var t: f32 = 0.15 + 0.05 * dither;
+    
+    var res: f32 = 1.0;
+    let k: f32 = 16.0;   // 影子硬度
+    
+    for (var i = 0; i < 32; i++) {
+        // 关键修正 3：计算采样位置时，沿法线方向再推出一点点 (normal * 0.05)
+        // 这能帮射线逃离 12bit 数据在表面产生的"底噪区"
+        let sample_p = p + normal * 0.04 + L * t;
+        let d = get_scene_sdf_full(sample_p).dist;
+        
+        // 撞击判定
+        if (d < 0.001) { return 0.0; }
+        
+        // 软阴影核心公式
+        res = min(res, k * d / t);
+        
+        // 关键修正 4：步长优化
+        // 这里的步长不能太大也不能太小，max(d, 0.015) 刚好约等于一个体素的尺寸
+        t += max(d, 0.02);
+        
+        if (t > 15.0 || res < 0.01) { break; }
+    }
+    
+    // 让影子的边缘过渡更符合视觉习惯
+    return smoothstep(0.0, 1.0, res);
+}
+
+// 3. 高精度薄片阴影函数（针对薄几何体优化）
+fn calculate_luoer_precision(p: vec3<f32>, normal: vec3<f32>, L: vec3<f32>, id_xy: vec2<u32>) -> f32 {
+    let dither = interleavedGradientNoise(vec2<f32>(id_xy));
+    
+    // 关键修正 1：大幅降低初始偏置
+    // 只有这样，薄如纸片的模型才能被射线捕捉到
+    var t: f32 = 0.03 + 0.02 * dither;
+    
+    var res: f32 = 1.0;
+    let k: f32 = 12.0;   // 稍微降低硬度，增加阴影的包容度
+    
+    for (var i = 0; i < 48; i++) { // 增加步进次数，保证精度
+        // 关键修正 2：法线偏置减小到 0.01
+        let sample_p = p + normal * 0.01 + L * t;
+        let d = get_scene_sdf_full(sample_p).dist;
+        
+        // 关键修正 3：负距离判定 (内部命中)
+        // 在三线性插值下，薄片中心可能是负值。一旦发现负值，说明绝对撞上了。
+        if (d < 0.0) { return 0.0; }
+        
+        // 判定命中
+        if (d < 0.0005) { return 0.0; }
+        
+        // 软阴影公式
+        res = min(res, k * d / t);
+        
+        // 关键修正 4：微步进 (Micro-stepping)
+        // 将强制步进从 0.02 降低到 0.005
+        // 这样射线就像显微镜一样，不会跳过任何薄片
+        t += max(d, 0.005);
+        
+        if (t > 15.0 || res < 0.01) { break; }
+    }
+    
+    return clamp(res, 0.0, 1.0);
+}
+
+// 辅助颜色转换，用于观察负值
+fn debug_color(val: f32) -> vec3<f32> {
+    if (val > 0.0) { return vec3<f32>(val, 0.0, 0.0); } // 正值显红色
+    return vec3<f32>(0.0, abs(val), 0.0);             // 负值显绿色
+}
+
+@compute @workgroup_size(8, 8)
+fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let screen_size = textureDimensions(output_texture);
+    if (id.x >= screen_size.x || id.y >= screen_size.y) { return; }
+
+    // 射线初始化
+    let screen_uv = vec2<f32>(id.xy) / vec2<f32>(screen_size);
+    let uv = vec2<f32>(screen_uv.x * 2.0 - 1.0, (1.0 - screen_uv.y) * 2.0 - 1.0);
+    let target_pos = params.proj_inv * vec4<f32>(uv.x, uv.y, 1.0, 1.0);
+    let ray_dir = normalize((params.view_inv * vec4<f32>(normalize(target_pos.xyz / target_pos.w), 0.0)).xyz);
+    let ray_p = params.cam_pos.xyz;
+
+    var t = 0.1;
+    var hit = false;
+    var final_v: Voxel;
+    
+    for (var i = 0; i < 128; i++) {
+        final_v = get_scene_sdf_full(ray_p + ray_dir * t);
+        
+        // 关键：微小的命中阈值
+        if (final_v.dist < 0.001) { hit = true; break; }
+        
+        // 关键：增加安全步长上限，防止射线在表面反复横跳
+        t += max(final_v.dist * 0.75, 0.0005); 
+        if (t > 80.0) { break; }
+    }
+
+    if (hit) {
+        let hit_p = ray_p + ray_dir * t;
+        let normal = get_normal_isolated(hit_p, final_v.entity_id);
+        let L = normalize(params.light_dir.xyz);
+
+        // 曦罗混合
+        let luoer = calculate_luoer_precision(hit_p, normal, L, id.xy);
+        
+        // 关键修复：最终颜色对齐
+        let base_color = final_v.color * final_v.modifier;
+        let dot_nl = max(0.0, dot(normal, L));
+        
+        // 如果是 debug 4，看原始颜色
+        if (params.debug_mode == 4u) {
+            textureStore(output_texture, id.xy, vec4<f32>(final_v.color, 1.0));
+        } else {
+            let lighting = mix(0.35, 1.0, luoer * smoothstep(0.0, 0.05, dot_nl));
+            textureStore(output_texture, id.xy, vec4<f32>(base_color * lighting, 1.0));
+        }
+    } else {
+        // 背景色
+        textureStore(output_texture, id.xy, vec4<f32>(0.05, 0.05, 0.1, 1.0));
+    }
+}
+
+// 展示部分保持不动...
+@group(0) @binding(0) var t_screen_read: texture_2d<f32>; 
+
+@vertex
+fn vs_blit(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
+    let pos_x = select(select(-1.0, 3.0, idx == 1u), -1.0, idx == 2u);
+    let pos_y = select(select(-1.0, -1.0, idx == 1u), 3.0, idx == 2u);
+    return vec4<f32>(pos_x, pos_y, 0.0, 1.0);
+}
+
+@fragment
+fn fs_blit(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    return textureLoad(t_screen_read, vec2<i32>(pos.xy), 0);
+}
+
+
+src\undo\mod.rs
+
+use std::collections::VecDeque;
+use glam::Vec3;
+
+#[derive(Debug, Clone)]
+pub struct EntityAction {
+    pub entity_id: usize,
+    pub old_position: Vec3,
+    pub old_rotation: Vec3,
+    pub old_scale: Vec3,
+    pub new_position: Vec3,
+    pub new_rotation: Vec3,
+    pub new_scale: Vec3,
+}
+
+pub struct UndoManager {
+    undo_stack: VecDeque<EntityAction>,
+    redo_stack: VecDeque<EntityAction>,
+    max_history: usize,
+}
+
+impl UndoManager {
+    pub fn new(max_history: usize) -> Self {
+        Self {
+            undo_stack: VecDeque::with_capacity(max_history),
+            redo_stack: VecDeque::with_capacity(max_history),
+            max_history,
+        }
+    }
+
+    pub fn push(&mut self, action: EntityAction) {
+        if self.undo_stack.len() >= self.max_history {
+            self.undo_stack.pop_front();
+        }
+        self.undo_stack.push_back(action);
+        self.redo_stack.clear();
+    }
+
+    pub fn undo(&mut self, entities: &mut Vec<crate::scene::Entity>) {
+        if let Some(action) = self.undo_stack.pop_back() {
+            if let Some(entity) = entities.get_mut(action.entity_id) {
+                entity.position = action.old_position;
+                entity.rotation = action.old_rotation;
+                entity.scale = action.old_scale;
+            }
+            self.redo_stack.push_back(action);
+        }
+    }
+
+    pub fn redo(&mut self, entities: &mut Vec<crate::scene::Entity>) {
+        if let Some(action) = self.redo_stack.pop_back() {
+            if let Some(entity) = entities.get_mut(action.entity_id) {
+                entity.position = action.new_position;
+                entity.rotation = action.new_rotation;
+                entity.scale = action.new_scale;
+            }
+            self.undo_stack.push_back(action);
+        }
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+    }
+}
+
+

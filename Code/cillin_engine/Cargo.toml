@@ -5,13 +5,16 @@ edition = "2024"
 
 [dependencies]
 winit = "0.29"
-wgpu = { version = "0.19", features = ["webgl"] }
-anyhow = "1.0"
+wgpu = "0.19"
+glam = { version = "0.24", features = ["serde"] } # 矩阵运算
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+gltf = "1.4"
+bytemuck = { version = "1.13", features = ["derive"] }
+log = "0.4"
 pollster = "0.3"
 env_logger = "0.10"
-log = "0.4"
-tokio = { version = "1.0", features = ["full"] }
-gltf = "1.4"
-image = "0.24"
-glam = "0.24"
-bytemuck = { version = "1.13", features = ["derive"] }
+cxx = "1.0"
+
+[build-dependencies]
+cxx-build = "1.0"
