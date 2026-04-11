@@ -170,6 +170,7 @@
         // 状态变量
         let currentSaturationSteps = 32; // 饱和度步进级别，默认32级
         let currentHueSteps = 32; // 色相步进级别，默认32级
+        let selectedColors = []; // 存储选中的颜色
         
         // 获取容器
         const container = document.getElementById('colorGrid');
@@ -252,10 +253,62 @@
                 const color = `hsl(${hue}deg, ${saturation}%, 50%)`;
                 cell.style.backgroundColor = color;
                 
-                // 添加点击事件，打印RGB和色相值到控制台
+                // 添加点击事件，打印RGB和色相值到控制台，添加/移除选中状态
                 cell.addEventListener('click', () => {
                     const rgb = hslToRgb(hue, saturation, 50);
                     console.log(`Color #${i}: RGB(${rgb.r}, ${rgb.g}, ${rgb.b}), Hue: ${hue.toFixed(2)}°`);
+                    
+                    const colorData = {
+                        rgb: rgb,
+                        hue: hue,
+                        saturation: saturation,
+                        lightness: 50
+                    };
+                    
+                    // 检查是否已经选中
+                    const index = selectedColors.findIndex(c => 
+                        Math.abs(c.hue - hue) < 0.1 && Math.abs(c.saturation - saturation) < 0.1
+                    );
+                    
+                    if (index > -1) {
+                        // 已选中，移除
+                        selectedColors.splice(index, 1);
+                        cell.style.border = '';
+                    } else {
+                        // 未选中，添加
+                        selectedColors.push(colorData);
+                        cell.style.border = '2px solid black';
+                        cell.style.boxSizing = 'border-box';
+                    }
+                    
+                    // 更新选中颜色数量
+                    console.log(`Selected colors: ${selectedColors.length}`);
+                });
+                
+                // 添加右键点击事件，实现弃选功能
+                cell.addEventListener('contextmenu', (e) => {
+                    e.preventDefault(); // 阻止默认右键菜单
+                    
+                    const rgb = hslToRgb(hue, saturation, 50);
+                    const colorData = {
+                        rgb: rgb,
+                        hue: hue,
+                        saturation: saturation,
+                        lightness: 50
+                    };
+                    
+                    // 检查是否已经选中
+                    const index = selectedColors.findIndex(c => 
+                        Math.abs(c.hue - hue) < 0.1 && Math.abs(c.saturation - saturation) < 0.1
+                    );
+                    
+                    if (index > -1) {
+                        // 已选中，移除
+                        selectedColors.splice(index, 1);
+                        cell.style.border = '';
+                        console.log(`Deselected color #${i}: RGB(${rgb.r}, ${rgb.g}, ${rgb.b}), Hue: ${hue.toFixed(2)}°`);
+                        console.log(`Selected colors: ${selectedColors.length}`);
+                    }
                 });
                 
                 colorCells.push(cell);
@@ -312,8 +365,246 @@
         hueStepsSlider.addEventListener('input', handleHueStepsChange);
         hueStepsSlider.addEventListener('change', handleHueStepsChange);
         
+        // 保存颜色数据到文件
+        function saveColorToFile() {
+            if (selectedColors.length === 0) {
+                alert('请先选择颜色');
+                return;
+            }
+            
+            // 按行（色相）分组
+            const rows = {};
+            selectedColors.forEach(color => {
+                const hueKey = Math.round(color.hue); // 以整数色相为键
+                if (!rows[hueKey]) {
+                    rows[hueKey] = [];
+                }
+                rows[hueKey].push(color);
+            });
+            
+            // 计算每行的最密分布点（饱和度）
+            const data = [];
+            Object.keys(rows).forEach(hueKey => {
+                const rowColors = rows[hueKey];
+                const count = rowColors.length;
+                
+                // 计算饱和度分布
+                const saturationCounts = {};
+                rowColors.forEach(color => {
+                    const satKey = Math.round(color.saturation);
+                    saturationCounts[satKey] = (saturationCounts[satKey] || 0) + 1;
+                });
+                
+                // 找出最密分布点
+                let maxCount = 0;
+                let mostDenseSaturation = 0;
+                Object.entries(saturationCounts).forEach(([sat, cnt]) => {
+                    if (cnt > maxCount) {
+                        maxCount = cnt;
+                        mostDenseSaturation = parseInt(sat);
+                    }
+                });
+                
+                data.push(`${hueKey}:${count}:${mostDenseSaturation}`);
+            });
+            
+            // 保存到本地存储
+            localStorage.setItem('selectedColors', JSON.stringify(selectedColors));
+            
+            // 创建Blob对象
+            const blob = new Blob([data.join('\n')], { type: 'text/plain' });
+            
+            // 创建下载链接
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'ColLine1.txt';
+            document.body.appendChild(a);
+            
+            // 模拟点击下载
+            a.click();
+            
+            // 清理
+            setTimeout(() => {
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+            }, 100);
+        }
+        
+        // 添加保存按钮
+        function addSaveButton() {
+            const button = document.createElement('button');
+            button.textContent = '保存选中颜色';
+            button.style.position = 'fixed';
+            button.style.top = '80px';
+            button.style.left = '20px';
+            button.style.padding = '10px 15px';
+            button.style.backgroundColor = 'rgba(30, 30, 40, 0.75)';
+            button.style.color = 'white';
+            button.style.border = '1px solid rgba(255,255,255,0.2)';
+            button.style.borderRadius = '32px';
+            button.style.fontFamily = 'system-ui, \'Segoe UI\', \'Helvetica Neue\', monospace';
+            button.style.fontSize = '1rem';
+            button.style.cursor = 'pointer';
+            button.style.zIndex = '999';
+            button.style.backdropFilter = 'blur(8px)';
+            button.style.boxShadow = '0 4px 15px rgba(0,0,0,0.3)';
+            
+            button.addEventListener('click', saveColorToFile);
+            document.body.appendChild(button);
+        }
+        
+        // 加载保存的颜色数据
+        function loadSavedColor() {
+            // 从本地存储加载
+            const savedColors = localStorage.getItem('selectedColors');
+            if (savedColors) {
+                try {
+                    selectedColors = JSON.parse(savedColors);
+                    // 高亮显示保存的颜色
+                    selectedColors.forEach(colorData => {
+                        highlightSavedColor(colorData);
+                    });
+                    console.log('Loaded saved colors:', selectedColors);
+                } catch (e) {
+                    console.error('Error loading saved colors:', e);
+                }
+            }
+        }
+        
+        // 高亮显示保存的颜色
+        function highlightSavedColor(colorData) {
+            // 遍历所有颜色块，找到匹配的颜色
+            for (let i = 0; i < colorCells.length; i++) {
+                const cell = colorCells[i];
+                const row = Math.floor(i / PER_ROW);
+                const col = i % PER_ROW;
+                
+                // 计算当前饱和度和色相
+                const saturationIndex = col % currentSaturationSteps;
+                const saturationStep = 100 / (currentSaturationSteps - 1);
+                const saturation = saturationIndex * saturationStep;
+                
+                const hueStep = 360 / currentHueSteps;
+                const hue = row * hueStep;
+                
+                // 检查是否匹配保存的颜色
+                if (Math.abs(hue - colorData.hue) < 0.1 && Math.abs(saturation - colorData.saturation) < 0.1) {
+                    // 为匹配的色块添加黑色边框
+                    cell.style.border = '2px solid black';
+                    cell.style.boxSizing = 'border-box';
+                    break;
+                }
+            }
+        }
+        
+        // 读取本地文件
+        function readLocalFile() {
+            // 创建文件输入元素
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.accept = '.txt';
+            input.style.display = 'none';
+            document.body.appendChild(input);
+            
+            // 监听文件选择
+            input.addEventListener('change', (e) => {
+                const file = e.target.files[0];
+                if (file) {
+                    const reader = new FileReader();
+                    reader.onload = (event) => {
+                        try {
+                            const content = event.target.result;
+                            const lines = content.trim().split('\n');
+                            
+                            // 清空当前选中的颜色
+                            selectedColors = [];
+                            
+                            // 移除所有色块的边框
+                            colorCells.forEach(c => {
+                                c.style.border = '';
+                            });
+                            
+                            // 解析每行颜色数据
+                            lines.forEach((line, index) => {
+                                const parts = line.split(':');
+                                if (parts.length >= 3) {
+                                    const hue = parseFloat(parts[0]);
+                                    const count = parseInt(parts[1]);
+                                    const mostDenseSaturation = parseFloat(parts[2]);
+                                    
+                                    // 由于新格式只保存了色相、数量和最密分布点，我们需要重建颜色数据
+                                    // 这里我们只添加最密分布点的颜色
+                                    const colorData = {
+                                        rgb: hslToRgb(hue, mostDenseSaturation, 50),
+                                        hue: hue,
+                                        saturation: mostDenseSaturation,
+                                        lightness: 50
+                                    };
+                                    
+                                    // 添加到选中颜色数组
+                                    selectedColors.push(colorData);
+                                    
+                                    // 高亮显示颜色
+                                    highlightSavedColor(colorData);
+                                    console.log(`Loaded row ${index + 1} from file: hue=${hue}, count=${count}, mostDenseSaturation=${mostDenseSaturation}`);
+                                }
+                            });
+                            
+                            // 保存到本地存储
+                            localStorage.setItem('selectedColors', JSON.stringify(selectedColors));
+                            console.log(`Loaded ${selectedColors.length} colors from file`);
+                        } catch (e) {
+                            console.error('Error reading file:', e);
+                        }
+                    };
+                    reader.readAsText(file);
+                }
+            });
+            
+            // 触发文件选择
+            input.click();
+            
+            // 清理
+            setTimeout(() => {
+                document.body.removeChild(input);
+            }, 100);
+        }
+        
+        // 添加读取文件的按钮
+        function addReadFileButton() {
+            const button = document.createElement('button');
+            button.textContent = '读取颜色文件';
+            button.style.position = 'fixed';
+            button.style.top = '20px';
+            button.style.left = '20px';
+            button.style.padding = '10px 15px';
+            button.style.backgroundColor = 'rgba(30, 30, 40, 0.75)';
+            button.style.color = 'white';
+            button.style.border = '1px solid rgba(255,255,255,0.2)';
+            button.style.borderRadius = '32px';
+            button.style.fontFamily = 'system-ui, \'Segoe UI\', \'Helvetica Neue\', monospace';
+            button.style.fontSize = '1rem';
+            button.style.cursor = 'pointer';
+            button.style.zIndex = '999';
+            button.style.backdropFilter = 'blur(8px)';
+            button.style.boxShadow = '0 4px 15px rgba(0,0,0,0.3)';
+            
+            button.addEventListener('click', readLocalFile);
+            document.body.appendChild(button);
+        }
+        
         // 初始生成颜色网格
         generateColorGrid();
+        
+        // 添加读取文件按钮
+        addReadFileButton();
+        
+        // 添加保存按钮
+        addSaveButton();
+        
+        // 加载保存的颜色数据
+        loadSavedColor();
     })();
 </script>
 </body>

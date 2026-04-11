@@ -22,3 +22,5 @@ Desktop.ini
 .env.local
 
 Cargo.lock
+
+Document/
