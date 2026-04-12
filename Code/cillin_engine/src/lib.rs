@@ -1,7 +1,7 @@
 #[cxx::bridge]
 pub mod ffi {
     unsafe extern "C++" {
-        include!("sdf_logic.hpp");
+        include!("cpp/sdf/sdf_logic.hpp");
 
         // 新增支持 AABB 的烘焙函数
         fn generate_sdf_baked_aabb(

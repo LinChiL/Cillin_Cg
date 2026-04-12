@@ -179,7 +179,7 @@ def visualize_density_functions(anchor_angles):
     ax4.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig('keyness_density_comparison.png', dpi=150)
+    plt.savefig('line1/keyness_density_comparison.png', dpi=150)
     plt.show()
     
     return kde_values, gmm_values, local_values
@@ -246,7 +246,7 @@ if __name__ == "__main__":
     
     # 拟合GMM并导出参数
     gmm_density, gmm_model = fit_gmm(anchor_angles, n_components=8)
-    export_gmm_params(gmm_model, "gmm_params.txt")
+    export_gmm_params(gmm_model, "line1/gmm_params.txt")
     
     # 生成96色的采样建议
     print("\n" + "="*60)
@@ -264,9 +264,9 @@ if __name__ == "__main__":
     print("\n")
     
     # 保存采样结果
-    with open("sampled_hues.txt", "w") as f:
+    with open("line1/sampled_hues.txt", "w") as f:
         for hue in samples:
             f.write(f"{hue:.2f}\n")
     
-    print("采样结果已保存到 sampled_hues.txt")
-    print("GMM参数已保存到 gmm_params.txt")
+    print("采样结果已保存到 line1/sampled_hues.txt")
+    print("GMM参数已保存到 line1/gmm_params.txt")

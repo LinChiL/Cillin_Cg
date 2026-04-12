@@ -27,13 +27,17 @@ def inspect_cem(cem_path, cpal_path=None):
         data = f.read()
         voxels = struct.unpack(f"<{len(data)//4}I", data)
 
-        # 3. 统计颜色 ID
+        # 3. 统计颜色 ID 和 Modifier
         color_ids = []
+        modifiers = []
         for v in voxels:
-            # 根据你的 pack_voxel_v2 逻辑：[Dist:12][ColorID:10][Mod:8][Flag:2]
-            # ID 在位 10-19
+            # ColorID: 位 10-19
             color_id = (v >> 10) & 0x3FF
             color_ids.append(color_id)
+            
+            # Modifier: 位 2-9 (8bits)
+            mod_raw = (v >> 2) & 0xFF
+            modifiers.append(mod_raw / 255.0)
 
         # 4. 如果提供了色板，加载颜色
         palette = []
@@ -51,13 +55,23 @@ def inspect_cem(cem_path, cpal_path=None):
         for cid, count in stats.most_common(10):
             percent = (count / total) * 100
             color_str = f"RGB{palette[cid]}" if palette and cid < len(palette) else "未知"
-            print(f"ID {cid:4}: 出现 {count:8} 次 ({percent:5.1f}%) | 对应颜色: {color_str}")
+            print(f"ID {cid:4}: 出现 {count:8} 次 ({percent:5.1f}%) | 对应基础色: {color_str}")
+
+        # --- 新增：Modifier 统计 ---
+        print("\n--- Modifier (Ko) 明度分布 ---")
+        avg_mod = sum(modifiers) / len(modifiers)
+        max_mod = max(modifiers)
+        min_mod = min(modifiers)
+        print(f"平均 Ko: {avg_mod:.3f} | 最大 Ko: {max_mod:.3f} | 最小 Ko: {min_mod:.3f}")
+        
+        if max_mod - min_mod > 0.1:
+            print("结论: 检测到明显的亮度变化，【Ko 泛化逻辑生效中】。")
 
         # 6. 验证棋盘格特征
         if len(stats) >= 2:
-            print("\n结论: 文件包含多种颜色 ID，数据【正常】。如果引擎里是纯色，则是渲染逻辑或索引问题。")
+            print("\n结论: 文件包含多种颜色 ID")
         else:
-            print("\n结论: 文件只包含一种颜色 ID，数据【异常】。请检查 C++ Compiler 导出逻辑。")
+            print("\n结论: 文件只包含一种颜色 ID")
 
 if __name__ == "__main__":
     # 默认路径

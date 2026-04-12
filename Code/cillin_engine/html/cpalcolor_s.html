@@ -158,7 +158,7 @@
 
 <!-- 色相步进级别调整滑条 -->
 <div class="slider-panel" style="bottom: 140px;">
-    <input type="range" id="hueStepsSlider" min="1" max="32" step="1" value="32">
+    <input type="range" id="hueStepsSlider" min="1" max="64" step="1" value="32">
     <div class="multiplier-value" id="hueStepsDisplay">32级</div>
 </div>
 
@@ -171,6 +171,7 @@
         let currentSaturationSteps = 32; // 饱和度步进级别，默认32级
         let currentHueSteps = 32; // 色相步进级别，默认32级
         let selectedColors = []; // 存储选中的颜色
+        let isDragging = false; // 是否正在拖动
         
         // 获取容器
         const container = document.getElementById('colorGrid');
@@ -179,6 +180,36 @@
         
         // 存储颜色元素
         let colorCells = [];
+        
+        // 处理颜色选择的函数
+        function handleColorSelection(cell, hue, saturation, index) {
+            const rgb = hslToRgb(hue, saturation, 50);
+            const colorData = {
+                rgb: rgb,
+                hue: hue,
+                saturation: saturation,
+                lightness: 50
+            };
+            
+            // 检查是否已经选中
+            const existingIndex = selectedColors.findIndex(c => 
+                Math.abs(c.hue - hue) < 0.1 && Math.abs(c.saturation - saturation) < 0.1
+            );
+            
+            if (existingIndex === -1) {
+                // 未选中，添加
+                selectedColors.push(colorData);
+                cell.style.border = '2px solid black';
+                cell.style.boxSizing = 'border-box';
+                console.log(`Selected color #${index}: RGB(${rgb.r}, ${rgb.g}, ${rgb.b}), Hue: ${hue.toFixed(2)}°`);
+                console.log(`Selected colors: ${selectedColors.length}`);
+            }
+        }
+        
+        // 添加全局鼠标释放事件，结束拖动
+        document.addEventListener('mouseup', () => {
+            isDragging = false;
+        });
         
         // HSL转RGB函数
         function hslToRgb(h, s, l) {
@@ -253,36 +284,20 @@
                 const color = `hsl(${hue}deg, ${saturation}%, 50%)`;
                 cell.style.backgroundColor = color;
                 
-                // 添加点击事件，打印RGB和色相值到控制台，添加/移除选中状态
-                cell.addEventListener('click', () => {
-                    const rgb = hslToRgb(hue, saturation, 50);
-                    console.log(`Color #${i}: RGB(${rgb.r}, ${rgb.g}, ${rgb.b}), Hue: ${hue.toFixed(2)}°`);
+                // 添加鼠标按下事件，开始拖动
+                cell.addEventListener('mousedown', (e) => {
+                    e.preventDefault();
+                    isDragging = true;
                     
-                    const colorData = {
-                        rgb: rgb,
-                        hue: hue,
-                        saturation: saturation,
-                        lightness: 50
-                    };
-                    
-                    // 检查是否已经选中
-                    const index = selectedColors.findIndex(c => 
-                        Math.abs(c.hue - hue) < 0.1 && Math.abs(c.saturation - saturation) < 0.1
-                    );
-                    
-                    if (index > -1) {
-                        // 已选中，移除
-                        selectedColors.splice(index, 1);
-                        cell.style.border = '';
-                    } else {
-                        // 未选中，添加
-                        selectedColors.push(colorData);
-                        cell.style.border = '2px solid black';
-                        cell.style.boxSizing = 'border-box';
+                    // 处理当前色块
+                    handleColorSelection(cell, hue, saturation, i);
+                });
+                
+                // 添加鼠标进入事件，在拖动时选择颜色
+                cell.addEventListener('mouseenter', () => {
+                    if (isDragging) {
+                        handleColorSelection(cell, hue, saturation, i);
                     }
-                    
-                    // 更新选中颜色数量
-                    console.log(`Selected colors: ${selectedColors.length}`);
                 });
                 
                 // 添加右键点击事件，实现弃选功能
@@ -372,47 +387,15 @@
                 return;
             }
             
-            // 按行（色相）分组
-            const rows = {};
-            selectedColors.forEach(color => {
-                const hueKey = Math.round(color.hue); // 以整数色相为键
-                if (!rows[hueKey]) {
-                    rows[hueKey] = [];
-                }
-                rows[hueKey].push(color);
-            });
-            
-            // 计算每行的最密分布点（饱和度）
-            const data = [];
-            Object.keys(rows).forEach(hueKey => {
-                const rowColors = rows[hueKey];
-                const count = rowColors.length;
-                
-                // 计算饱和度分布
-                const saturationCounts = {};
-                rowColors.forEach(color => {
-                    const satKey = Math.round(color.saturation);
-                    saturationCounts[satKey] = (saturationCounts[satKey] || 0) + 1;
-                });
-                
-                // 找出最密分布点
-                let maxCount = 0;
-                let mostDenseSaturation = 0;
-                Object.entries(saturationCounts).forEach(([sat, cnt]) => {
-                    if (cnt > maxCount) {
-                        maxCount = cnt;
-                        mostDenseSaturation = parseInt(sat);
-                    }
-                });
-                
-                data.push(`${hueKey}:${count}:${mostDenseSaturation}`);
-            });
-            
             // 保存到本地存储
             localStorage.setItem('selectedColors', JSON.stringify(selectedColors));
             
-            // 创建Blob对象
-            const blob = new Blob([data.join('\n')], { type: 'text/plain' });
+            // 创建Blob对象，每行一个颜色，格式为（色相）:（饱和度）
+            const data = selectedColors.map(c => 
+                `${c.hue.toFixed(2)}:${c.saturation.toFixed(2)}`
+            ).join('\n');
+            
+            const blob = new Blob([data], { type: 'text/plain' });
             
             // 创建下载链接
             const url = URL.createObjectURL(blob);
@@ -527,27 +510,54 @@
                             
                             // 解析每行颜色数据
                             lines.forEach((line, index) => {
-                                const parts = line.split(':');
-                                if (parts.length >= 3) {
-                                    const hue = parseFloat(parts[0]);
-                                    const count = parseInt(parts[1]);
-                                    const mostDenseSaturation = parseFloat(parts[2]);
-                                    
-                                    // 由于新格式只保存了色相、数量和最密分布点，我们需要重建颜色数据
-                                    // 这里我们只添加最密分布点的颜色
-                                    const colorData = {
-                                        rgb: hslToRgb(hue, mostDenseSaturation, 50),
-                                        hue: hue,
-                                        saturation: mostDenseSaturation,
-                                        lightness: 50
-                                    };
-                                    
-                                    // 添加到选中颜色数组
-                                    selectedColors.push(colorData);
-                                    
-                                    // 高亮显示颜色
-                                    highlightSavedColor(colorData);
-                                    console.log(`Loaded row ${index + 1} from file: hue=${hue}, count=${count}, mostDenseSaturation=${mostDenseSaturation}`);
+                                // 支持两种格式：新格式（色相:饱和度）和旧格式（RGB,色相,饱和度,亮度）
+                                if (line.includes(':')) {
+                                    // 新格式：色相:饱和度
+                                    const parts = line.split(':');
+                                    if (parts.length >= 2) {
+                                        const hue = parseFloat(parts[0]);
+                                        const saturation = parseFloat(parts[1]);
+                                        const lightness = 50;
+                                        
+                                        // 计算RGB值
+                                        const rgb = hslToRgb(hue, saturation, lightness);
+                                        
+                                        const colorData = {
+                                            rgb: rgb,
+                                            hue: hue,
+                                            saturation: saturation,
+                                            lightness: lightness
+                                        };
+                                        
+                                        // 添加到选中颜色数组
+                                        selectedColors.push(colorData);
+                                        
+                                        // 高亮显示颜色
+                                        highlightSavedColor(colorData);
+                                        console.log(`Loaded color ${index + 1} from file:`, colorData);
+                                    }
+                                } else if (line.includes(',')) {
+                                    // 旧格式：RGB,色相,饱和度,亮度
+                                    const parts = line.split(',');
+                                    if (parts.length >= 6) {
+                                        const colorData = {
+                                            rgb: {
+                                                r: parseInt(parts[0]),
+                                                g: parseInt(parts[1]),
+                                                b: parseInt(parts[2])
+                                            },
+                                            hue: parseFloat(parts[3]),
+                                            saturation: parseFloat(parts[4]),
+                                            lightness: parseInt(parts[5])
+                                        };
+                                        
+                                        // 添加到选中颜色数组
+                                        selectedColors.push(colorData);
+                                        
+                                        // 高亮显示颜色
+                                        highlightSavedColor(colorData);
+                                        console.log(`Loaded color ${index + 1} from file:`, colorData);
+                                    }
                                 }
                             });
                             
