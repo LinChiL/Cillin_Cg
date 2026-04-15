@@ -12,6 +12,8 @@ pub struct InputState {
     pub is_middle_mouse_pressed: bool,
     pub last_mouse_pos: Option<(f64, f64)>,
     pub scroll_delta: f32,
+    pub is_delete_pressed: bool,
+    pub is_left_mouse_pressed: bool,
 }
 
 impl InputState {
@@ -35,6 +37,8 @@ impl InputState {
                     } else {
                         self.last_mouse_pos = None;
                     }
+                } else if button == &MouseButton::Left {
+                    self.is_left_mouse_pressed = state == &ElementState::Pressed;
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -61,11 +65,22 @@ impl InputState {
                 "e" => self.is_e_pressed = pressed,
                 _ => {}
             },
+            winit::keyboard::Key::Named(key) => match key {
+                winit::keyboard::NamedKey::Delete => {
+                    self.is_delete_pressed = pressed;
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
 
     pub fn reset_scroll(&mut self) {
         self.scroll_delta = 0.0;
+    }
+
+    pub fn reset(&mut self) {
+        self.is_delete_pressed = false;
+        self.is_left_mouse_pressed = false;
     }
 }

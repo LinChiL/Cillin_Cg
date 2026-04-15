@@ -34,13 +34,23 @@ for root, dirs, filenames in os.walk(src_dir):
 
 # 处理特定的C++文件
 if os.path.exists(cpp_dir):
-    # 只包含指定的C++文件
-    cpp_files = ["sdf_logic.cpp", "sdf_logic.hpp", "cem_compiler_v2.cpp"]
+    # 包含 cpp/cem 目录下的文件
+    cpp_files = ["cem/cem_compiler_v4.cpp"]
     for file in cpp_files:
         full_path = os.path.join(cpp_dir, file)
         if os.path.exists(full_path):
             rel_path = os.path.relpath(full_path, project_dir)
             files.append((rel_path, full_path))
+    
+    # 包含 cpp/sdf 目录下的文件
+    sdf_dir = os.path.join(cpp_dir, "sdf")
+    if os.path.exists(sdf_dir):
+        sdf_files = ["sdf_logic.cpp", "sdf_logic.hpp"]
+        for file in sdf_files:
+            full_path = os.path.join(sdf_dir, file)
+            if os.path.exists(full_path):
+                rel_path = os.path.relpath(full_path, project_dir)
+                files.append((rel_path, full_path))
 
 # 添加build.rs
 build_rs_path = os.path.join(project_dir, "build.rs")

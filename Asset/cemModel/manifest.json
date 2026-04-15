@@ -27,6 +27,13 @@
       "file": "flower.cem",
       "tags": ["flower", "nature"],
       "default_scale": [1.0, 1.0, 1.0]
+    },
+        {
+      "id": 5,
+      "name": "ComeSphere",
+      "file": "ComeSphere.cem",
+      "tags": ["ComeSphere", "test"],
+      "default_scale": [1.0, 1.0, 1.0]
     }
   ]
 }

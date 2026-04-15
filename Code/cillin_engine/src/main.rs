@@ -166,11 +166,186 @@ struct State<'a> {
     blit_bind_group: wgpu::BindGroup,
     compute_pipeline: wgpu::ComputePipeline,
     output_texture: wgpu::Texture,
+    
+    // 性能监控相关
+    query_set: wgpu::QuerySet,
+    query_buffer: wgpu::Buffer,
+    mapped_buffer: wgpu::Buffer,
+    is_perf_mode: bool,
+    last_compute_time: f32,
+    last_render_time: f32,
+    frame_count: u32,
+    last_perf_print: std::time::Instant,
+    
+    // 连续生成模式
+    is_ser_spawn_mode: bool,
+    ser_spawn_model_id: u32,
+    
+    // Tile 加速相关
+    tile_buffer: wgpu::Buffer,
+    tile_map_cache: Vec<scene::TileData>,
 }
 
 
 
 impl<'a> State<'a> {
+    // 辅助函数：世界点转像素点
+    fn project_to_pixel(&self, world_p: glam::Vec3, vp: glam::Mat4) -> Option<glam::Vec2> {
+        let clip = vp * world_p.extend(1.0);
+        if clip.w <= 0.0 { return None; }
+        let ndc = clip.xyz() / clip.w;
+        Some(glam::vec2(
+            (ndc.x + 1.0) * 0.5 * self.render_context.size.width as f32,
+            (1.0 - ndc.y) * 0.5 * self.render_context.size.height as f32,
+        ))
+    }
+
+    // 将 AABB 的 8 个顶点投影到屏幕坐标
+    fn project_aabb_to_screen(&self, entity: &scene::Entity, model: &models::ModelAsset) -> Option<(glam::Vec2, glam::Vec2)> {
+        let mvp = self.render_context.current_proj * self.render_context.current_view * glam::Mat4::from_cols_array_2d(&entity.get_model_matrix());
+        
+        let min = model.aabb_min;
+        let max = model.aabb_max;
+        
+        // AABB 的 8 个顶点坐标
+        let corners = [
+            glam::vec4(min[0], min[1], min[2], 1.0),
+            glam::vec4(min[0], min[1], max[2], 1.0),
+            glam::vec4(min[0], max[1], min[2], 1.0),
+            glam::vec4(min[0], max[1], max[2], 1.0),
+            glam::vec4(max[0], min[1], min[2], 1.0),
+            glam::vec4(max[0], min[1], max[2], 1.0),
+            glam::vec4(max[0], max[1], min[2], 1.0),
+            glam::vec4(max[0], max[1], max[2], 1.0),
+        ];
+
+        let mut screen_min = glam::vec2(f32::MAX, f32::MAX);
+        let mut screen_max = glam::vec2(f32::MIN, f32::MIN);
+        let mut any_in_front = false;
+
+        for corner in corners {
+            let mut clip_pos = mvp * corner;
+            
+            // 简单的裁剪判定：如果顶点在相机后面，这一步比较复杂，我们简单处理
+            if clip_pos.w > 0.0 {
+                any_in_front = true;
+            } else {
+                continue;
+            }
+
+            // 归一化设备坐标 (NDC)
+            let ndc = clip_pos.xyz() / clip_pos.w;
+            
+            // 映射到屏幕像素坐标
+            let pixel_x = (ndc.x + 1.0) * 0.5 * self.render_context.size.width as f32;
+            let pixel_y = (1.0 - ndc.y) * 0.5 * self.render_context.size.height as f32;
+
+            screen_min = screen_min.min(glam::vec2(pixel_x, pixel_y));
+            screen_max = screen_max.max(glam::vec2(pixel_x, pixel_y));
+        }
+
+        if !any_in_front { return None; }
+        
+        Some((screen_min, screen_max))
+    }
+
+    // 每帧更新 Tile 缓冲区
+    fn update_tile_buffer(&mut self) {
+        let width = self.render_context.size.width;
+        let height = self.render_context.size.height;
+        let tiles_x = (width + 15) / 16;
+        let tiles_y = (height + 15) / 16;
+        let total_tiles = (tiles_x * tiles_y) as usize;
+
+        if self.tile_map_cache.len() != total_tiles {
+            self.tile_map_cache.resize(total_tiles, scene::TileData { count: 0, _padding: [0; 3], entity_indices: [0; 128] });
+        }
+        self.tile_map_cache.fill(scene::TileData { count: 0, _padding: [0; 3], entity_indices: [0; 128] });
+
+        // 1. 【生命感逻辑】：按距离排序，确保“挡路”的物体永远排在名单前列
+        let mut sorted_indices: Vec<usize> = (0..self.entities.len()).collect();
+        let cam_pos = self.camera.eye;
+        sorted_indices.sort_by(|&a, &b| {
+            let da = (self.entities[a].position - cam_pos).length();
+            let db = (self.entities[b].position - cam_pos).length();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // 2. 获取光源方向
+        let light_dir = glam::vec3(0.5, 1.0, 0.5).normalize();
+        let shadow_ext = -light_dir * 50.0; // 影子最长 50 米
+        let vp = self.render_context.current_proj * self.render_context.current_view;
+
+        for idx in sorted_indices {
+            let entity = &self.entities[idx];
+            let model = &self.models[&entity.model_id];
+            let model_mat = glam::Mat4::from_cols_array_2d(&entity.get_model_matrix());
+            
+            let mut screen_min = glam::vec2(f32::MAX, f32::MAX);
+            let mut screen_max = glam::vec2(f32::MIN, f32::MIN);
+            let mut is_visible = false;
+
+            // AABB 8 个顶点
+            let min = model.aabb_min;
+            let max = model.aabb_max;
+            let corners = [
+                glam::vec3(min[0], min[1], min[2]),
+                glam::vec3(min[0], min[1], max[2]),
+                glam::vec3(min[0], max[1], min[2]),
+                glam::vec3(min[0], max[1], max[2]),
+                glam::vec3(max[0], min[1], min[2]),
+                glam::vec3(max[0], min[1], max[2]),
+                glam::vec3(max[0], max[1], min[2]),
+                glam::vec3(max[0], max[1], max[2]),
+            ];
+
+            for corner in corners {
+                let world_pos = model_mat.transform_point3(corner);
+                
+                // 投影本体和影子
+                let points = [world_pos, world_pos + shadow_ext];
+                for p in points {
+                    if let Some(pixel) = self.project_to_pixel(p, vp) {
+                        // 关键防御：过滤掉无效的投影结果
+                        if pixel.x.is_finite() && pixel.y.is_finite() {
+                            screen_min = screen_min.min(pixel);
+                            screen_max = screen_max.max(pixel);
+                            is_visible = true;
+                        }
+                    }
+                }
+            }
+
+            // 如果该物体及其影子完全在相机背后，跳过
+            if !is_visible { continue; }
+
+            // 3. 关键防御：计算 Tile 索引时必须进行极度严格的范围锁定
+            // 使用 i32 进行初步计算，防止减 1 时的下溢出
+            let ts_x = ((screen_min.x / 16.0).floor() as i32 - 1).clamp(0, tiles_x as i32 - 1);
+            let te_x = ((screen_max.x / 16.0).ceil() as i32 + 1).clamp(0, tiles_x as i32 - 1);
+            let ts_y = ((screen_min.y / 16.0).floor() as i32 - 1).clamp(0, tiles_y as i32 - 1);
+            let te_y = ((screen_max.y / 16.0).ceil() as i32 + 1).clamp(0, tiles_y as i32 - 1);
+
+            for ty in ts_y..=te_y {
+                let row_offset = (ty as usize).wrapping_mul(tiles_x as usize);
+                for tx in ts_x..=te_x {
+                    let t_idx = row_offset.wrapping_add(tx as usize);
+                    
+                    // 4. 最终防线：检查数组边界
+                    if t_idx < total_tiles {
+                        let count = self.tile_map_cache[t_idx].count as usize;
+                        if count < 128 {
+                            self.tile_map_cache[t_idx].entity_indices[count] = idx as u32;
+                            self.tile_map_cache[t_idx].count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.render_context.queue.write_buffer(&self.tile_buffer, 0, bytemuck::cast_slice(&self.tile_map_cache));
+    }
+
     async fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
@@ -181,7 +356,50 @@ impl<'a> State<'a> {
             ..Default::default()
         }).await.unwrap();
 
-        let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor::default(), None).await.unwrap();
+        let (device, queue) = adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: None,
+                // 开启时间戳查询特性
+                required_features: wgpu::Features::TIMESTAMP_QUERY,
+                required_limits: wgpu::Limits::default(),
+            },
+            None,
+        ).await.unwrap();
+
+        // 创建一个查询集，预留 4 个位置（Compute开始/结束，Render开始/结束）
+        let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            count: 4,
+            ty: wgpu::QueryType::Timestamp,
+            label: Some("Perf Query Set"),
+        });
+
+        // 还需要一个 Buffer 用来把 GPU 里的计时结果读回 CPU
+        let query_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Query Buffer"),
+            size: 32, // 4 * 8 字节
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // 创建一个用于映射读取的缓冲区
+        let mapped_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Mapped Query Buffer"),
+            size: 32,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        // 创建 Tile Buffer (支持到 4K 分辨率的预留空间)
+        let max_tiles_x = (3840 + 15) / 16;
+        let max_tiles_y = (2160 + 15) / 16;
+        let tile_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Tile Storage Buffer"),
+            size: (max_tiles_x * max_tiles_y * std::mem::size_of::<scene::TileData>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+
 
         let caps = surface.get_capabilities(&adapter);
         // 选择支持的 sRGB 格式
@@ -262,7 +480,7 @@ impl<'a> State<'a> {
                                 mip_level_count: 1,
                                 sample_count: 1,
                                 dimension: wgpu::TextureDimension::D3,
-                                format: wgpu::TextureFormat::R32Uint,
+                                format: wgpu::TextureFormat::Rg32Uint,
                                 usage: wgpu::TextureUsages::TEXTURE_BINDING,
                                 view_formats: &[],
                             }).create_view(&wgpu::TextureViewDescriptor::default())) },
@@ -283,7 +501,7 @@ impl<'a> State<'a> {
                         mip_level_count: 1,
                         sample_count: 1,
                         dimension: wgpu::TextureDimension::D3,
-                        format: wgpu::TextureFormat::R32Uint,
+                        format: wgpu::TextureFormat::Rg32Uint,
                         usage: wgpu::TextureUsages::TEXTURE_BINDING,
                         view_formats: &[],
                     }).create_view(&wgpu::TextureViewDescriptor::default()),
@@ -319,7 +537,7 @@ impl<'a> State<'a> {
         // 3. 相机与管线
         let camera_pos = Vec3::new(3.0, 3.0, 3.0);
         let view = Mat4::look_at_rh(camera_pos, Vec3::ZERO, Vec3::Y);
-        let proj = Mat4::perspective_rh(45.0f32.to_radians(), size.width as f32 / size.height as f32, 0.1, 100.0);
+        let proj = Mat4::perspective_rh(45.0f32.to_radians(), size.width as f32 / size.height as f32, 0.1, 10000.0);
         let camera_matrix = proj * view;
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Camera"),
@@ -396,6 +614,7 @@ impl<'a> State<'a> {
                 wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false }, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 5, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 6, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
             ],
         });
 
@@ -490,7 +709,7 @@ impl<'a> State<'a> {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
-            format: wgpu::TextureFormat::R32Uint,
+            format: wgpu::TextureFormat::Rg32Uint,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -516,7 +735,7 @@ impl<'a> State<'a> {
                 bytemuck::cast_slice(&model.dna_data),
                 wgpu::ImageDataLayout {
                     offset: 0,
-                    bytes_per_row: Some(4 * sdf_res),
+                    bytes_per_row: Some(8 * sdf_res),
                     rows_per_image: Some(sdf_res),
                 },
                 wgpu::Extent3d { width: sdf_res, height: sdf_res, depth_or_array_layers: sdf_res },
@@ -666,6 +885,7 @@ impl<'a> State<'a> {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&global_sdf_view) },
                 wgpu::BindGroupEntry { binding: 4, resource: params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: palette_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: tile_buffer.as_entire_binding() },
             ],
             label: Some("Compute Bind Group"),
         });
@@ -747,6 +967,24 @@ impl<'a> State<'a> {
             blit_bind_group,
             compute_pipeline,
             output_texture,
+            
+            // 性能监控相关
+            query_set,
+            query_buffer,
+            mapped_buffer,
+            is_perf_mode: false,
+            last_compute_time: 0.0,
+            last_render_time: 0.0,
+            frame_count: 0,
+            last_perf_print: std::time::Instant::now(),
+            
+            // 连续生成模式
+            is_ser_spawn_mode: false,
+            ser_spawn_model_id: 0,
+            
+            // Tile 加速相关
+            tile_buffer,
+            tile_map_cache: Vec::new(),
         };
 
         // 关键：启动时先计算一次场景 SDF
@@ -788,6 +1026,7 @@ impl<'a> State<'a> {
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.global_sdf_view) },
                     wgpu::BindGroupEntry { binding: 4, resource: self.params_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 5, resource: self.palette_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: self.tile_buffer.as_entire_binding() },
                 ],
                 label: Some("Compute Bind Group"),
             });
@@ -836,7 +1075,15 @@ impl<'a> State<'a> {
         let world_pos = world_pos.xyz() / world_pos.w;
         let ray_dir = (world_pos - self.camera.eye).normalize();
         
+        // 如果 ray_dir.y 趋近于 0 或大于 0 (看向天空)，t 会变成无限大或负数
+        if ray_dir.y.abs() < 0.001 {
+            return self.camera.eye + ray_dir * 10.0; // 兜底：放在相机前 10 米
+        }
+        
         let t = -self.camera.eye.y / ray_dir.y;
+        if t < 0.0 {
+            return self.camera.eye + ray_dir * 10.0; // 兜底
+        }
         self.camera.eye + ray_dir * t
     }
 
@@ -887,9 +1134,153 @@ impl<'a> State<'a> {
         self.undo_manager.redo(&mut self.entities);
     }
 
+    // 获取 wgpu 设备显存使用情况（估算）
+    fn get_vram_usage(&self) -> (u64, u64) {
+        // wgpu 没有直接提供显存查询 API，但我们可以：
+        // 1. 手动累加已知的显存分配
+        let mut total_allocated = 0u64;
+        
+        // 全局 SDF 纹理
+        let sdf_size = self.global_sdf_texture.size();
+        total_allocated += (sdf_size.width * sdf_size.height * sdf_size.depth_or_array_layers) as u64 * 8; // Rg32Uint = 8 bytes
+        
+        // 输出纹理
+        let output_size = self.output_texture.size();
+        total_allocated += (output_size.width * output_size.height) as u64 * 4; // RGBA8 = 4 bytes
+        
+        // 实体列表缓冲区
+        total_allocated += self.entity_list_buffer.size();
+        
+        // 参数缓冲区
+        total_allocated += self.params_buffer.size();
+        
+        // 颜色库缓冲区
+        total_allocated += self.palette_buffer.size();
+        
+        // 每个模型的实例缓冲区和顶点缓冲区（虽然你没用到顶点，但为了完整）
+        for model in self.models.values() {
+            total_allocated += model.instance_buffer.size();
+            total_allocated += model.vertex_buffer.size();
+            total_allocated += model.index_buffer.size();
+        }
+        
+        // 粗略估算驱动/交换链开销（通常是实际分配量的 20-30%）
+        let driver_overhead = total_allocated / 4;
+        
+        (total_allocated, total_allocated + driver_overhead)
+    }
+    
+    // 获取系统内存使用（RSS，驻留集大小）
+    fn get_ram_usage(&self) -> usize {
+        #[cfg(target_os = "windows")]
+        {
+            use winapi::um::psapi::GetProcessMemoryInfo;
+            use winapi::um::processthreadsapi::GetCurrentProcess;
+            use winapi::um::psapi::PROCESS_MEMORY_COUNTERS;
+            use std::mem::zeroed;
+            
+            unsafe {
+                let mut pmc: PROCESS_MEMORY_COUNTERS = zeroed();
+                pmc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+                if GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) != 0 {
+                    return pmc.WorkingSetSize as usize;
+                }
+            }
+        }
+        
+        #[cfg(target_os = "linux")]
+        {
+            let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+            for line in status.lines() {
+                if line.starts_with("VmRSS:") {
+                    let kb: usize = line.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
+                    return kb * 1024;
+                }
+            }
+        }
+        
+        #[cfg(target_os = "macos")]
+        {
+            use libc::{task_info, task_t, task_basic_info, task_basic_info_t, mach_task_self_, TASK_BASIC_INFO, natural_t, integer_t};
+            unsafe {
+                let mut info = std::mem::zeroed::<task_basic_info>();
+                let mut count = (std::mem::size_of::<task_basic_info>() / std::mem::size_of::<natural_t>()) as natural_t;
+                let ret = task_info(
+                    mach_task_self_,
+                    TASK_BASIC_INFO,
+                    &mut info as *mut _ as *mut integer_t,
+                    &mut count,
+                );
+                if ret == 0 {
+                    return info.resident_size;
+                }
+            }
+        }
+        
+        // Fallback: 估算（不准确但总比没有好）
+        std::mem::size_of::<Self>()
+    }
+
     fn execute_command(&mut self) {
         let command = self.console.execute();
         if command.is_empty() {
+            self.console.is_open = false;
+            self.edit_mode = EditMode::Idle;
+            return;
+        }
+
+        if command == "mem" || command == "vram" {
+            // --- 1. 计算核心 DNA 堆栈 ---
+            let model_count = self.models.len();
+            let sdf_res = 64u64;
+            // Rg32Uint = 8 bytes per voxel
+            let dna_per_model = sdf_res * sdf_res * sdf_res * 8;
+            let total_dna_vram = dna_per_model * model_count as u64;
+
+            // --- 2. 计算 Tile 瓦片系统 (4K 预留空间) ---
+            // Stride 132 u32 = 528 bytes
+            let tile_stride = 132 * 4;
+            let max_tiles = ((3840 + 15) / 16) * ((2160 + 15) / 16);
+            let total_tile_vram = max_tiles as u64 * tile_stride as u64;
+
+            // --- 3. 计算输出画布 ---
+            let (w, h) = (self.render_context.size.width as u64, self.render_context.size.height as u64);
+            let canvas_vram = w * h * 4; // Rgba8
+
+            // --- 4. 计算实体清单 ---
+            let entity_list_vram = 1024 * 256; // 1024 slots * 256 bytes
+
+            // --- 打印报告 ---
+            println!("┌──────────────────────────────────────────────────────────┐");
+            println!("│              CILLIN ENGINE VRAM REPORT (CEM3)            │");
+            println!("├──────────────────────────────────────────────────────────┤");
+            println!("│ [Holographic DNA Stack]                                  │");
+            println!("│  - Per Model:   {:>8.2} MB (64^3 * 8B)               │", dna_per_model as f64 / 1024.0 / 1024.0);
+            println!("│  - Model Count: {:>8}                                  │", model_count);
+            println!("│  - Total DNA:   {:>8.2} MB                               │", total_dna_vram as f64 / 1024.0 / 1024.0);
+            println!("│                                                          │");
+            println!("│ [Adaptive Tile System]                                   │");
+            println!("│  - Stride:      {:>8} Bytes (128 Indices)            │", tile_stride);
+            println!("│  - Buffer Size: {:>8.2} MB (Fixed for 4K)              │", total_tile_vram as f64 / 1024.0 / 1024.0);
+            println!("│                                                          │");
+            println!("│ [Render Canvas & Pipeline]                               │");
+            println!("│  - Resolution:  {}x{}                               │", w, h);
+            println!("│  - Framebuffer: {:>8.2} MB                               │", canvas_vram as f64 / 1024.0 / 1024.0);
+            println!("│  - Entity List: {:>8.2} KB                               │", entity_list_vram as f64 / 1024.0);
+            println!("├──────────────────────────────────────────────────────────┤");
+            let total_vram = total_dna_vram + total_tile_vram + canvas_vram + entity_list_vram as u64;
+            println!("│ TOTAL ALLOCATED VRAM: {:>10.2} MB                      │", total_vram as f64 / 1024.0 / 1024.0);
+            println!("└──────────────────────────────────────────────────────────┘");
+
+            self.console.is_open = false;
+            self.edit_mode = EditMode::Idle;
+            return;
+        }
+
+        // 处理 stat 命令
+        if command == "stat" {
+            self.is_perf_mode = !self.is_perf_mode;
+            println!("性能监控已{}", if self.is_perf_mode { "开启" } else { "关闭" });
             self.console.is_open = false;
             self.edit_mode = EditMode::Idle;
             return;
@@ -900,7 +1291,7 @@ impl<'a> State<'a> {
         let parts: Vec<&str> = command.split_whitespace().collect();
         if let Some(cmd) = parts.first() {
             match *cmd {
-                "help" => println!("可用命令: help, exit, spawn <model_id>, cmr <x> <y> <z>, cmr now, sdf, shadow, ao, debug <0|1|2>"),
+                "help" => println!("可用命令: help, exit, spawn <model_id>, serspawn <model_id>, cmr <x> <y> <z>, cmr now, sdf, shadow, ao, debug <0|1|2|3|4|5>, mem, stat, modelinfo"),
                 "exit" => println!("控制台已关闭"),
                 "spawn" => {
                     if parts.len() >= 2 {
@@ -919,6 +1310,19 @@ impl<'a> State<'a> {
                             self.entities.push(entity);
                             *self.instance_counters.entry(model_id).or_insert(0) += 1;
                             println!("已在位置 {:?} 生成模型 {}", pos, model_id);
+                        } else {
+                            println!("错误: 无效的模型 ID");
+                        }
+                    } else {
+                        println!("错误: 请提供模型 ID");
+                    }
+                }
+                "serspawn" => {
+                    if parts.len() >= 2 {
+                        if let Ok(model_id) = parts[1].parse::<u32>() {
+                            self.is_ser_spawn_mode = true;
+                            self.ser_spawn_model_id = model_id;
+                            println!("已开启连续生成模式，模型 ID: {}", model_id);
                         } else {
                             println!("错误: 无效的模型 ID");
                         }
@@ -963,8 +1367,16 @@ impl<'a> State<'a> {
                             println!("调试模式已切换为: {}", mode);
                         }
                     } else {
-                        println!("用法: debug <0|1|2|3|4> (0:关, 1:距离场(红正绿负), 2:坐标映射, 3:法线, 4:原始颜色)");
+                        println!("用法: debug <0|1|2|3|4|5> (0:关, 1:距离场(红正绿负), 2:坐标映射, 3:法线, 4:原始颜色, 5:距离场扫描(红内蓝外))");
                     }
+                }
+                "modelinfo" => {
+                    println!("========== 模型信息 ==========");
+                    for entity in &self.entities {
+                        let model_name = self.manifest.get(&entity.model_id).map(|m| m.name.as_str()).unwrap_or("Unknown");
+                        println!("实体 ID: {}, 模型 ID: {}, 模型名称: {}", entity.id, entity.model_id, model_name);
+                    }
+                    println!("==============================");
                 }
                 _ => println!("未知命令: {}", cmd),
             }
@@ -982,6 +1394,40 @@ impl<'a> State<'a> {
         self.controller.is_q_pressed = self.input_state.is_q_pressed;
         self.controller.is_e_pressed = self.input_state.is_e_pressed;
         
+        // 处理 delete 键删除模型
+        if self.input_state.is_delete_pressed && self.selected_idx.is_some() {
+            let idx = self.selected_idx.unwrap();
+            if idx < self.entities.len() {
+                let entity = &self.entities[idx];
+                println!("已删除模型: ID={}, ModelID={}", entity.id, entity.model_id);
+                self.entities.remove(idx);
+                // 重新分配 ID
+                for (i, entity) in self.entities.iter_mut().enumerate() {
+                    entity.id = i;
+                }
+                self.selected_idx = None;
+            }
+        }
+        
+        // 处理连续生成模式
+        if self.is_ser_spawn_mode && self.input_state.is_left_mouse_pressed {
+            let pos = self.get_click_ground_pos();
+            let model_id = self.ser_spawn_model_id;
+            let instance_index = *self.instance_counters.get(&model_id).unwrap_or(&0);
+            let entity = scene::Entity::new(
+                self.entities.len(),
+                model_id,
+                instance_index,
+                pos,
+                Vec3::ZERO,
+                Vec3::ONE,
+                [1.0, 1.0, 1.0, 1.0],
+            );
+            self.entities.push(entity);
+            *self.instance_counters.entry(model_id).or_insert(0) += 1;
+            println!("已在位置 {:?} 生成模型 {}", pos, model_id);
+        }
+        
         // 更新相机位置
         self.controller.update(&mut self.camera, 1.0);
         
@@ -991,7 +1437,7 @@ impl<'a> State<'a> {
             45.0f32.to_radians(), 
             self.render_context.size.width as f32 / self.render_context.size.height as f32, 
             0.1, 
-            1000.0
+            10000.0
         );
         
         // 更新相机缓冲区
@@ -1001,6 +1447,9 @@ impl<'a> State<'a> {
             0, 
             bytemuck::cast_slice(camera_matrix.as_ref())
         );
+        
+        // 重置输入状态
+        self.input_state.reset();
     }
 
     fn update_instance_buffer(&mut self, model_id: u32) {
@@ -1040,7 +1489,76 @@ impl<'a> State<'a> {
         ); 
     }
 
+    fn print_perf_stats(&self) {
+        // 1. 计算显存 (VRAM)
+        let sdf_size = (64 * 64 * 64 * self.models.len() * 4) as f64 / 1024.0 / 1024.0;
+        let out_tex_size = (self.render_context.size.width * self.render_context.size.height * 4) as f64 / 1024.0 / 1024.0;
+        let total_vram = sdf_size + out_tex_size + 2.0; // 2MB 是 Buffers 的估算
+
+        // 2. 打印精美的控制台报表
+        println!("--- Cillin Engine Perf Stats ---");
+        println!("VRAM Usage:  {:.2} MB (SDF Data: {:.2} MB)", total_vram, sdf_size);
+        println!("GPU Brain:   {:.3} ms (Xi-Luoer Compute)", self.last_compute_time);
+        println!("GPU Eye:     {:.3} ms (Blit & UI)", self.last_render_time);
+        println!("Total Frame: {:.2} FPS", 1000.0 / (self.last_compute_time + self.last_render_time));
+        println!("-------------------------------");
+    }
+
+    fn process_query_results(&mut self) {
+        let device = &self.render_context.device;
+        let queue = &self.render_context.queue;
+
+        // 创建一个新的命令编码器来复制查询结果
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.resolve_query_set(&self.query_set, 0..4, &self.query_buffer, 0);
+        // 将查询结果复制到可映射的缓冲区
+        encoder.copy_buffer_to_buffer(&self.query_buffer, 0, &self.mapped_buffer, 0, 32);
+        queue.submit(std::iter::once(encoder.finish()));
+
+        // 映射缓冲区以读取结果
+        let buffer_slice = self.mapped_buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).unwrap();
+        });
+
+        device.poll(wgpu::Maintain::Wait);
+
+        if let Ok(Ok(())) = receiver.recv() {
+            let data = buffer_slice.get_mapped_range();
+            let timestamps: &[u64] = bytemuck::cast_slice(&data);
+
+            if timestamps.len() >= 4 {
+                let compute_start = timestamps[0];
+                let compute_end = timestamps[1];
+                let render_start = timestamps[2];
+                let render_end = timestamps[3];
+
+                // 计算时间差（纳秒）
+                let compute_time_ns = compute_end - compute_start;
+                let render_time_ns = render_end - render_start;
+
+                // 转换为毫秒
+                self.last_compute_time = compute_time_ns as f32 / 1_000_000.0;
+                self.last_render_time = render_time_ns as f32 / 1_000_000.0;
+
+                // 每 10 帧打印一次性能统计
+                self.frame_count += 1;
+                if self.is_perf_mode && self.frame_count % 10 == 0 {
+                    self.print_perf_stats();
+                }
+            }
+        }
+
+        // 取消映射
+        self.mapped_buffer.unmap();
+    }
+
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        // 性能革命：先更新 Tile 名单
+        self.update_tile_buffer();
+        
         // 更新实体清单缓冲区
         let entity_data: Vec<scene::EntityData> = self.entities.iter()
             .map(|e| {
@@ -1073,6 +1591,8 @@ impl<'a> State<'a> {
         
         let mut encoder = self.render_context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
+        // --- 1. 监控大脑 (Xi-Luoer 混合算法耗时) ---
+        encoder.write_timestamp(&self.query_set, 0); // 记下开始时间
         // 第一步：计算大脑
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
@@ -1080,7 +1600,10 @@ impl<'a> State<'a> {
             cpass.set_bind_group(0, &self.compute_bind_group, &[]); // 使用计算专用组
             cpass.dispatch_workgroups((self.render_context.size.width + 7) / 8, (self.render_context.size.height + 7) / 8, 1);
         }
+        encoder.write_timestamp(&self.query_set, 1); // 记下结束时间
 
+        // --- 2. 监控眼睛 (最终画面呈现耗时) ---
+        encoder.write_timestamp(&self.query_set, 2);
         // 第二步：眼睛展示
         let output = self.render_context.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1102,9 +1625,14 @@ impl<'a> State<'a> {
             rpass.set_bind_group(0, &self.blit_bind_group, &[]); // 使用展示专用组
             rpass.draw(0..3, 0..1); // 画一个全屏三角形
         }
+        encoder.write_timestamp(&self.query_set, 3);
 
         self.render_context.queue.submit(std::iter::once(encoder.finish()));
         output.present();
+
+        // 处理查询结果
+        self.process_query_results();
+
         Ok(())
     }
 }
@@ -1123,15 +1651,27 @@ fn main() {
             WindowEvent::CloseRequested => elwt.exit(),
             WindowEvent::Resized(s) => state.resize(*s),
             WindowEvent::MouseInput { button, state: button_state, .. } => {
+                // 关键修复 1: 无论如何，先让 input_state 记录下点击状态
+                state.input_state.process_event(event);
+
+                // 如果控制台开着，不处理 3D 场景点击
+                if state.console.is_open { return; }
+
                 if button == &MouseButton::Middle {
-                    state.input_state.is_middle_mouse_pressed = *button_state == ElementState::Pressed;
-                    if state.input_state.is_middle_mouse_pressed {
+                    if *button_state == ElementState::Pressed {
                         state.input_state.last_mouse_pos = Some(state.input_state.mouse_pos);
                     } else {
                         state.input_state.last_mouse_pos = None;
                     }
                 } else if button == &MouseButton::Left {
                     if *button_state == ElementState::Pressed {
+                        // 如果处于连续生成模式，点击时不应该触发“选中/取消选中”逻辑，避免冲突
+                        if state.is_ser_spawn_mode {
+                            // 这里可以留空，因为生成逻辑在 update() 里面通过 is_left_mouse_pressed 触发
+                            return;
+                        }
+
+                        // 原有的选中逻辑
                         if let Some(entity) = state.get_clicked_entity() {
                             println!("{}", entity.model_id);
                             println!("{}", entity.code);
@@ -1325,11 +1865,17 @@ fn main() {
                     }
                 }
             }
+            WindowEvent::CursorMoved { .. } => {
+                state.input_state.process_event(event);
+            }
             WindowEvent::MouseWheel { delta: _, .. } => {
                 state.input_state.process_event(event);
                 // 使用滚轮调整相机位置
                 state.camera.eye += state.camera.get_forward() * state.input_state.scroll_delta * 0.1;
                 state.input_state.reset_scroll();
+            }
+            WindowEvent::KeyboardInput { .. } => {
+                state.input_state.process_event(event);
             }
             WindowEvent::RedrawRequested => {
                 state.update();

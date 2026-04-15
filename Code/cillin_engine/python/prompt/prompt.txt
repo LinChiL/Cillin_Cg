@@ -1,33 +1,26 @@
 build.rs
 
+// build.rs
 fn main() {
-    let mut build = cxx_build::bridge("src/lib.rs");
-    build.file("cpp/sdf_logic.cpp")
-        .include("cpp")
-        .std("c++20"); // 这样写更标准，cc-rs 会自动处理不同平台的 flag
-
-    build.compile("cillin_math");
-
     println!("cargo:rerun-if-changed=src/lib.rs");
-    println!("cargo:rerun-if-changed=cpp/sdf_logic.cpp");
-    println!("cargo:rerun-if-changed=cpp/sdf_logic.hpp");
 }
 
 
-cpp\cem_compiler_v2.cpp
+cpp\cem\cem_compiler_v4.cpp
 
 #define CGLTF_IMPLEMENTATION
 #include "cgltf.h"
-
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
 #include <vector>
+#include <array>
 #include <cmath>
 #include <iostream>
 #include <fstream>
 #include <algorithm>
 #include <map>
+#include <cstdint>
 
 // --- 基础数学结构 ---
 struct Vec3 {
@@ -43,48 +36,143 @@ struct Vec3 {
 
 struct Color { uint8_t r, g, b; };
 
-struct MeshData {
-    std::vector<Vec3> vertices;
-    std::vector<Color> colors;
-    std::vector<uint32_t> indices;
-    Vec3 min_b, max_b;
+struct Vec2 { float u, v; };
+
+struct HSV {
+    double h; // 0-360
+    double s; // 0-1
+    double v; // 0-1
 };
 
-// --- 色彩空间工具 ---
-float color_dist(Color c1, Color c2) {
-    return std::pow(c1.r - c2.r, 2) + std::pow(c1.g - c2.g, 2) + std::pow(c1.b - c2.b, 2);
+// --- Keyness2D: 人眼感知敏感度权重计算 (GMM) ---
+class Keyness2D {
+public:
+    double keyness(double hue_deg, double saturation) const {
+        const double PI = 3.141592653589793;
+        double hue_rad = hue_deg * PI / 180.0;
+        
+        if (hue_rad > PI) hue_rad -= 2 * PI;
+        if (hue_rad < -PI) hue_rad += 2 * PI;
+        
+        double hue_key = gmm1d(hue_rad, hue_weights, hue_means, hue_covs);
+        double sat_sens = gmm1d(hue_rad, sat_weights, sat_means, sat_covs);
+        double sat_factor = std::pow(saturation, 0.6);
+        
+        // 归一化系数：0.00556946 是实验测定的峰值密度
+        double result = hue_key * sat_sens * sat_factor / 0.00556946;
+        return std::min(1.0, result);
+    }
+
+private:
+    static constexpr int N = 8;
+    typedef std::array<double, N> Array;
+
+    static constexpr Array hue_weights = {0.11132848, 0.13530582, 0.10849456, 0.11214354, 0.22830474, 0.09697763, 0.12251557, 0.08492966};
+    static constexpr Array hue_means = {6.96195504, -2.89108923, 11.31023104, 0.57595815, 4.04752825, -5.55301231, 9.69434493, -1.34614132};
+    static constexpr Array hue_covs = {0.38831633, 0.43726528, 0.33392143, 0.32444862, 1.07510566, 0.19457601, 0.35457794, 0.15187700};
+    
+    static constexpr Array sat_weights = {0.09713084, 0.13469279, 0.11840812, 0.15963278, 0.10077283, 0.11777569, 0.13832214, 0.13326481};
+    static constexpr Array sat_means = {-5.28501930, 4.79250700, 9.46615962, -0.27033550, 2.54706985, 6.65366799, -2.55780595, 11.54815262};
+    static constexpr Array sat_covs = {0.51787753, 0.71454204, 0.81614231, 0.80506982, 0.91408268, 0.72683746, 0.93444933, 0.41576665};
+
+    double gmm1d(double x, const Array& w, const Array& m, const Array& v) const {
+        const double PI = 3.141592653589793;
+        double density = 0.0;
+        for (int i = 0; i < N; ++i) {
+            double diff = x - m[i];
+            density += w[i] * std::exp(-(diff * diff) / (2.0 * v[i])) / std::sqrt(2.0 * PI * v[i]);
+        }
+        return density;
+    }
+};
+
+// --- 工具函数 ---
+
+HSV rgb_to_hsv(Color c) {
+    double r = c.r / 255.0, g = c.g / 255.0, b = c.b / 255.0;
+    double max = std::max({r, g, b}), min = std::min({r, g, b});
+    double delta = max - min;
+    HSV hsv = {0, 0, max};
+    if (delta > 0) {
+        hsv.s = delta / max;
+        if (max == r) hsv.h = 60.0 * fmod((g - b) / delta, 6.0);
+        else if (max == g) hsv.h = 60.0 * ((b - r) / delta + 2.0);
+        else hsv.h = 60.0 * ((r - g) / delta + 4.0);
+        if (hsv.h < 0) hsv.h += 360.0;
+    }
+    return hsv;
+}
+
+// 颜色归一化：将 RGB 的最大值拉伸到 255
+Color normalize_to_255(Color c, float& out_ko) {
+    float max_val = std::max({(float)c.r, (float)c.g, (float)c.b, 1.0f});
+    out_ko = max_val / 255.0f;
+    return { (uint8_t)(c.r / max_val * 255), (uint8_t)(c.g / max_val * 255), (uint8_t)(c.b / max_val * 255) };
+}
+
+// 1. 新增：射线与三角形求交 (Moller-Trumbore 算法)
+bool ray_intersects_triangle(Vec3 ray_o, Vec3 ray_d, Vec3 v0, Vec3 v1, Vec3 v2) {
+    Vec3 edge1 = v1 - v0;
+    Vec3 edge2 = v2 - v0;
+    Vec3 h = ray_d.cross(edge2);
+    float a = edge1.dot(h);
+    if (a > -1e-6f && a < 1e-6f) return false;
+    float f = 1.0f / a;
+    Vec3 s = ray_o - v0;
+    float u = f * s.dot(h);
+    if (u < 0.0f || u > 1.0f) return false;
+    Vec3 q = s.cross(edge1);
+    float v = f * ray_d.dot(q);
+    if (v < 0.0f || u + v > 1.0f) return false;
+    float t = f * edge2.dot(q);
+    return t > 1e-6f;
+}
+
+// ΔP 感知距离计算
+double calculate_delta_p(Color c1, Color c2, const Keyness2D& kn) {
+    auto hsv1 = rgb_to_hsv(c1);
+    auto hsv2 = rgb_to_hsv(c2);
+    double dh = std::abs(hsv1.h - hsv2.h);
+    if (dh > 180.0) dh = 360.0 - dh;
+    double ds = std::abs(hsv1.s - hsv2.s);
+    double weight = kn.keyness(hsv1.h, hsv1.s);
+    // 使用方程: ΔP = √[ (ΔH × K_h(h))² + (ΔS × K_s(h) × (1 - s)^0.6)² ]
+    double term_h = dh * weight;
+    double term_s = ds * weight * std::pow(1.0 - hsv1.s, 0.6);
+    return std::sqrt(term_h * term_h + term_s * term_s);
 }
 
 class GlobalPalette {
 public:
     std::vector<Color> colors;
+    Keyness2D kn;
+
+    void add_to_library(Color raw_color) {
+        float dummy_ko;
+        Color base = normalize_to_255(raw_color, dummy_ko);
+        for (const auto& exist : colors) {
+            if (calculate_delta_p(base, exist, kn) < 0.05) return; // Ji 阈值判定
+        }
+        if (colors.size() < 1024) colors.push_back(base);
+    }
+
+    int find_best_match(Color target_raw) {
+        float dummy_ko;
+        Color base_target = normalize_to_255(target_raw, dummy_ko);
+        int best_id = 0; double min_dp = 1e10;
+        for (int i = 0; i < colors.size(); ++i) {
+            double dp = calculate_delta_p(base_target, colors[i], kn);
+            if (dp < min_dp) { min_dp = dp; best_id = i; }
+        }
+        return best_id;
+    }
 
     void load(const std::string& path) {
         std::ifstream ifs(path, std::ios::binary);
-        if (!ifs.is_open()) {
-            std::cout << "Warning: Palette not found, generating a default rainbow palette." << std::endl;
-            generate_default();
-            return;
-        }
+        if (!ifs.is_open()) return;
         colors.resize(1024);
-        ifs.seekg(4); // 跳过魔数
+        ifs.seekg(8); // 跳过 CPAL(4) + Count(4)
         ifs.read((char*)colors.data(), 1024 * 3);
-    }
-
-    void generate_default() {
-        colors.resize(1024);
-        for(int i=0; i<1024; ++i) colors[i] = {(uint8_t)(i/4), (uint8_t)(i%255), (uint8_t)((i*7)%255)};
-    }
-
-    // 撞库逻辑：在 1024 种公用色里找最像的
-    int find_best_match(Color target) {
-        int best_id = 0;
-        float min_d = 1e10f;
-        for(int i=0; i<colors.size(); ++i) {
-            float d = color_dist(target, colors[i]);
-            if(d < min_d) { min_d = d; best_id = i; }
-        }
-        return best_id;
     }
 
     void save(const std::string& path) {
@@ -92,196 +180,260 @@ public:
         ofs.write("CPAL", 4);
         uint32_t count = 1024;
         ofs.write((char*)&count, 4);
-        ofs.write((char*)colors.data(), 1024 * 3);
-        ofs.close();
-        std::cout << "Saved palette to: " << path << std::endl;
+        std::vector<Color> output = colors;
+        output.resize(1024, {0,0,0});
+        ofs.write((char*)output.data(), 1024 * 3);
     }
 };
 
-// --- 点到三角形距离函数 ---
+// --- 八面体法线编码 (Octahedron Encoding) ---
+// 将 3D 向量完美压入 10 bits，保持极高精度
+uint32_t encode_normal_10bit(Vec3 n) {
+    float l1 = std::abs(n.x) + std::abs(n.y) + std::abs(n.z);
+    float x = n.x / l1;
+    float y = n.y / l1;
+    if (n.z < 0.0f) {
+        float tx = (1.0f - std::abs(y)) * (x >= 0.0f ? 1.0f : -1.0f);
+        float ty = (1.0f - std::abs(x)) * (y >= 0.0f ? 1.0f : -1.0f);
+        x = tx; y = ty;
+    }
+    uint32_t ux = (uint32_t)std::clamp((x * 0.5f + 0.5f) * 31.0f, 0.0f, 31.0f);
+    uint32_t uy = (uint32_t)std::clamp((y * 0.5f + 0.5f) * 31.0f, 0.0f, 31.0f);
+    return (ux << 5) | uy;
+}
+
+// --- 64-bit 全息体素结构 ---
+struct Voxel64 {
+    uint32_t r; // [SDF 20-bit][ColorID 12-bit]
+    uint32_t g; // [Normal 10-bit][Ko 8-bit][Reserved 14-bit]
+};
+
+Voxel64 pack_voxel_64bit(float dist, int color_id, Vec3 normal, float ko, float world_size) {
+    // 1. R 通道：高精度距离 + 颜色
+    float normalized_d = std::clamp(dist / world_size, -1.0f, 1.0f);
+    int32_t d_int = (int32_t)(normalized_d * 524287.0f); // 20-bit 范围
+    uint32_t d_bits = (uint32_t)d_int & 0xFFFFF;
+    uint32_t id_bits = (uint32_t)color_id & 0xFFF;
+    uint32_t r = (d_bits << 12) | id_bits;
+
+    // 2. G 通道：法线 + Ko (还给你了！)
+    uint32_t norm_bits = encode_normal_10bit(normal) & 0x3FF;
+    uint32_t ko_bits = (uint32_t)(std::clamp(ko, 0.0f, 1.0f) * 255.0f) & 0xFF;
+    uint32_t g = (norm_bits << 22) | (ko_bits << 14); 
+
+    return {r, g};
+}
+
+// --- 几何重心计算 (为了拿到平滑法线) ---
+Vec3 get_closest_point_barycentric(Vec3 p, Vec3 a, Vec3 b, Vec3 c, float& u, float& v, float& w) {
+    Vec3 v0 = b - a, v1 = c - a, v2 = p - a;
+    float d00 = v0.dot(v0); float d01 = v0.dot(v1); float d11 = v1.dot(v1);
+    float d20 = v2.dot(v0); float d21 = v2.dot(v1);
+    float denom = d00 * d11 - d01 * d01;
+    v = (d11 * d20 - d01 * d21) / denom;
+    w = (d00 * d21 - d01 * d20) / denom;
+    u = 1.0f - v - w;
+    u = std::clamp(u, 0.0f, 1.0f); v = std::clamp(v, 0.0f, 1.0f); w = std::clamp(w, 0.0f, 1.0f);
+    return a * u + b * v + c * w;
+}
+
+// --- 其他几何与导出函数 (保持逻辑一致) ---
+
+struct MeshData {
+    std::vector<Vec3> vertices;
+    std::vector<Vec3> normals; // 新增：存法线
+    std::vector<Color> colors;
+    std::vector<Vec2> uvs; // 新增：存储每个顶点的 UV
+    std::vector<uint32_t> indices;
+    
+    // 增加对贴图的引用
+    uint8_t* texture_data = nullptr;
+    int tex_w, tex_h;
+    
+    Vec3 min_b, max_b;
+};
+
 float point_to_tri_dist_sq(Vec3 p, Vec3 a, Vec3 b, Vec3 c, Vec3& out_normal) {
     Vec3 ab = b - a; Vec3 bc = c - b; Vec3 ca = a - c;
     Vec3 ap = p - a; Vec3 bp = p - b; Vec3 cp = p - c;
     Vec3 n = ab.cross(ca);
     out_normal = n;
-
     auto project_on_seg = [](Vec3 p, Vec3 a, Vec3 b) {
         Vec3 ab = b - a;
         float t = std::clamp((p - a).dot(ab) / ab.length_sq(), 0.0f, 1.0f);
         return (p - (a + ab * t)).length_sq();
     };
-
     bool inside = ab.cross(n).dot(ap) >= 0.0f && bc.cross(n).dot(bp) >= 0.0f && ca.cross(n).dot(cp) >= 0.0f;
     if (inside) return (n.dot(ap) * n.dot(ap)) / n.length_sq();
     return std::min({project_on_seg(p, a, b), project_on_seg(p, b, c), project_on_seg(p, c, a)});
 }
 
-// --- 核心：.cem v2 打包逻辑 ---
-// [Dist: 12bit] [ColorID: 10bit] [Modifier: 8bit] [Flag: 2bit]
 uint32_t pack_voxel_v2(float dist, int color_id, float modifier, float world_size) {
-    // 1. 距离映射 (-2048 to 2047)
     float normalized_d = std::clamp(dist / world_size, -1.0f, 1.0f);
     int32_t d_int = (int32_t)(normalized_d * 2047.0f);
     uint32_t d_bits = (uint32_t)d_int & 0xFFF;
-
-    // 2. 颜色 ID (0 to 1023)
     uint32_t id_bits = (uint32_t)color_id & 0x3FF;
-
-    // 3. 亮度微调 (0 to 255)
     uint32_t mod_bits = (uint32_t)(std::clamp(modifier, 0.0f, 1.0f) * 255.0f);
-
-    // 4. 组装
-    return (d_bits << 20) | (id_bits << 10) | (mod_bits << 2) | 0u;
+    return (d_bits << 20) | (id_bits << 10) | (mod_bits << 2);
 }
 
-// --- 加载GLB模型 ---
 MeshData load_glb(const std::string& path) {
     cgltf_options options = {};
     cgltf_data* data = nullptr;
-    std::cout << "Loading GLB: " << path << std::endl;
-    cgltf_result result = cgltf_parse_file(&options, path.c_str(), &data);
-    if (result != cgltf_result_success) {
-        std::cout << "Failed to parse GLB file. Error code: " << result << std::endl;
-        exit(-1);
-    }
-    result = cgltf_load_buffers(&options, data, path.c_str());
-    if (result != cgltf_result_success) {
-        std::cout << "Failed to load buffers. Error code: " << result << std::endl;
-        exit(-1);
-    }
-
-    MeshData mesh;
-    mesh.min_b = {1e10, 1e10, 1e10}; mesh.max_b = {-1e10, -1e10, -1e10};
-
+    if (cgltf_parse_file(&options, path.c_str(), &data) != cgltf_result_success) exit(-1);
+    cgltf_load_buffers(&options, data, path.c_str());
+    MeshData mesh; mesh.min_b = {1e10, 1e10, 1e10}; mesh.max_b = {-1e10, -1e10, -1e10};
+    int img_comp;
     for (size_t m_idx = 0; m_idx < data->meshes_count; ++m_idx) {
-        cgltf_mesh* g_mesh = &data->meshes[m_idx];
-        for (int i = 0; i < g_mesh->primitives_count; ++i) {
-            cgltf_primitive* prim = &g_mesh->primitives[i];
+        for (int i = 0; i < data->meshes[m_idx].primitives_count; ++i) {
+            cgltf_primitive* prim = &data->meshes[m_idx].primitives[i];
             
-            // --- 核心：处理贴图 ---
-            uint8_t* img_data = nullptr;
-            int img_w, img_h, img_comp;
-            if (prim->material && prim->material->has_pbr_metallic_roughness && 
-                prim->material->pbr_metallic_roughness.base_color_texture.texture) {
-                
-                auto* image = prim->material->pbr_metallic_roughness.base_color_texture.texture->image;
-                auto* view = image->buffer_view;
-                // 从内存中读取 GLB 内嵌的图片
-                img_data = stbi_load_from_memory((uint8_t*)view->buffer->data + view->offset, view->size, &img_w, &img_h, &img_comp, 3);
-            }
-
-            // 获取当前 Primitive 的基础颜色（从材质球拿）
-            Color mat_color = {255, 255, 255}; // 默认白
-            if (prim->material && prim->material->has_pbr_metallic_roughness) {
-                float* c = prim->material->pbr_metallic_roughness.base_color_factor;
-                mat_color = { (uint8_t)(c[0] * 255), (uint8_t)(c[1] * 255), (uint8_t)(c[2] * 255) };
+            // 关键：在这里读取并保留贴图数据
+            if (prim->material && prim->material->has_pbr_metallic_roughness && prim->material->pbr_metallic_roughness.base_color_texture.texture) {
+                auto* view = prim->material->pbr_metallic_roughness.base_color_texture.texture->image->buffer_view;
+                mesh.texture_data = stbi_load_from_memory(
+                    (uint8_t*)view->buffer->data + view->offset,
+                    view->size, &mesh.tex_w, &mesh.tex_h, &img_comp, 3
+                );
             }
 
             size_t vertex_offset = mesh.vertices.size();
-            cgltf_accessor* pos_acc = nullptr;
-            cgltf_accessor* uv_acc = nullptr;
-            cgltf_accessor* col_acc = nullptr;
-
+            cgltf_accessor *pos_acc = nullptr, *uv_acc = nullptr, *col_acc = nullptr, *norm_acc = nullptr;
             for (int j = 0; j < prim->attributes_count; ++j) {
                 if (prim->attributes[j].type == cgltf_attribute_type_position) pos_acc = prim->attributes[j].data;
                 if (prim->attributes[j].type == cgltf_attribute_type_texcoord) uv_acc = prim->attributes[j].data;
                 if (prim->attributes[j].type == cgltf_attribute_type_color) col_acc = prim->attributes[j].data;
+                if (prim->attributes[j].type == cgltf_attribute_type_normal) norm_acc = prim->attributes[j].data; // 拿法线！
             }
-
-            if (pos_acc) {
-                for (int k = 0; k < pos_acc->count; ++k) {
-                    float v[3]; cgltf_accessor_read_float(pos_acc, k, v, 3);
-                    Vec3 p = {v[0], v[1], v[2]};
-                    mesh.vertices.push_back(p);
-                    mesh.min_b.x = std::min(mesh.min_b.x, p.x); mesh.max_b.x = std::max(mesh.max_b.x, p.x);
-                    mesh.min_b.y = std::min(mesh.min_b.y, p.y); mesh.max_b.y = std::max(mesh.max_b.y, p.y);
-                    mesh.min_b.z = std::min(mesh.min_b.z, p.z); mesh.max_b.z = std::max(mesh.max_b.z, p.z);
-                    
-                    // 颜色逻辑：优先顶点色，其次贴图采样，最后材质颜色
-                    Color final_c = mat_color;
-                    if (col_acc) {
-                        float c[4]; cgltf_accessor_read_float(col_acc, k, c, 4);
-                        final_c = {(uint8_t)(c[0]*255), (uint8_t)(c[1]*255), (uint8_t)(c[2]*255)};
-                    } else if (img_data && uv_acc) {
-                        float uv[2]; cgltf_accessor_read_float(uv_acc, k, uv, 2);
-                        int x = (int)(uv[0] * img_w) % img_w;
-                        int y = (int)(uv[1] * img_h) % img_h;
-                        if(x < 0) x += img_w;
-                        if(y < 0) y += img_h;
-                        int idx = (y * img_w + x) * 3;
-                        final_c = {img_data[idx], img_data[idx+1], img_data[idx+2]};
-                    }
-                    mesh.colors.push_back(final_c);
+            for (int k = 0; k < pos_acc->count; ++k) {
+                float v[3]; cgltf_accessor_read_float(pos_acc, k, v, 3);
+                Vec3 p = {v[0], v[1], v[2]}; mesh.vertices.push_back(p);
+                mesh.min_b.x = std::min(mesh.min_b.x, p.x); mesh.max_b.x = std::max(mesh.max_b.x, p.x);
+                mesh.min_b.y = std::min(mesh.min_b.y, p.y); mesh.max_b.y = std::max(mesh.max_b.y, p.y);
+                mesh.min_b.z = std::min(mesh.min_b.z, p.z); mesh.max_b.z = std::max(mesh.max_b.z, p.z);
+                
+                // 读取 UV
+                if (uv_acc) {
+                    float uv[2];
+                    cgltf_accessor_read_float(uv_acc, k, uv, 2);
+                    mesh.uvs.push_back({uv[0], uv[1]});
+                } else {
+                    mesh.uvs.push_back({0, 0});
+                }
+                
+                Color c = {255, 255, 255};
+                if (col_acc) { float fc[4]; cgltf_accessor_read_float(col_acc, k, fc, 4); c = {(uint8_t)(fc[0]*255), (uint8_t)(fc[1]*255), (uint8_t)(fc[2]*255)}; }
+                else if (mesh.texture_data && !mesh.uvs.empty()) { 
+                    float uv[2]; cgltf_accessor_read_float(uv_acc, k, uv, 2);
+                    int x = (int)(uv[0] * mesh.tex_w) % mesh.tex_w, y = (int)(uv[1] * mesh.tex_h) % mesh.tex_h;
+                    int idx = (y * mesh.tex_w + (x < 0 ? x + mesh.tex_w : x)) * 3;
+                    c = {mesh.texture_data[idx], mesh.texture_data[idx+1], mesh.texture_data[idx+2]};
+                }
+                mesh.colors.push_back(c);
+                if (norm_acc) {
+                    float fn[3]; cgltf_accessor_read_float(norm_acc, k, fn, 3);
+                    mesh.normals.push_back({fn[0], fn[1], fn[2]});
+                } else {
+                    mesh.normals.push_back({0, 1, 0}); // 兜底
                 }
             }
-
-            if (prim->indices) {
-                for (int k = 0; k < prim->indices->count; ++k) {
-                    mesh.indices.push_back(vertex_offset + cgltf_accessor_read_index(prim->indices, k));
-                }
-            }
-            
-            // 释放贴图数据
-            if (img_data) {
-                stbi_image_free(img_data);
-            }
+            if (prim->indices) for (int k = 0; k < prim->indices->count; ++k) mesh.indices.push_back(vertex_offset + cgltf_accessor_read_index(prim->indices, k));
         }
     }
-    cgltf_free(data);
-    return mesh;
+    cgltf_free(data); return mesh;
 }
 
-// --- 生成全局色板 ---
+#include <filesystem>
+
 void generate_global_palette(const std::string& glb_dir, const std::string& output_cpal) {
-    std::vector<std::string> glb_files = {
-        "ComeCube.glb",
-        "tree.glb"
-    };
-
-    std::map<uint32_t, int> color_counts;
-
-    for (const auto& filename : glb_files) {
-        std::string path = glb_dir + "\\" + filename;
-        std::cout << "Processing: " << path << std::endl;
-        MeshData mesh = load_glb(path);
-        
-        std::cout << "Mesh vertices: " << mesh.vertices.size() << ", colors: " << mesh.colors.size() << std::endl;
-        
-        for (const auto& c : mesh.colors) {
-            uint32_t key = (c.r << 16) | (c.g << 8) | c.b;
-            color_counts[key]++;
+    namespace fs = std::filesystem;
+    GlobalPalette pal;
+    pal.add_to_library({255, 255, 255}); // 强制白
+    pal.add_to_library({128, 128, 128}); // 强制灰
+    
+    // 遍历文件夹中的所有 GLB 文件
+    for (const auto& entry : fs::directory_iterator(glb_dir)) {
+        if (entry.path().extension() == ".glb") {
+            std::string file = entry.path().filename().string();
+            std::cout << "Processing: " << file << std::endl;
+            MeshData mesh = load_glb(glb_dir + "\\" + file);
+            for (const auto& c : mesh.colors) pal.add_to_library(c);
         }
     }
-
-    std::vector<std::pair<uint32_t, int>> sorted_colors(color_counts.begin(), color_counts.end());
-    std::sort(sorted_colors.begin(), sorted_colors.end(), [](const auto& a, const auto& b) {
-        return a.second > b.second;
-    });
-
-    GlobalPalette pal;
-    pal.colors.resize(1024, {0, 0, 0});
-
-    for (int i = 0; i < std::min((size_t)1024, sorted_colors.size()); ++i) {
-        uint32_t key = sorted_colors[i].first;
-        pal.colors[i] = {
-            (uint8_t)(key >> 16),
-            (uint8_t)((key >> 8) & 0xFF),
-            (uint8_t)(key & 0xFF)
-        };
-    }
-
+    
     pal.save(output_cpal);
-    std::cout << "Generated global palette with " << std::min((size_t)1024, sorted_colors.size()) << " colors" << std::endl;
+    std::cout << "Palette Generated. Unique Hue-Bases: " << pal.colors.size() << std::endl;
 }
 
-// --- CEM 2.0 导出逻辑 ---
 void cook_cem_v2(const std::string& input_glb, const std::string& output_cem, GlobalPalette& pal) {
     MeshData mesh = load_glb(input_glb);
-
     int res = 64;
     std::vector<uint32_t> voxels(res * res * res);
     Vec3 size = mesh.max_b - mesh.min_b;
     float world_size = std::max({size.x, size.y, size.z});
+
+    std::cout << "Cooking with Ray-Casting Sign Detection..." << std::endl;
+
+    for (int z = 0; z < res; ++z) {
+        for (int y = 0; y < res; ++y) {
+            for (int x = 0; x < res; ++x) {
+                // 1. 计算采样点
+                Vec3 p = {
+                    mesh.min_b.x + (x / (float)(res-1)) * size.x,
+                    mesh.min_b.y + (y / (float)(res-1)) * size.y,
+                    mesh.min_b.z + (z / (float)(res-1)) * size.z
+                };
+
+                // 2. 寻找最近三角形并计算绝对距离
+                float min_d_sq = 1e10f;
+                int closest_tri_idx = 0;
+                for (size_t i = 0; i < mesh.indices.size(); i += 3) {
+                    Vec3 dummy_n;
+                    float d_sq = point_to_tri_dist_sq(p, mesh.vertices[mesh.indices[i]], mesh.vertices[mesh.indices[i+1]], mesh.vertices[mesh.indices[i+2]], dummy_n);
+                    if (d_sq < min_d_sq) { min_d_sq = d_sq; closest_tri_idx = i; }
+                }
+
+                // 3. 核心：射线投票法判定符号 (inside/outside)
+                int hit_count = 0;
+                Vec3 ray_dir = {1.0f, 0.432f, 0.123f}; // 避开坐标轴的随机向量
+                ray_dir = ray_dir * (1.0f / ray_dir.length());
+                for (size_t i = 0; i < mesh.indices.size(); i += 3) {
+                    if (ray_intersects_triangle(p, ray_dir, mesh.vertices[mesh.indices[i]], mesh.vertices[mesh.indices[i+1]], mesh.vertices[mesh.indices[i+2]])) {
+                        hit_count++;
+                    }
+                }
+                float dist = std::sqrt(min_d_sq);
+                if (hit_count % 2 != 0) dist = -dist; // 奇数次穿越说明在内部
+
+                // 4. 抓取最近顶点颜色 (棋盘格支持)
+                uint32_t best_v = mesh.indices[closest_tri_idx];
+                float best_vd = 1e10f;
+                for(int k=0; k<3; k++) {
+                    float d = (p - mesh.vertices[mesh.indices[closest_tri_idx+k]]).length_sq();
+                    if(d < best_vd) { best_vd = d; best_v = mesh.indices[closest_tri_idx+k]; }
+                }
+
+                float ko;
+                Color norm_c = normalize_to_255(mesh.colors[best_v], ko);
+                voxels[x + y*res + z*res*res] = pack_voxel_v2(dist, pal.find_best_match(mesh.colors[best_v]), ko, world_size);
+            }
+        }
+    }
+    std::ofstream ofs(output_cem, std::ios::binary);
+    ofs.write("CEM2", 4); ofs.write((char*)&res, 4);
+    ofs.write((char*)&mesh.min_b, 12); ofs.write((char*)&mesh.max_b, 12);
+    ofs.write((char*)voxels.data(), voxels.size() * 4);
+}
+
+// --- 升级版 Cook 函数 (64-bit) ---
+void cook_cem_v3_64bit(const std::string& input_glb, const std::string& output_cem, GlobalPalette& pal) {
+    MeshData mesh = load_glb(input_glb);
+    int res = 64;
+    std::vector<Voxel64> voxels(res * res * res);
+    Vec3 size = mesh.max_b - mesh.min_b;
+    float world_size = std::max({size.x, size.y, size.z});
+
+    std::cout << "Cooking CEM3 (64-bit HD) with Normal Injection..." << std::endl;
 
     for (int z = 0; z < res; ++z) {
         for (int y = 0; y < res; ++y) {
@@ -292,319 +444,249 @@ void cook_cem_v2(const std::string& input_glb, const std::string& output_cem, Gl
                     mesh.min_b.z + (z / (float)(res-1)) * size.z
                 };
 
-                float min_d_sq = 1e10f;
-                Vec3 closest_n = {0,0,0};
-                int closest_tri = 0;
-
+                // 1. 寻找最近三角形并计算重心
+                float min_d_sq = 1e10f; int closest_tri = 0;
+                float cu, cv, cw;
                 for (size_t i = 0; i < mesh.indices.size(); i += 3) {
-                    Vec3 a = mesh.vertices[mesh.indices[i]];
-                    Vec3 b = mesh.vertices[mesh.indices[i+1]];
-                    Vec3 c = mesh.vertices[mesh.indices[i+2]];
-                    Vec3 tri_n;
-                    float d_sq = point_to_tri_dist_sq(p, a, b, c, tri_n);
-                    if (d_sq < min_d_sq) { min_d_sq = d_sq; closest_n = tri_n; closest_tri = i; }
+                    Vec3 dummy_n;
+                    float d_sq = point_to_tri_dist_sq(p, mesh.vertices[mesh.indices[i]], mesh.vertices[mesh.indices[i+1]], mesh.vertices[mesh.indices[i+2]], dummy_n);
+                    if (d_sq < min_d_sq) {
+                        min_d_sq = d_sq; closest_tri = i;
+                        get_closest_point_barycentric(p, mesh.vertices[mesh.indices[i]], mesh.vertices[mesh.indices[i+1]], mesh.vertices[mesh.indices[i+2]], cu, cv, cw);
+                    }
                 }
 
+                // 2. 拿到平滑插值法线
+                Vec3 n1 = mesh.normals[mesh.indices[closest_tri]];
+                Vec3 n2 = mesh.normals[mesh.indices[closest_tri+1]];
+                Vec3 n3 = mesh.normals[mesh.indices[closest_tri+2]];
+                Vec3 smooth_n = (n1 * cu + n2 * cv + n3 * cw) * (1.0f / (cu + cv + cw + 1e-8f));
+                smooth_n = smooth_n * (1.0f / smooth_n.length());
+
+                // 3. 射线投票定正负 (保持 100% 准确)
+                int hit_count = 0;
+                Vec3 ray_dir = {1.0f, 0.432f, 0.123f};
+                ray_dir = ray_dir * (1.0f / ray_dir.length());
+                for (size_t i = 0; i < mesh.indices.size(); i += 3) {
+                    if (ray_intersects_triangle(p, ray_dir, mesh.vertices[mesh.indices[i]], mesh.vertices[mesh.indices[i+1]], mesh.vertices[mesh.indices[i+2]])) hit_count++;
+                }
                 float dist = std::sqrt(min_d_sq);
-                if ((p - mesh.vertices[mesh.indices[closest_tri]]).dot(closest_n) < 0) dist = -dist;
 
-                Color original_c = mesh.colors.empty() ? Color{255,255,255} : mesh.colors[mesh.indices[closest_tri]];
-                
-                // --- 核心改变：向公用色板撞库 ---
-                int color_id = pal.find_best_match(original_c);
-                
-                // --- 计算微调值 (Modifier) ---
-                float mod = (original_c.r + original_c.g + original_c.b + 1) /
-                            (float)(pal.colors[color_id].r + pal.colors[color_id].g + pal.colors[color_id].b + 1);
+                // --- 核心修正：针对细小几何体的保护 ---
+                // 如果当前点离任何一个三角形的距离小于“半个体素”的对角线
+                // 我们适当缩小 dist 的正值，让它在 3D 纹理中留下更明显的“痕迹”
+                float voxel_world_size = world_size / 64.0f;
+                if (hit_count % 2 != 0) {
+                    dist = -dist;
+                } else {
+                    // 即使在外部，如果太近，也稍微压低距离值，防止插值时被抹除
+                    if (dist < voxel_world_size * 0.5f) {
+                        dist *= 0.8f;
+                    }
+                }
 
-                voxels[x + y*res + z*res*res] = pack_voxel_v2(dist, color_id, mod, world_size);
+                // 4. 核心修复：插值 UV 并采样贴图
+                Color raw_c = mesh.colors[mesh.indices[closest_tri]]; // 默认为第一个顶点的颜色
+                if (mesh.texture_data && !mesh.uvs.empty()) {
+                    // 1. 获取三个顶点的 UV
+                    Vec2 uv1 = mesh.uvs[mesh.indices[closest_tri]];
+                    Vec2 uv2 = mesh.uvs[mesh.indices[closest_tri + 1]];
+                    Vec2 uv3 = mesh.uvs[mesh.indices[closest_tri + 2]];
+
+                    // 2. 重心插值得到当前点的精确 UV
+                    float u = uv1.u * cu + uv2.u * cv + uv3.u * cw;
+                    float v = uv1.v * cu + uv2.v * cv + uv3.v * cw;
+
+                    // 3. 映射到贴图像素坐标 (支持 Wrap 循环采样)
+                    int tx = (int)(u * mesh.tex_w) % mesh.tex_w;
+                    int ty = (int)(v * mesh.tex_h) % mesh.tex_h;
+                    if (tx < 0) tx += mesh.tex_w;
+                    if (ty < 0) ty += mesh.tex_h;
+
+                    // 4. 从贴图内存读取
+                    int pixel_idx = (ty * mesh.tex_w + tx) * 3;
+                    raw_c.r = mesh.texture_data[pixel_idx];
+                    raw_c.g = mesh.texture_data[pixel_idx + 1];
+                    raw_c.b = mesh.texture_data[pixel_idx + 2];
+                }
+
+                // 5. 颜色与 Ko
+                float ko;
+                Color norm_c = normalize_to_255(raw_c, ko); // 获取原始 Ko
+
+                // 6. 打包 64-bit
+                voxels[x + y*res + z*res*res] = pack_voxel_64bit(dist, pal.find_best_match(raw_c), smooth_n, ko, world_size);
             }
         }
     }
 
-    // 写入 .cem 文件 (不再包含 Palette)
     std::ofstream ofs(output_cem, std::ios::binary);
-    ofs.write("CEM2", 4); // 版本 2
+    ofs.write("CEM3", 4); // 魔数更新为 CEM3
     ofs.write((char*)&res, 4);
     ofs.write((char*)&mesh.min_b, 12); ofs.write((char*)&mesh.max_b, 12);
-    ofs.write((char*)voxels.data(), voxels.size() * 4);
-    ofs.close();
+    ofs.write((char*)voxels.data(), voxels.size() * 8); // 写入 8 字节体素
+    
+    // 释放贴图数据
+    if (mesh.texture_data) stbi_image_free(mesh.texture_data);
+}
 
-    std::cout << "Cooked CEM v2: " << output_cem << std::endl;
+void cook_all(const std::string& glb_dir, const std::string& palette_path, const std::string& output_dir) {
+    namespace fs = std::filesystem;
+    
+    // 加载调色板
+    GlobalPalette pal;
+    pal.load(palette_path);
+    
+    // 确保输出目录存在
+    fs::create_directories(output_dir);
+    
+    // 遍历文件夹中的所有 GLB 文件
+    for (const auto& entry : fs::directory_iterator(glb_dir)) {
+        if (entry.path().extension() == ".glb") {
+            std::string file = entry.path().filename().string();
+            std::string input_glb = entry.path().string();
+            std::string output_cem = output_dir + "\\" + file.substr(0, file.size() - 4) + ".cem";
+            
+            std::cout << "Processing: " << file << " -> " << output_cem << std::endl;
+            cook_cem_v3_64bit(input_glb, output_cem, pal);
+        }
+    }
+    
+    std::cout << "Cook-all completed!" << std::endl;
 }
 
 int main(int argc, char** argv) {
-    if (argc < 4) {
-        std::cout << "Usage: cem_cooker_v2 <mode> <input> <output>" << std::endl;
-        std::cout << "Modes:" << std::endl;
-        std::cout << "  generate-palette <glb_directory> <output.cpal>" << std::endl;
-        std::cout << "  cook <input.glb> <palette.cpal> <output.cem>" << std::endl;
-        return -1;
-    }
-
+    if (argc < 4) return -1;
     std::string mode = argv[1];
-
-    if (mode == "generate-palette") {
-        generate_global_palette(argv[2], argv[3]);
-    } else if (mode == "cook") {
-        if (argc < 5) {
-            std::cout << "Usage: cem_cooker_v2 cook <input.glb> <palette.cpal> <output.cem>" << std::endl;
-            return -1;
-        }
-        GlobalPalette pal;
-        pal.load(argv[3]);
-        cook_cem_v2(argv[2], argv[4], pal);
-    } else {
-        std::cout << "Unknown mode: " << mode << std::endl;
-        return -1;
+    if (mode == "generate-palette") generate_global_palette(argv[2], argv[3]);
+    else if (mode == "cook") { GlobalPalette pal; pal.load(argv[3]); cook_cem_v2(argv[2], argv[4], pal); }
+    else if (mode == "cook-64bit") { GlobalPalette pal; pal.load(argv[3]); cook_cem_v3_64bit(argv[2], argv[4], pal); }
+    else if (mode == "cook-all") {
+        if (argc < 5) return -1;
+        cook_all(argv[2], argv[3], argv[4]);
     }
-
     return 0;
 }
 
 
-cpp\sdf_logic.cpp
+cpp\sdf\sdf_logic.cpp
 
-﻿#include "sdf_logic.hpp"
-#include "cillin_engine/src/lib.rs.h" // 必须包含这个！cxx 会自动生成它
+﻿﻿#include "sdf_logic.hpp"
+#include "cillin_engine/src/lib.rs.h"
 
-float point_to_triangle_dist_sq(Vec3 p, Vec3 a, Vec3 b, Vec3 c) {
-    Vec3 ab = b - a;
-    Vec3 bc = c - b;
-    Vec3 ca = a - c;
-    Vec3 ap = p - a;
-    Vec3 bp = p - b;
-    Vec3 cp = p - c;
-
-    Vec3 n = ab.cross(ca);
-
-    auto project_on_segment = [](Vec3 p, Vec3 a, Vec3 b) {
-        Vec3 ab = b - a;
-        float t = (p - a).dot(ab) / ab.length_sq();
-        t = std::max(0.0f, std::min(1.0f, t));
-        Vec3 proj = {a.x + t * ab.x, a.y + t * ab.y, a.z + t * ab.z};
-        Vec3 diff = p - proj;
-        return diff.length_sq();
-    };
-
-    bool inside = 
-        ab.cross(n).dot(ap) >= 0.0f && 
-        bc.cross(n).dot(bp) >= 0.0f && 
-        ca.cross(n).dot(cp) >= 0.0f;
-
-    if (inside) {
-        float dist_n = n.dot(ap);
-        return (dist_n * dist_n) / n.length_sq();
-    } else {
-        return std::min({
-            project_on_segment(p, a, b),
-            project_on_segment(p, b, c),
-            project_on_segment(p, c, a)
-        });
-    }
-}
-
-rust::Vec<float> generate_sdf_baked_aabb(
-    rust::Slice<const float> vertices,
-    rust::Slice<const uint32_t> indices,
-    int res,
-    float min_x, float min_y, float min_z,
-    float max_x, float max_y, float max_z
-) {
-    rust::Vec<float> output_grid;
-    output_grid.reserve(res * res * res);
-
-    Vec3 min_b = { min_x, min_y, min_z };
-    Vec3 max_b = { max_x, max_y, max_z };
-    Vec3 size = { max_x - min_x, max_y - min_y, max_z - min_z };
-
-    for (int z = 0; z < res; ++z) {
-        for (int y = 0; y < res; ++y) {
-            for (int x = 0; x < res; ++x) {
-                // 精准映射：根据格子索引算出世界坐标
-                Vec3 p = {
-                    min_b.x + (x / (float)(res - 1)) * size.x,
-                    min_b.y + (y / (float)(res - 1)) * size.y,
-                    min_b.z + (z / (float)(res - 1)) * size.z
-                };
-
-                float min_d_sq = 1e10f;
-                Vec3 closest_normal = {0, 0, 0};
-                Vec3 closest_p_to_v = {0, 0, 0};
-
-                for (size_t i = 0; i < indices.size(); i += 3) {
-                    Vec3 a = { vertices[indices[i]*8], vertices[indices[i]*8+1], vertices[indices[i]*8+2] };
-                    Vec3 b = { vertices[indices[i+1]*8], vertices[indices[i+1]*8+1], vertices[indices[i+1]*8+2] };
-                    Vec3 c = { vertices[indices[i+2]*8], vertices[indices[i+2]*8+1], vertices[indices[i+2]*8+2] };
-                    
-                    // 计算该三角形的法线
-                    Vec3 edge1 = b - a;
-                    Vec3 edge2 = c - a;
-                    Vec3 tri_normal = edge1.cross(edge2); // 未归一化的法线
-
-                    float d_sq = point_to_triangle_dist_sq(p, a, b, c);
-                    if (d_sq < min_d_sq) {
-                        min_d_sq = d_sq;
-                        closest_normal = tri_normal;
-                        closest_p_to_v = p - a; // 从面上一点指向采样点 p 的向量
-                    }
-                }
-
-                float dist = std::sqrt(min_d_sq);
-                
-                // --- 核心：判定符号 ---
-                // 如果点 p 到面的向量与法线方向相反（点积为负），说明在模型内部
-                if (closest_p_to_v.dot(closest_normal) < 0) {
-                    dist = -dist; // 标记为内部！
-                }
-                
-                output_grid.push_back(dist);
-            }
-        }
-    }
-    return output_grid;
-}
-
-// 辅助函数：矩阵变换点
-Vec3 transform_vec(Vec3 p, const float* matrix) {
-    float x = p.x * matrix[0] + p.y * matrix[4] + p.z * matrix[8] + matrix[12];
-    float y = p.x * matrix[1] + p.y * matrix[5] + p.z * matrix[9] + matrix[13];
-    float z = p.x * matrix[2] + p.y * matrix[6] + p.z * matrix[10] + matrix[14];
-    float w = p.x * matrix[3] + p.y * matrix[7] + p.z * matrix[11] + matrix[15];
-    
-    if (w != 0.0f) {
-        return {x / w, y / w, z / w};
-    }
-    return {x, y, z};
-}
-
-// 解包体素数据
-float unpack_voxel(uint32_t data) {
-    // 手动处理 12 位补码，确保负数正确还原
-    uint32_t d_bits = data >> 20;
+// 内部工具：仅解包距离，保持极简
+inline float unpack_voxel_dist(uint32_t data) {
+    uint32_t d_bits = (data >> 20) & 0xFFF;
     int32_t d_int = (int32_t)d_bits;
-    if (d_bits >= 2048) {
-        d_int -= 4096;
-    }
+    if (d_bits >= 2048) d_int -= 4096;
     return (float)d_int / 2047.0f;
 }
 
-// 三线性插值采样（支持 Uint32 全息数据）
+// 供 CPU 碰撞等逻辑使用的采样
 float sample_local_sdf(Vec3 p_local, const uint32_t* data, int res) {
-    // 将 -1~1 的局部坐标转为 0~res-1 的索引坐标
+    // 映射到索引空间
     float x = (p_local.x * 0.5f + 0.5f) * (res - 1);
     float y = (p_local.y * 0.5f + 0.5f) * (res - 1);
     float z = (p_local.z * 0.5f + 0.5f) * (res - 1);
 
-    // 如果坐标在模型包围盒外，返回一个很大的距离
-    if (x < 0 || x > res-1 || y < 0 || y > res-1 || z < 0 || z > res-1) return 10.0f;
+    if (x < 0 || x > res - 1 || y < 0 || y > res - 1 || z < 0 || z > res - 1) return 1.0f;
 
     int x0 = (int)x; int x1 = std::min(x0 + 1, res - 1);
     int y0 = (int)y; int y1 = std::min(y0 + 1, res - 1);
     int z0 = (int)z; int z1 = std::min(z0 + 1, res - 1);
+    float fx = x - (float)x0; float fy = y - (float)y0; float fz = z - (float)z0;
 
-    float fx = x - x0; float fy = y - y0; float fz = z - z0;
-
-    // 8 点采样插值 (标准的 GPU 纹理采样算法的 CPU 实现)
-    auto get_v = [&](int ix, int iy, int iz) { 
-        return unpack_voxel(data[ix + iy * res + iz * res * res]); 
+    auto get_v = [&](int ix, int iy, int iz) {
+        return unpack_voxel_dist(data[ix + iy * res + iz * res * res]);
     };
 
-    float v000 = get_v(x0, y0, z0); float v100 = get_v(x1, y0, z0);
-    float v010 = get_v(x0, y1, z0); float v110 = get_v(x1, y1, z0);
-    float v001 = get_v(x0, y0, z1); float v101 = get_v(x1, y0, z1);
-    float v011 = get_v(x0, y1, z1); float v111 = get_v(x1, y1, z1);
-
-    float i1 = v000 * (1 - fx) + v100 * fx;
-    float i2 = v010 * (1 - fx) + v110 * fx;
-    float j1 = v001 * (1 - fx) + v101 * fx;
-    float j2 = v011 * (1 - fx) + v111 * fx;
-
-    float w1 = i1 * (1 - fy) + i2 * fy;
-    float w2 = j1 * (1 - fy) + j2 * fy;
-
-    return w1 * (1 - fz) + w2 * fz;
+    // 这里 CPU 版使用 std::lerp 即可，不强制要求 Quintic
+    return std::lerp(
+        std::lerp(std::lerp(get_v(x0,y0,z0), get_v(x1,y0,z0), fx), std::lerp(get_v(x0,y1,z0), get_v(x1,y1,z0), fx), fy),
+        std::lerp(std::lerp(get_v(x0,y0,z1), get_v(x1,y0,z1), fx), std::lerp(get_v(x0,y1,z1), get_v(x1,y1,z1), fx), fy),
+        fz
+    );
 }
 
-// 核心：合并所有实体到全局 SDF
-rust::Vec<float> merge_global_sdf(
-    rust::Slice<const EntitySdfInfo> entities, // 修改这里：去掉 ffi::
+// merge_global_sdf 保持原有的逻辑即可
+void merge_global_sdf(
+    uint32_t* global_data,
     int global_res,
-    float world_box_size
+    const uint32_t* local_data,
+    int local_res,
+    float offset_x,
+    float offset_y,
+    float offset_z
 ) {
-    rust::Vec<float> global_grid;
-    global_grid.reserve(global_res * global_res * global_res);
-
-    float step = world_box_size / (float)global_res;
-    float offset = world_box_size * 0.5f;
-    float half_step = step * 0.5f;
-
-    for (int z = 0; z < global_res; ++z) {
-        for (int y = 0; y < global_res; ++y) {
-            for (int x = 0; x < global_res; ++x) {
-                Vec3 p_world = { 
-                    x * step - offset + half_step, 
-                    y * step - offset + half_step, 
-                    z * step - offset + half_step 
-                };
-                float min_dist = 10.0f;
-
-                for (const auto& entity : entities) {
-                    // 使用 entity.inv_matrix.data() 访问数组
-                    Vec3 p_local = transform_vec(p_world, entity.inv_matrix.data());
-                    float d = sample_local_sdf(p_local, entity.sdf_ptr, entity.res);
-                    if (d < min_dist) min_dist = d;
+    // 计算局部 SDF 在全局纹理中的起始和结束坐标
+    int start_x = static_cast<int>((offset_x + 0.5f) * (global_res - 1));
+    int start_y = static_cast<int>((offset_y + 0.5f) * (global_res - 1));
+    int start_z = static_cast<int>((offset_z + 0.5f) * (global_res - 1));
+    
+    int end_x = start_x + local_res;
+    int end_y = start_y + local_res;
+    int end_z = start_z + local_res;
+    
+    // 确保不越界
+    start_x = std::max(0, start_x);
+    start_y = std::max(0, start_y);
+    start_z = std::max(0, start_z);
+    
+    end_x = std::min(global_res, end_x);
+    end_y = std::min(global_res, end_y);
+    end_z = std::min(global_res, end_z);
+    
+    // 合并数据
+    for (int z = start_z; z < end_z; z++) {
+        for (int y = start_y; y < end_y; y++) {
+            for (int x = start_x; x < end_x; x++) {
+                // 计算局部坐标
+                int local_x = x - start_x;
+                int local_y = y - start_y;
+                int local_z = z - start_z;
+                
+                // 检查局部坐标是否在有效范围内
+                if (local_x < 0 || local_x >= local_res ||
+                    local_y < 0 || local_y >= local_res ||
+                    local_z < 0 || local_z >= local_res) {
+                    continue;
                 }
-                global_grid.push_back(min_dist);
+                
+                // 计算全局和局部索引
+                int global_idx = x + y * global_res + z * global_res * global_res;
+                int local_idx = local_x + local_y * local_res + local_z * local_res * local_res;
+                
+                // 直接复制数据
+                global_data[global_idx] = local_data[local_idx];
             }
         }
     }
-    return global_grid;
 }
 
 
-cpp\sdf_logic.hpp
+cpp\sdf\sdf_logic.hpp
 
-﻿#pragma once
+﻿﻿#pragma once
 #include "rust/cxx.h"
 #include <cmath>
 #include <algorithm>
 #include <vector>
-#include <cstdint> // 确保 uint32_t 可用
+#include <cstdint>
 
-// 1. 全局命名空间的 Vec3 定义，供 cxx 使用
-struct Vec3 {
-    float x, y, z;
-    Vec3 operator-(const Vec3& v) const { return {x - v.x, y - v.y, z - v.z}; }
-    Vec3 operator+(const Vec3& v) const { return {x + v.x, y + v.y, z + v.z}; }
-    float dot(const Vec3& v) const { return x * v.x + y * v.y + z * v.z; }
-    Vec3 cross(const Vec3& v) const {
-        return {y * v.z - z * v.y, z * v.x - x * v.z, x * v.y - y * v.x};
-    }
-    float length_sq() const { return this->dot(*this); }
-};
+struct Vec3 { float x, y, z; };
 
-// 2. 前置声明 Rust 中定义的结构体，这样编译器就知道它是一个结构体
-struct EntitySdfInfo;
-
-float point_to_triangle_dist_sq(Vec3 p, Vec3 a, Vec3 b, Vec3 c);
-Vec3 transform_vec(Vec3 p, const float* matrix);
-float unpack_voxel(uint32_t data);
+// 供 CPU 逻辑使用的采样逻辑（如碰撞检测）
 float sample_local_sdf(Vec3 p_local, const uint32_t* data, int res);
 
-// 2. 去掉 ffi:: 前缀
-rust::Vec<float> generate_sdf_baked_aabb(
-    rust::Slice<const float> vertices,
-    rust::Slice<const uint32_t> indices,
-    int res,
-    float min_x, float min_y, float min_z,
-    float max_x, float max_y, float max_z
-);
-
-rust::Vec<float> merge_global_sdf(
-    rust::Slice<const EntitySdfInfo> entities, // 修改这里：去掉 ffi::
+// 全局 SDF 合并逻辑：将局部 SDF 数据合并到全局纹理
+void merge_global_sdf(
+    uint32_t* global_data,
     int global_res,
-    float world_box_size
+    const uint32_t* local_data,
+    int local_res,
+    float offset_x,
+    float offset_y,
+    float offset_z
 );
 
 
@@ -797,6 +879,8 @@ pub struct InputState {
     pub is_middle_mouse_pressed: bool,
     pub last_mouse_pos: Option<(f64, f64)>,
     pub scroll_delta: f32,
+    pub is_delete_pressed: bool,
+    pub is_left_mouse_pressed: bool,
 }
 
 impl InputState {
@@ -820,6 +904,8 @@ impl InputState {
                     } else {
                         self.last_mouse_pos = None;
                     }
+                } else if button == &MouseButton::Left {
+                    self.is_left_mouse_pressed = state == &ElementState::Pressed;
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -846,6 +932,12 @@ impl InputState {
                 "e" => self.is_e_pressed = pressed,
                 _ => {}
             },
+            winit::keyboard::Key::Named(key) => match key {
+                winit::keyboard::NamedKey::Delete => {
+                    self.is_delete_pressed = pressed;
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -853,40 +945,16 @@ impl InputState {
     pub fn reset_scroll(&mut self) {
         self.scroll_delta = 0.0;
     }
+
+    pub fn reset(&mut self) {
+        self.is_delete_pressed = false;
+        self.is_left_mouse_pressed = false;
+    }
 }
 
 
 
 src\lib.rs
-
-#[cxx::bridge]
-pub mod ffi {
-    unsafe extern "C++" {
-        include!("sdf_logic.hpp");
-
-        // 新增支持 AABB 的烘焙函数
-        fn generate_sdf_baked_aabb(
-            vertices: &[f32],
-            indices: &[u32],
-            res: i32,
-            min_x: f32, min_y: f32, min_z: f32,
-            max_x: f32, max_y: f32, max_z: f32,
-        ) -> Vec<f32>;
-
-        fn merge_global_sdf(
-            entities: &[EntitySdfInfo],
-            global_res: i32,
-            world_box_size: f32
-        ) -> Vec<f32>;
-    }
-
-    #[derive(Debug)]
-    pub struct EntitySdfInfo {
-        pub inv_matrix: [f32; 16],
-        pub sdf_ptr: *const u32,
-        pub res: i32,
-    }
-}
 
 pub mod camera;
 pub mod console;
@@ -1062,15 +1130,192 @@ struct State<'a> {
     entity_list_buffer: wgpu::Buffer,
     params_buffer: wgpu::Buffer,
     palette_buffer: wgpu::Buffer,
+    compute_bind_group_layout: wgpu::BindGroupLayout,
+    blit_bind_group_layout: wgpu::BindGroupLayout,
     compute_bind_group: wgpu::BindGroup,
     blit_bind_group: wgpu::BindGroup,
     compute_pipeline: wgpu::ComputePipeline,
     output_texture: wgpu::Texture,
+    
+    // 性能监控相关
+    query_set: wgpu::QuerySet,
+    query_buffer: wgpu::Buffer,
+    mapped_buffer: wgpu::Buffer,
+    is_perf_mode: bool,
+    last_compute_time: f32,
+    last_render_time: f32,
+    frame_count: u32,
+    last_perf_print: std::time::Instant,
+    
+    // 连续生成模式
+    is_ser_spawn_mode: bool,
+    ser_spawn_model_id: u32,
+    
+    // Tile 加速相关
+    tile_buffer: wgpu::Buffer,
+    tile_map_cache: Vec<scene::TileData>,
 }
 
 
 
 impl<'a> State<'a> {
+    // 辅助函数：世界点转像素点
+    fn project_to_pixel(&self, world_p: glam::Vec3, vp: glam::Mat4) -> Option<glam::Vec2> {
+        let clip = vp * world_p.extend(1.0);
+        if clip.w <= 0.0 { return None; }
+        let ndc = clip.xyz() / clip.w;
+        Some(glam::vec2(
+            (ndc.x + 1.0) * 0.5 * self.render_context.size.width as f32,
+            (1.0 - ndc.y) * 0.5 * self.render_context.size.height as f32,
+        ))
+    }
+
+    // 将 AABB 的 8 个顶点投影到屏幕坐标
+    fn project_aabb_to_screen(&self, entity: &scene::Entity, model: &models::ModelAsset) -> Option<(glam::Vec2, glam::Vec2)> {
+        let mvp = self.render_context.current_proj * self.render_context.current_view * glam::Mat4::from_cols_array_2d(&entity.get_model_matrix());
+        
+        let min = model.aabb_min;
+        let max = model.aabb_max;
+        
+        // AABB 的 8 个顶点坐标
+        let corners = [
+            glam::vec4(min[0], min[1], min[2], 1.0),
+            glam::vec4(min[0], min[1], max[2], 1.0),
+            glam::vec4(min[0], max[1], min[2], 1.0),
+            glam::vec4(min[0], max[1], max[2], 1.0),
+            glam::vec4(max[0], min[1], min[2], 1.0),
+            glam::vec4(max[0], min[1], max[2], 1.0),
+            glam::vec4(max[0], max[1], min[2], 1.0),
+            glam::vec4(max[0], max[1], max[2], 1.0),
+        ];
+
+        let mut screen_min = glam::vec2(f32::MAX, f32::MAX);
+        let mut screen_max = glam::vec2(f32::MIN, f32::MIN);
+        let mut any_in_front = false;
+
+        for corner in corners {
+            let mut clip_pos = mvp * corner;
+            
+            // 简单的裁剪判定：如果顶点在相机后面，这一步比较复杂，我们简单处理
+            if clip_pos.w > 0.0 {
+                any_in_front = true;
+            } else {
+                continue;
+            }
+
+            // 归一化设备坐标 (NDC)
+            let ndc = clip_pos.xyz() / clip_pos.w;
+            
+            // 映射到屏幕像素坐标
+            let pixel_x = (ndc.x + 1.0) * 0.5 * self.render_context.size.width as f32;
+            let pixel_y = (1.0 - ndc.y) * 0.5 * self.render_context.size.height as f32;
+
+            screen_min = screen_min.min(glam::vec2(pixel_x, pixel_y));
+            screen_max = screen_max.max(glam::vec2(pixel_x, pixel_y));
+        }
+
+        if !any_in_front { return None; }
+        
+        Some((screen_min, screen_max))
+    }
+
+    // 每帧更新 Tile 缓冲区
+    fn update_tile_buffer(&mut self) {
+        let width = self.render_context.size.width;
+        let height = self.render_context.size.height;
+        let tiles_x = (width + 15) / 16;
+        let tiles_y = (height + 15) / 16;
+        let total_tiles = (tiles_x * tiles_y) as usize;
+
+        if self.tile_map_cache.len() != total_tiles {
+            self.tile_map_cache.resize(total_tiles, scene::TileData { count: 0, _padding: [0; 3], entity_indices: [0; 128] });
+        }
+        self.tile_map_cache.fill(scene::TileData { count: 0, _padding: [0; 3], entity_indices: [0; 128] });
+
+        // 1. 【生命感逻辑】：按距离排序，确保“挡路”的物体永远排在名单前列
+        let mut sorted_indices: Vec<usize> = (0..self.entities.len()).collect();
+        let cam_pos = self.camera.eye;
+        sorted_indices.sort_by(|&a, &b| {
+            let da = (self.entities[a].position - cam_pos).length();
+            let db = (self.entities[b].position - cam_pos).length();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // 2. 获取光源方向
+        let light_dir = glam::vec3(0.5, 1.0, 0.5).normalize();
+        let shadow_ext = -light_dir * 50.0; // 影子最长 50 米
+        let vp = self.render_context.current_proj * self.render_context.current_view;
+
+        for idx in sorted_indices {
+            let entity = &self.entities[idx];
+            let model = &self.models[&entity.model_id];
+            let model_mat = glam::Mat4::from_cols_array_2d(&entity.get_model_matrix());
+            
+            let mut screen_min = glam::vec2(f32::MAX, f32::MAX);
+            let mut screen_max = glam::vec2(f32::MIN, f32::MIN);
+            let mut is_visible = false;
+
+            // AABB 8 个顶点
+            let min = model.aabb_min;
+            let max = model.aabb_max;
+            let corners = [
+                glam::vec3(min[0], min[1], min[2]),
+                glam::vec3(min[0], min[1], max[2]),
+                glam::vec3(min[0], max[1], min[2]),
+                glam::vec3(min[0], max[1], max[2]),
+                glam::vec3(max[0], min[1], min[2]),
+                glam::vec3(max[0], min[1], max[2]),
+                glam::vec3(max[0], max[1], min[2]),
+                glam::vec3(max[0], max[1], max[2]),
+            ];
+
+            for corner in corners {
+                let world_pos = model_mat.transform_point3(corner);
+                
+                // 投影本体和影子
+                let points = [world_pos, world_pos + shadow_ext];
+                for p in points {
+                    if let Some(pixel) = self.project_to_pixel(p, vp) {
+                        // 关键防御：过滤掉无效的投影结果
+                        if pixel.x.is_finite() && pixel.y.is_finite() {
+                            screen_min = screen_min.min(pixel);
+                            screen_max = screen_max.max(pixel);
+                            is_visible = true;
+                        }
+                    }
+                }
+            }
+
+            // 如果该物体及其影子完全在相机背后，跳过
+            if !is_visible { continue; }
+
+            // 3. 关键防御：计算 Tile 索引时必须进行极度严格的范围锁定
+            // 使用 i32 进行初步计算，防止减 1 时的下溢出
+            let ts_x = ((screen_min.x / 16.0).floor() as i32 - 1).clamp(0, tiles_x as i32 - 1);
+            let te_x = ((screen_max.x / 16.0).ceil() as i32 + 1).clamp(0, tiles_x as i32 - 1);
+            let ts_y = ((screen_min.y / 16.0).floor() as i32 - 1).clamp(0, tiles_y as i32 - 1);
+            let te_y = ((screen_max.y / 16.0).ceil() as i32 + 1).clamp(0, tiles_y as i32 - 1);
+
+            for ty in ts_y..=te_y {
+                let row_offset = (ty as usize).wrapping_mul(tiles_x as usize);
+                for tx in ts_x..=te_x {
+                    let t_idx = row_offset.wrapping_add(tx as usize);
+                    
+                    // 4. 最终防线：检查数组边界
+                    if t_idx < total_tiles {
+                        let count = self.tile_map_cache[t_idx].count as usize;
+                        if count < 128 {
+                            self.tile_map_cache[t_idx].entity_indices[count] = idx as u32;
+                            self.tile_map_cache[t_idx].count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.render_context.queue.write_buffer(&self.tile_buffer, 0, bytemuck::cast_slice(&self.tile_map_cache));
+    }
+
     async fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
@@ -1081,7 +1326,50 @@ impl<'a> State<'a> {
             ..Default::default()
         }).await.unwrap();
 
-        let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor::default(), None).await.unwrap();
+        let (device, queue) = adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: None,
+                // 开启时间戳查询特性
+                required_features: wgpu::Features::TIMESTAMP_QUERY,
+                required_limits: wgpu::Limits::default(),
+            },
+            None,
+        ).await.unwrap();
+
+        // 创建一个查询集，预留 4 个位置（Compute开始/结束，Render开始/结束）
+        let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            count: 4,
+            ty: wgpu::QueryType::Timestamp,
+            label: Some("Perf Query Set"),
+        });
+
+        // 还需要一个 Buffer 用来把 GPU 里的计时结果读回 CPU
+        let query_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Query Buffer"),
+            size: 32, // 4 * 8 字节
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // 创建一个用于映射读取的缓冲区
+        let mapped_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Mapped Query Buffer"),
+            size: 32,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        // 创建 Tile Buffer (支持到 4K 分辨率的预留空间)
+        let max_tiles_x = (3840 + 15) / 16;
+        let max_tiles_y = (2160 + 15) / 16;
+        let tile_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Tile Storage Buffer"),
+            size: (max_tiles_x * max_tiles_y * std::mem::size_of::<scene::TileData>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+
 
         let caps = surface.get_capabilities(&adapter);
         // 选择支持的 sRGB 格式
@@ -1162,7 +1450,7 @@ impl<'a> State<'a> {
                                 mip_level_count: 1,
                                 sample_count: 1,
                                 dimension: wgpu::TextureDimension::D3,
-                                format: wgpu::TextureFormat::R32Uint,
+                                format: wgpu::TextureFormat::Rg32Uint,
                                 usage: wgpu::TextureUsages::TEXTURE_BINDING,
                                 view_formats: &[],
                             }).create_view(&wgpu::TextureViewDescriptor::default())) },
@@ -1183,7 +1471,7 @@ impl<'a> State<'a> {
                         mip_level_count: 1,
                         sample_count: 1,
                         dimension: wgpu::TextureDimension::D3,
-                        format: wgpu::TextureFormat::R32Uint,
+                        format: wgpu::TextureFormat::Rg32Uint,
                         usage: wgpu::TextureUsages::TEXTURE_BINDING,
                         view_formats: &[],
                     }).create_view(&wgpu::TextureViewDescriptor::default()),
@@ -1219,7 +1507,7 @@ impl<'a> State<'a> {
         // 3. 相机与管线
         let camera_pos = Vec3::new(3.0, 3.0, 3.0);
         let view = Mat4::look_at_rh(camera_pos, Vec3::ZERO, Vec3::Y);
-        let proj = Mat4::perspective_rh(45.0f32.to_radians(), size.width as f32 / size.height as f32, 0.1, 100.0);
+        let proj = Mat4::perspective_rh(45.0f32.to_radians(), size.width as f32 / size.height as f32, 0.1, 10000.0);
         let camera_matrix = proj * view;
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Camera"),
@@ -1296,6 +1584,7 @@ impl<'a> State<'a> {
                 wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false }, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 5, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 6, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
             ],
         });
 
@@ -1390,7 +1679,7 @@ impl<'a> State<'a> {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
-            format: wgpu::TextureFormat::R32Uint,
+            format: wgpu::TextureFormat::Rg32Uint,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -1416,7 +1705,7 @@ impl<'a> State<'a> {
                 bytemuck::cast_slice(&model.dna_data),
                 wgpu::ImageDataLayout {
                     offset: 0,
-                    bytes_per_row: Some(4 * sdf_res),
+                    bytes_per_row: Some(8 * sdf_res),
                     rows_per_image: Some(sdf_res),
                 },
                 wgpu::Extent3d { width: sdf_res, height: sdf_res, depth_or_array_layers: sdf_res },
@@ -1566,6 +1855,7 @@ impl<'a> State<'a> {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&global_sdf_view) },
                 wgpu::BindGroupEntry { binding: 4, resource: params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: palette_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: tile_buffer.as_entire_binding() },
             ],
             label: Some("Compute Bind Group"),
         });
@@ -1641,10 +1931,30 @@ impl<'a> State<'a> {
             entity_list_buffer,
             params_buffer,
             palette_buffer,
+            compute_bind_group_layout,
+            blit_bind_group_layout,
             compute_bind_group,
             blit_bind_group,
             compute_pipeline,
             output_texture,
+            
+            // 性能监控相关
+            query_set,
+            query_buffer,
+            mapped_buffer,
+            is_perf_mode: false,
+            last_compute_time: 0.0,
+            last_render_time: 0.0,
+            frame_count: 0,
+            last_perf_print: std::time::Instant::now(),
+            
+            // 连续生成模式
+            is_ser_spawn_mode: false,
+            ser_spawn_model_id: 0,
+            
+            // Tile 加速相关
+            tile_buffer,
+            tile_map_cache: Vec::new(),
         };
 
         // 关键：启动时先计算一次场景 SDF
@@ -1656,6 +1966,53 @@ impl<'a> State<'a> {
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
             self.render_context.resize(new_size);
+            
+            // 更新输出纹理
+            let device = &self.render_context.device;
+            
+            // 创建新的输出纹理
+            let new_output_texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Output Texture"),
+                size: wgpu::Extent3d {
+                    width: new_size.width,
+                    height: new_size.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let new_output_texture_view = new_output_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            
+            // 更新绑定组
+            let new_compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &self.compute_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&new_output_texture_view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: self.entity_list_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.global_sdf_view) },
+                    wgpu::BindGroupEntry { binding: 4, resource: self.params_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: self.palette_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: self.tile_buffer.as_entire_binding() },
+                ],
+                label: Some("Compute Bind Group"),
+            });
+            
+            let new_blit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                layout: &self.blit_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&new_output_texture_view) },
+                ],
+                label: Some("Blit Bind Group"),
+            });
+            
+            // 更新状态
+            self.output_texture = new_output_texture;
+            self.compute_bind_group = new_compute_bind_group;
+            self.blit_bind_group = new_blit_bind_group;
         }
     }
 
@@ -1688,7 +2045,15 @@ impl<'a> State<'a> {
         let world_pos = world_pos.xyz() / world_pos.w;
         let ray_dir = (world_pos - self.camera.eye).normalize();
         
+        // 如果 ray_dir.y 趋近于 0 或大于 0 (看向天空)，t 会变成无限大或负数
+        if ray_dir.y.abs() < 0.001 {
+            return self.camera.eye + ray_dir * 10.0; // 兜底：放在相机前 10 米
+        }
+        
         let t = -self.camera.eye.y / ray_dir.y;
+        if t < 0.0 {
+            return self.camera.eye + ray_dir * 10.0; // 兜底
+        }
         self.camera.eye + ray_dir * t
     }
 
@@ -1739,9 +2104,153 @@ impl<'a> State<'a> {
         self.undo_manager.redo(&mut self.entities);
     }
 
+    // 获取 wgpu 设备显存使用情况（估算）
+    fn get_vram_usage(&self) -> (u64, u64) {
+        // wgpu 没有直接提供显存查询 API，但我们可以：
+        // 1. 手动累加已知的显存分配
+        let mut total_allocated = 0u64;
+        
+        // 全局 SDF 纹理
+        let sdf_size = self.global_sdf_texture.size();
+        total_allocated += (sdf_size.width * sdf_size.height * sdf_size.depth_or_array_layers) as u64 * 8; // Rg32Uint = 8 bytes
+        
+        // 输出纹理
+        let output_size = self.output_texture.size();
+        total_allocated += (output_size.width * output_size.height) as u64 * 4; // RGBA8 = 4 bytes
+        
+        // 实体列表缓冲区
+        total_allocated += self.entity_list_buffer.size();
+        
+        // 参数缓冲区
+        total_allocated += self.params_buffer.size();
+        
+        // 颜色库缓冲区
+        total_allocated += self.palette_buffer.size();
+        
+        // 每个模型的实例缓冲区和顶点缓冲区（虽然你没用到顶点，但为了完整）
+        for model in self.models.values() {
+            total_allocated += model.instance_buffer.size();
+            total_allocated += model.vertex_buffer.size();
+            total_allocated += model.index_buffer.size();
+        }
+        
+        // 粗略估算驱动/交换链开销（通常是实际分配量的 20-30%）
+        let driver_overhead = total_allocated / 4;
+        
+        (total_allocated, total_allocated + driver_overhead)
+    }
+    
+    // 获取系统内存使用（RSS，驻留集大小）
+    fn get_ram_usage(&self) -> usize {
+        #[cfg(target_os = "windows")]
+        {
+            use winapi::um::psapi::GetProcessMemoryInfo;
+            use winapi::um::processthreadsapi::GetCurrentProcess;
+            use winapi::um::psapi::PROCESS_MEMORY_COUNTERS;
+            use std::mem::zeroed;
+            
+            unsafe {
+                let mut pmc: PROCESS_MEMORY_COUNTERS = zeroed();
+                pmc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+                if GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) != 0 {
+                    return pmc.WorkingSetSize as usize;
+                }
+            }
+        }
+        
+        #[cfg(target_os = "linux")]
+        {
+            let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+            for line in status.lines() {
+                if line.starts_with("VmRSS:") {
+                    let kb: usize = line.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
+                    return kb * 1024;
+                }
+            }
+        }
+        
+        #[cfg(target_os = "macos")]
+        {
+            use libc::{task_info, task_t, task_basic_info, task_basic_info_t, mach_task_self_, TASK_BASIC_INFO, natural_t, integer_t};
+            unsafe {
+                let mut info = std::mem::zeroed::<task_basic_info>();
+                let mut count = (std::mem::size_of::<task_basic_info>() / std::mem::size_of::<natural_t>()) as natural_t;
+                let ret = task_info(
+                    mach_task_self_,
+                    TASK_BASIC_INFO,
+                    &mut info as *mut _ as *mut integer_t,
+                    &mut count,
+                );
+                if ret == 0 {
+                    return info.resident_size;
+                }
+            }
+        }
+        
+        // Fallback: 估算（不准确但总比没有好）
+        std::mem::size_of::<Self>()
+    }
+
     fn execute_command(&mut self) {
         let command = self.console.execute();
         if command.is_empty() {
+            self.console.is_open = false;
+            self.edit_mode = EditMode::Idle;
+            return;
+        }
+
+        if command == "mem" || command == "vram" {
+            // --- 1. 计算核心 DNA 堆栈 ---
+            let model_count = self.models.len();
+            let sdf_res = 64u64;
+            // Rg32Uint = 8 bytes per voxel
+            let dna_per_model = sdf_res * sdf_res * sdf_res * 8;
+            let total_dna_vram = dna_per_model * model_count as u64;
+
+            // --- 2. 计算 Tile 瓦片系统 (4K 预留空间) ---
+            // Stride 132 u32 = 528 bytes
+            let tile_stride = 132 * 4;
+            let max_tiles = ((3840 + 15) / 16) * ((2160 + 15) / 16);
+            let total_tile_vram = max_tiles as u64 * tile_stride as u64;
+
+            // --- 3. 计算输出画布 ---
+            let (w, h) = (self.render_context.size.width as u64, self.render_context.size.height as u64);
+            let canvas_vram = w * h * 4; // Rgba8
+
+            // --- 4. 计算实体清单 ---
+            let entity_list_vram = 1024 * 256; // 1024 slots * 256 bytes
+
+            // --- 打印报告 ---
+            println!("┌──────────────────────────────────────────────────────────┐");
+            println!("│              CILLIN ENGINE VRAM REPORT (CEM3)            │");
+            println!("├──────────────────────────────────────────────────────────┤");
+            println!("│ [Holographic DNA Stack]                                  │");
+            println!("│  - Per Model:   {:>8.2} MB (64^3 * 8B)               │", dna_per_model as f64 / 1024.0 / 1024.0);
+            println!("│  - Model Count: {:>8}                                  │", model_count);
+            println!("│  - Total DNA:   {:>8.2} MB                               │", total_dna_vram as f64 / 1024.0 / 1024.0);
+            println!("│                                                          │");
+            println!("│ [Adaptive Tile System]                                   │");
+            println!("│  - Stride:      {:>8} Bytes (128 Indices)            │", tile_stride);
+            println!("│  - Buffer Size: {:>8.2} MB (Fixed for 4K)              │", total_tile_vram as f64 / 1024.0 / 1024.0);
+            println!("│                                                          │");
+            println!("│ [Render Canvas & Pipeline]                               │");
+            println!("│  - Resolution:  {}x{}                               │", w, h);
+            println!("│  - Framebuffer: {:>8.2} MB                               │", canvas_vram as f64 / 1024.0 / 1024.0);
+            println!("│  - Entity List: {:>8.2} KB                               │", entity_list_vram as f64 / 1024.0);
+            println!("├──────────────────────────────────────────────────────────┤");
+            let total_vram = total_dna_vram + total_tile_vram + canvas_vram + entity_list_vram as u64;
+            println!("│ TOTAL ALLOCATED VRAM: {:>10.2} MB                      │", total_vram as f64 / 1024.0 / 1024.0);
+            println!("└──────────────────────────────────────────────────────────┘");
+
+            self.console.is_open = false;
+            self.edit_mode = EditMode::Idle;
+            return;
+        }
+
+        // 处理 stat 命令
+        if command == "stat" {
+            self.is_perf_mode = !self.is_perf_mode;
+            println!("性能监控已{}", if self.is_perf_mode { "开启" } else { "关闭" });
             self.console.is_open = false;
             self.edit_mode = EditMode::Idle;
             return;
@@ -1752,7 +2261,7 @@ impl<'a> State<'a> {
         let parts: Vec<&str> = command.split_whitespace().collect();
         if let Some(cmd) = parts.first() {
             match *cmd {
-                "help" => println!("可用命令: help, exit, spawn <model_id>, cmr <x> <y> <z>, cmr now, sdf, shadow, ao, debug <0|1|2>"),
+                "help" => println!("可用命令: help, exit, spawn <model_id>, serspawn <model_id>, cmr <x> <y> <z>, cmr now, sdf, shadow, ao, debug <0|1|2|3|4|5>, mem, stat, modelinfo"),
                 "exit" => println!("控制台已关闭"),
                 "spawn" => {
                     if parts.len() >= 2 {
@@ -1771,6 +2280,19 @@ impl<'a> State<'a> {
                             self.entities.push(entity);
                             *self.instance_counters.entry(model_id).or_insert(0) += 1;
                             println!("已在位置 {:?} 生成模型 {}", pos, model_id);
+                        } else {
+                            println!("错误: 无效的模型 ID");
+                        }
+                    } else {
+                        println!("错误: 请提供模型 ID");
+                    }
+                }
+                "serspawn" => {
+                    if parts.len() >= 2 {
+                        if let Ok(model_id) = parts[1].parse::<u32>() {
+                            self.is_ser_spawn_mode = true;
+                            self.ser_spawn_model_id = model_id;
+                            println!("已开启连续生成模式，模型 ID: {}", model_id);
                         } else {
                             println!("错误: 无效的模型 ID");
                         }
@@ -1815,8 +2337,16 @@ impl<'a> State<'a> {
                             println!("调试模式已切换为: {}", mode);
                         }
                     } else {
-                        println!("用法: debug <0|1|2> (0:关, 1:距离场, 2:坐标映射)");
+                        println!("用法: debug <0|1|2|3|4|5> (0:关, 1:距离场(红正绿负), 2:坐标映射, 3:法线, 4:原始颜色, 5:距离场扫描(红内蓝外))");
                     }
+                }
+                "modelinfo" => {
+                    println!("========== 模型信息 ==========");
+                    for entity in &self.entities {
+                        let model_name = self.manifest.get(&entity.model_id).map(|m| m.name.as_str()).unwrap_or("Unknown");
+                        println!("实体 ID: {}, 模型 ID: {}, 模型名称: {}", entity.id, entity.model_id, model_name);
+                    }
+                    println!("==============================");
                 }
                 _ => println!("未知命令: {}", cmd),
             }
@@ -1834,6 +2364,40 @@ impl<'a> State<'a> {
         self.controller.is_q_pressed = self.input_state.is_q_pressed;
         self.controller.is_e_pressed = self.input_state.is_e_pressed;
         
+        // 处理 delete 键删除模型
+        if self.input_state.is_delete_pressed && self.selected_idx.is_some() {
+            let idx = self.selected_idx.unwrap();
+            if idx < self.entities.len() {
+                let entity = &self.entities[idx];
+                println!("已删除模型: ID={}, ModelID={}", entity.id, entity.model_id);
+                self.entities.remove(idx);
+                // 重新分配 ID
+                for (i, entity) in self.entities.iter_mut().enumerate() {
+                    entity.id = i;
+                }
+                self.selected_idx = None;
+            }
+        }
+        
+        // 处理连续生成模式
+        if self.is_ser_spawn_mode && self.input_state.is_left_mouse_pressed {
+            let pos = self.get_click_ground_pos();
+            let model_id = self.ser_spawn_model_id;
+            let instance_index = *self.instance_counters.get(&model_id).unwrap_or(&0);
+            let entity = scene::Entity::new(
+                self.entities.len(),
+                model_id,
+                instance_index,
+                pos,
+                Vec3::ZERO,
+                Vec3::ONE,
+                [1.0, 1.0, 1.0, 1.0],
+            );
+            self.entities.push(entity);
+            *self.instance_counters.entry(model_id).or_insert(0) += 1;
+            println!("已在位置 {:?} 生成模型 {}", pos, model_id);
+        }
+        
         // 更新相机位置
         self.controller.update(&mut self.camera, 1.0);
         
@@ -1843,7 +2407,7 @@ impl<'a> State<'a> {
             45.0f32.to_radians(), 
             self.render_context.size.width as f32 / self.render_context.size.height as f32, 
             0.1, 
-            100.0
+            10000.0
         );
         
         // 更新相机缓冲区
@@ -1853,6 +2417,9 @@ impl<'a> State<'a> {
             0, 
             bytemuck::cast_slice(camera_matrix.as_ref())
         );
+        
+        // 重置输入状态
+        self.input_state.reset();
     }
 
     fn update_instance_buffer(&mut self, model_id: u32) {
@@ -1892,7 +2459,76 @@ impl<'a> State<'a> {
         ); 
     }
 
+    fn print_perf_stats(&self) {
+        // 1. 计算显存 (VRAM)
+        let sdf_size = (64 * 64 * 64 * self.models.len() * 4) as f64 / 1024.0 / 1024.0;
+        let out_tex_size = (self.render_context.size.width * self.render_context.size.height * 4) as f64 / 1024.0 / 1024.0;
+        let total_vram = sdf_size + out_tex_size + 2.0; // 2MB 是 Buffers 的估算
+
+        // 2. 打印精美的控制台报表
+        println!("--- Cillin Engine Perf Stats ---");
+        println!("VRAM Usage:  {:.2} MB (SDF Data: {:.2} MB)", total_vram, sdf_size);
+        println!("GPU Brain:   {:.3} ms (Xi-Luoer Compute)", self.last_compute_time);
+        println!("GPU Eye:     {:.3} ms (Blit & UI)", self.last_render_time);
+        println!("Total Frame: {:.2} FPS", 1000.0 / (self.last_compute_time + self.last_render_time));
+        println!("-------------------------------");
+    }
+
+    fn process_query_results(&mut self) {
+        let device = &self.render_context.device;
+        let queue = &self.render_context.queue;
+
+        // 创建一个新的命令编码器来复制查询结果
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.resolve_query_set(&self.query_set, 0..4, &self.query_buffer, 0);
+        // 将查询结果复制到可映射的缓冲区
+        encoder.copy_buffer_to_buffer(&self.query_buffer, 0, &self.mapped_buffer, 0, 32);
+        queue.submit(std::iter::once(encoder.finish()));
+
+        // 映射缓冲区以读取结果
+        let buffer_slice = self.mapped_buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).unwrap();
+        });
+
+        device.poll(wgpu::Maintain::Wait);
+
+        if let Ok(Ok(())) = receiver.recv() {
+            let data = buffer_slice.get_mapped_range();
+            let timestamps: &[u64] = bytemuck::cast_slice(&data);
+
+            if timestamps.len() >= 4 {
+                let compute_start = timestamps[0];
+                let compute_end = timestamps[1];
+                let render_start = timestamps[2];
+                let render_end = timestamps[3];
+
+                // 计算时间差（纳秒）
+                let compute_time_ns = compute_end - compute_start;
+                let render_time_ns = render_end - render_start;
+
+                // 转换为毫秒
+                self.last_compute_time = compute_time_ns as f32 / 1_000_000.0;
+                self.last_render_time = render_time_ns as f32 / 1_000_000.0;
+
+                // 每 10 帧打印一次性能统计
+                self.frame_count += 1;
+                if self.is_perf_mode && self.frame_count % 10 == 0 {
+                    self.print_perf_stats();
+                }
+            }
+        }
+
+        // 取消映射
+        self.mapped_buffer.unmap();
+    }
+
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        // 性能革命：先更新 Tile 名单
+        self.update_tile_buffer();
+        
         // 更新实体清单缓冲区
         let entity_data: Vec<scene::EntityData> = self.entities.iter()
             .map(|e| {
@@ -1925,6 +2561,8 @@ impl<'a> State<'a> {
         
         let mut encoder = self.render_context.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
+        // --- 1. 监控大脑 (Xi-Luoer 混合算法耗时) ---
+        encoder.write_timestamp(&self.query_set, 0); // 记下开始时间
         // 第一步：计算大脑
         {
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
@@ -1932,7 +2570,10 @@ impl<'a> State<'a> {
             cpass.set_bind_group(0, &self.compute_bind_group, &[]); // 使用计算专用组
             cpass.dispatch_workgroups((self.render_context.size.width + 7) / 8, (self.render_context.size.height + 7) / 8, 1);
         }
+        encoder.write_timestamp(&self.query_set, 1); // 记下结束时间
 
+        // --- 2. 监控眼睛 (最终画面呈现耗时) ---
+        encoder.write_timestamp(&self.query_set, 2);
         // 第二步：眼睛展示
         let output = self.render_context.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1954,9 +2595,14 @@ impl<'a> State<'a> {
             rpass.set_bind_group(0, &self.blit_bind_group, &[]); // 使用展示专用组
             rpass.draw(0..3, 0..1); // 画一个全屏三角形
         }
+        encoder.write_timestamp(&self.query_set, 3);
 
         self.render_context.queue.submit(std::iter::once(encoder.finish()));
         output.present();
+
+        // 处理查询结果
+        self.process_query_results();
+
         Ok(())
     }
 }
@@ -1975,15 +2621,27 @@ fn main() {
             WindowEvent::CloseRequested => elwt.exit(),
             WindowEvent::Resized(s) => state.resize(*s),
             WindowEvent::MouseInput { button, state: button_state, .. } => {
+                // 关键修复 1: 无论如何，先让 input_state 记录下点击状态
+                state.input_state.process_event(event);
+
+                // 如果控制台开着，不处理 3D 场景点击
+                if state.console.is_open { return; }
+
                 if button == &MouseButton::Middle {
-                    state.input_state.is_middle_mouse_pressed = *button_state == ElementState::Pressed;
-                    if state.input_state.is_middle_mouse_pressed {
+                    if *button_state == ElementState::Pressed {
                         state.input_state.last_mouse_pos = Some(state.input_state.mouse_pos);
                     } else {
                         state.input_state.last_mouse_pos = None;
                     }
                 } else if button == &MouseButton::Left {
                     if *button_state == ElementState::Pressed {
+                        // 如果处于连续生成模式，点击时不应该触发“选中/取消选中”逻辑，避免冲突
+                        if state.is_ser_spawn_mode {
+                            // 这里可以留空，因为生成逻辑在 update() 里面通过 is_left_mouse_pressed 触发
+                            return;
+                        }
+
+                        // 原有的选中逻辑
                         if let Some(entity) = state.get_clicked_entity() {
                             println!("{}", entity.model_id);
                             println!("{}", entity.code);
@@ -2177,11 +2835,17 @@ fn main() {
                     }
                 }
             }
+            WindowEvent::CursorMoved { .. } => {
+                state.input_state.process_event(event);
+            }
             WindowEvent::MouseWheel { delta: _, .. } => {
                 state.input_state.process_event(event);
                 // 使用滚轮调整相机位置
                 state.camera.eye += state.camera.get_forward() * state.input_state.scroll_delta * 0.1;
                 state.input_state.reset_scroll();
+            }
+            WindowEvent::KeyboardInput { .. } => {
+                state.input_state.process_event(event);
             }
             WindowEvent::RedrawRequested => {
                 state.update();
@@ -2256,178 +2920,75 @@ pub fn load_glb(
     path: &str,
     layout: &BindGroupLayout,
 ) -> Result<ModelAsset, Box<dyn Error>> {
-    let (gltf, buffers, images) = gltf::import(path)?;
-    
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
-    let mut min = glam::Vec3::splat(f32::MAX);
-    let mut max = glam::Vec3::splat(f32::MIN);
-
-    for mesh in gltf.meshes() {
-        for primitive in mesh.primitives() {
-            let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
-            let pos_reader = reader.read_positions().ok_or("Failed to read positions")?;
-            let tex_reader = reader.read_tex_coords(0).ok_or("Failed to read tex coords")?.into_f32();
-            let norm_reader = reader.read_normals().ok_or("Failed to read normals")?;
-
-            for ((pos, tex), norm) in pos_reader.zip(tex_reader).zip(norm_reader) {
-                vertices.push(Vertex { position: pos, tex_coords: tex, normal: norm });
-                let pos_vec3 = glam::Vec3::from(pos);
-                min = min.min(pos_vec3);
-                max = max.max(pos_vec3);
-            }
-            if let Some(idx) = reader.read_indices() {
-                indices.extend(idx.into_u32());
-            }
-        }
-    }
-
-    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Vertex Buffer"),
-        contents: bytemuck::cast_slice(&vertices),
-        usage: wgpu::BufferUsages::VERTEX,
-    });
-
-    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Index Buffer"),
-        contents: bytemuck::cast_slice(&indices),
-        usage: wgpu::BufferUsages::INDEX,
-    });
-
-    // --- 核心修复：优先加载 .cem DNA ---
+    // --- 核心逻辑：加载 .cem DNA ---
     let cem_path = path.replace(".glb", ".cem");
     let (dna_data, aabb_min, aabb_max) = if std::path::Path::new(&cem_path).exists() {
         println!("检测到全息 DNA 资产，正在加载: {}", cem_path);
         load_cem_data(&cem_path)
     } else {
-        // 如果没有 .cem，我们降级生成一个空的或者报错
-        // 既然你已经有了 cem_compiler，建议先运行编译工具生成 .cem
+        // 如果没有 .cem，我们降级生成一个空的
         println!("警告: 未找到 .cem 文件，该模型将无法在 DNA 模式下渲染!");
         (vec![0u32; 64*64*64], [0.0; 4], [0.0; 4])
     };
 
-    let (_texture, diffuse_view, sampler, albedo_data) = if let Some(image) = images.iter().next() {
-        let texture_size = wgpu::Extent3d { 
-            width: image.width, 
-            height: image.height, 
-            depth_or_array_layers: 1 
-        };
-
-        // --- 核心修复逻辑：RGB 转 RGBA --- 
-        let rgba_pixels = if image.pixels.len() == (image.width * image.height * 3) as usize { 
-            // 如果是 RGB，手动补上 A 通道 (255) 
-            let mut temp = Vec::with_capacity((image.width * image.height * 4) as usize); 
-            for chunk in image.pixels.chunks(3) { 
-                temp.push(chunk[0]); // R 
-                temp.push(chunk[1]); // G 
-                temp.push(chunk[2]); // B 
-                temp.push(255);      // A (不透明) 
-            } 
-            temp 
-        } else { 
-            // 如果已经是 RGBA，直接用 
-            image.pixels.clone() 
-        }; 
-
-        let texture = device.create_texture(&wgpu::TextureDescriptor { 
-            label: Some("Diffuse Texture"), 
-            size: texture_size, 
-            mip_level_count: 1, 
-            sample_count: 1, 
-            dimension: wgpu::TextureDimension::D2, 
-            format: wgpu::TextureFormat::Rgba8UnormSrgb, // 对应 4 通道 
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, 
-            view_formats: &[], 
-        }); 
-        
-        queue.write_texture( 
-            wgpu::ImageCopyTexture { 
-                texture: &texture, 
-                mip_level: 0, 
-                origin: wgpu::Origin3d::ZERO, 
-                aspect: wgpu::TextureAspect::All, 
-            }, 
-            &rgba_pixels, // 使用转换后的像素 
-            wgpu::ImageDataLayout { 
-                offset: 0, 
-                bytes_per_row: Some(4 * image.width), // 必须是 4 
-                rows_per_image: Some(image.height), 
-            }, 
-            texture_size, 
-        );
-        
-        let diffuse_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("Diffuse Sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        
-        (texture, diffuse_view, sampler, Some(rgba_pixels))
-    } else {
-        let texture_size = wgpu::Extent3d { width: 256, height: 256, depth_or_array_layers: 1 };
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Default Texture"), 
-            size: texture_size, 
-            mip_level_count: 1, 
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2, 
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, 
-            view_formats: &[],
-        });
-        
-        let mut pixels = vec![0u8; (256 * 256 * 4) as usize];
-        for y in 0..256 {
-            for x in 0..256 {
-                let idx = (y * 256 + x) * 4;
-                if (x / 32 + y / 32) % 2 == 0 {
-                    pixels[idx] = 255;
-                    pixels[idx + 1] = 255;
-                    pixels[idx + 2] = 255;
-                    pixels[idx + 3] = 255;
-                } else {
-                    pixels[idx] = 128;
-                    pixels[idx + 1] = 128;
-                    pixels[idx + 2] = 128;
-                    pixels[idx + 3] = 255;
-                }
+    // 创建默认纹理
+    let texture_size = wgpu::Extent3d { width: 256, height: 256, depth_or_array_layers: 1 };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Default Texture"), 
+        size: texture_size, 
+        mip_level_count: 1, 
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2, 
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, 
+        view_formats: &[],
+    });
+    
+    let mut pixels = vec![0u8; (256 * 256 * 4) as usize];
+    for y in 0..256 {
+        for x in 0..256 {
+            let idx = (y * 256 + x) * 4;
+            if (x / 32 + y / 32) % 2 == 0 {
+                pixels[idx] = 255;
+                pixels[idx + 1] = 255;
+                pixels[idx + 2] = 255;
+                pixels[idx + 3] = 255;
+            } else {
+                pixels[idx] = 128;
+                pixels[idx + 1] = 128;
+                pixels[idx + 2] = 128;
+                pixels[idx + 3] = 255;
             }
         }
-        
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &pixels,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * 256),
-                rows_per_image: Some(256),
-            },
-            texture_size,
-        );
-        
-        let diffuse_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("Default Sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        
-        (texture, diffuse_view, sampler, Some(pixels))
-    };
+    }
+    
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &pixels,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * 256),
+            rows_per_image: Some(256),
+        },
+        texture_size,
+    );
+    
+    let diffuse_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("Default Sampler"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
 
-    // 创建一个占位的纹理视图（因为现在 Shader 统一走 global_sdf_texture）
+    // 创建一个占位的纹理视图
     let dummy_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("Dummy"),
         size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
@@ -2461,6 +3022,19 @@ pub fn load_glb(
         label: None,
     });
 
+    // 创建空的顶点和索引缓冲区
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Empty Vertex Buffer"),
+        contents: &[],
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+
+    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Empty Index Buffer"),
+        contents: &[],
+        usage: wgpu::BufferUsages::INDEX,
+    });
+
     // 初始化实例缓冲区（初始容量为 16）
     let initial_capacity = 16;
     let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -2473,13 +3047,13 @@ pub fn load_glb(
     Ok(ModelAsset {
         vertex_buffer,
         index_buffer,
-        num_indices: indices.len() as u32,
+        num_indices: 0,
         bind_group,
         instance_buffer,
         instance_capacity: initial_capacity,
         sdf_view,
-        dna_data,
-        albedo_data,
+        dna_data: Vec::new(), // 释放 CPU 端的 DNA 数据，已经上传到显存
+        albedo_data: Some(pixels),
         aabb_min,
         aabb_max,
     })
@@ -2492,8 +3066,9 @@ pub fn load_cem_data(path: &str) -> (Vec<u32>, [f32; 4], [f32; 4]) {
 
     // 1. 验证魔数
     let magic = &buffer[0..4];
-    if magic != b"CEM2" {
-        panic!("模型格式不匹配！期望 CEM2，得到 {:?}", magic);
+    let is_64bit = magic == b"CEM3";
+    if !is_64bit && magic != b"CEM2" {
+        panic!("模型格式不匹配！期望 CEM2 或 CEM3，得到 {:?}", magic);
     }
 
     // 2. 提取 AABB (12字节 min + 12字节 max)
@@ -2505,12 +3080,24 @@ pub fn load_cem_data(path: &str) -> (Vec<u32>, [f32; 4], [f32; 4]) {
     let max_y = f32::from_le_bytes(buffer[24..28].try_into().unwrap());
     let max_z = f32::from_le_bytes(buffer[28..32].try_into().unwrap());
 
-    // 3. 提取 Voxel 数据 (从第 32 字节开始，全是 u32)
-    let voxel_data_u32: Vec<u32> = buffer[32..].chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
-        .collect();
+    // 3. 提取 Voxel 数据
+    let voxel_data_u32: Vec<u32> = if is_64bit {
+        // CEM3 格式：64-bit 体素 (8 字节 per voxel)
+        buffer[32..].chunks_exact(8)
+            .flat_map(|chunk| {
+                let r = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
+                let g = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+                [r, g].into_iter()
+            })
+            .collect()
+    } else {
+        // CEM2 格式：32-bit 体素 (4 字节 per voxel)
+        buffer[32..].chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect()
+    };
 
-    println!("🚀 已成功加载全息资产: {} | 数据量: {}", path, voxel_data_u32.len());
+    println!("已成功加载cem资产: {} | 数据量: {} | 格式: {}", path, voxel_data_u32.len(), if is_64bit { "CEM3 (64-bit)" } else { "CEM2 (32-bit)" });
 
     let min_b: [f32; 4] = [min_x, min_y, min_z, 1.0];
     let max_b: [f32; 4] = [max_x, max_y, max_z, 1.0];
@@ -2642,6 +3229,17 @@ use glam::{Vec3, Quat, Mat4};
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use bytemuck::{Pod, Zeroable};
+
+pub const TILE_SIZE: u32 = 16; // 每个 Tile 16x16 像素
+pub const MAX_ENTITIES_PER_TILE: usize = 128; // 每个 Tile 最多记录 128 个物体
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TileData {
+    pub count: u32,
+    pub _padding: [u32; 3], // 16字节对齐
+    pub entity_indices: [u32; MAX_ENTITIES_PER_TILE],
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -2819,6 +3417,231 @@ src\shader.wgsl
 @group(0) @binding(2) var t_cem_data: texture_3d<u32>;
 @group(0) @binding(4) var<uniform> params: Params;
 @group(0) @binding(5) var<storage, read> palette: array<vec4<f32>>;
+// 6. Tile 数据 (Stride 132 = 1 count + 3 pad + 128 indices)
+@group(0) @binding(6) var<storage, read> tile_data: array<u32>;
+const TILE_STRIDE: u32 = 132u;
+
+const TILE_SIZE: u32 = 16;
+const MAX_ENTITIES_PER_TILE: u32 = 128;
+
+// 射线区间结构体
+struct RayRange {
+    t_in: f32,
+    t_out: f32,
+    e_idx: u32,
+};
+
+// 核心求交算法 (Ray-AABB Slab Method)
+fn ray_aabb_intersection(ray_o: vec3<f32>, ray_dir: vec3<f32>, b_min: vec3<f32>, b_max: vec3<f32>) -> vec2<f32> {
+    let inv_d = 1.0 / ray_dir;
+    let t0 = (b_min - ray_o) * inv_d;
+    let t1 = (b_max - ray_o) * inv_d;
+    let t_min = min(t0, t1);
+    let t_max = max(t0, t1);
+    let t_entry = max(max(t_min.x, t_min.y), t_min.z);
+    let t_exit = min(min(t_max.x, t_max.y), t_max.z);
+    return vec2<f32>(t_entry, t_exit);
+}
+
+// 射线-AABB 求交：算出进入和离开的时间
+fn intersect_aabb(ray_o: vec3<f32>, ray_d: vec3<f32>, b_min: vec3<f32>, b_max: vec3<f32>) -> vec2<f32> {
+    let inv_d = 1.0 / ray_d;
+    let t0 = (b_min - ray_o) * inv_d;
+    let t1 = (b_max - ray_o) * inv_d;
+    let tmin = min(t0, t1);
+    let tmax = max(t0, t1);
+    let t_in = max(max(tmin.x, tmin.y), tmin.z);
+    let t_out = min(min(tmax.x, tmax.y), tmax.z);
+    return vec2<f32>(t_in, t_out);
+}
+
+// shader.wgsl -> intersect_aabb 修正版
+fn intersect_aabb_safe(ray_o: vec3<f32>, ray_d: vec3<f32>, b_min: vec3<f32>, b_max: vec3<f32>) -> vec2<f32> {
+    // 关键修正 1：防止 ray_dir 为 0 导致的无穷大
+    let safe_d = select(ray_d, vec3<f32>(0.00001), abs(ray_d) < vec3<f32>(0.00001));
+    let inv_d = 1.0 / safe_d;
+    let t0 = (b_min - ray_o) * inv_d;
+    let t1 = (b_max - ray_o) * inv_d;
+    let tmin = min(t0, t1);
+    let tmax = max(t0, t1);
+    let t_in = max(max(tmin.x, tmin.y), tmin.z);
+    let t_out = min(min(tmax.x, tmax.y), tmax.z);
+    
+    // 关键修正 2：如果射线就在盒子内部，t_in 会是负数
+    // 我们返回一个带有微小"提前量"的 t_in
+    return vec2<f32>(t_in - 0.05, t_out + 0.05);
+}
+
+// 2. 【生命感求交】：带安全余量的 AABB 检测
+fn intersect_aabb_alive(ray_o: vec3<f32>, ray_d: vec3<f32>, b_min: vec3<f32>, b_max: vec3<f32>) -> vec2<f32> {
+    let inv_d = 1.0 / (ray_d + vec3<f32>(1e-6));
+    let t0 = (b_min - ray_o) * inv_d;
+    let t1 = (b_max - ray_o) * inv_d;
+    let t_min = min(t0, t1);
+    let t_max = max(t0, t1);
+    // 增加 0.02 的"苏醒余量"，防止射线出生在表面之后
+    return vec2<f32>(max(max(t_min.x, t_min.y), t_min.z) - 0.02, min(min(t_max.x, t_max.y), t_max.z) + 0.02);
+}
+
+// 将候选名单扩大到 24 个以节省寄存器，提升 FPS
+fn sort_ranges_robust(ranges: ptr<function, array<RayRange, 24>>, count: u32) {
+    if (count <= 1u) { return; }
+    for (var i = 1u; i < count; i++) {
+        let key = (*ranges)[i];
+        var j = i;
+        // 增加安全上限判定
+        while (j > 0u && (*ranges)[j - 1u].t_in > key.t_in) {
+            (*ranges)[j] = (*ranges)[j - 1u];
+            j--;
+        }
+        (*ranges)[j] = key;
+    }
+}
+
+// 针对特定物体的精确采样
+fn get_entity_dist_precise(world_p: vec3<f32>, e_idx: u32) -> f32 {
+    let e = scene.entities[e_idx];
+    let local_p = (e.inv_model_matrix * vec4<f32>(world_p, 1.0)).xyz;
+    let dims = e.aabb_max.xyz - e.aabb_min.xyz;
+    let model_max_dim = max(dims.x, max(dims.y, dims.z));
+    
+    let uvw = clamp((local_p - e.aabb_min.xyz) / dims, vec3<f32>(0.0), vec3<f32>(1.0));
+    let voxel = sample_dna_smooth(uvw, e.sdf_index);
+    
+    // --- 核心修正：SDF 膨胀 ---
+    // 减去 0.002 意味着我们将物体的“场”向外扩张了体素宽度的 1/8 左右
+    // 这能有效抵消线性插值带来的“消融”效应
+    return (voxel.dist - 0.002) * model_max_dim * e.instance_scale;
+}
+
+// 获取特定物体的 Voxel 数据
+fn get_voxel_data_precise(world_p: vec3<f32>, e_idx: u32) -> Voxel {
+    let e = scene.entities[e_idx];
+    let local_p = (e.inv_model_matrix * vec4<f32>(world_p, 1.0)).xyz;
+    let dims = e.aabb_max.xyz - e.aabb_min.xyz;
+    
+    let uvw = clamp((local_p - e.aabb_min.xyz) / dims, vec3<f32>(0.0), vec3<f32>(1.0));
+    var voxel = sample_dna_smooth(uvw, e.sdf_index);
+    
+    voxel.entity_id = e_idx;
+    return voxel;
+}
+
+// 1. 核心修正：绝对平滑的 Tile 采样器
+fn get_tile_sdf_safe(world_p: vec3<f32>, tile_base: u32, count: u32) -> Voxel {
+    var min_v: Voxel;
+    min_v.dist = 1000.0;
+    min_v.entity_id = 0u;
+
+    for (var j: u32 = 0u; j < count; j++) {
+        let e_idx = tile_data[tile_base + 4u + j];
+        let e = scene.entities[e_idx];
+        let local_p = (e.inv_model_matrix * vec4<f32>(world_p, 1.0)).xyz;
+        let dims = e.aabb_max.xyz - e.aabb_min.xyz;
+        let model_max_dim = max(dims.x, max(dims.y, dims.z));
+        
+        // 使用带符号的 AABB 距离 (内部为负)
+        let d_box = sdAABB(local_p, e.aabb_min.xyz, e.aabb_max.xyz) * e.instance_scale;
+
+        // 采样 DNA（即使在 AABB 外也利用 clamp 保证连续性）
+        let uvw = clamp((local_p - e.aabb_min.xyz) / dims, vec3<f32>(0.0), vec3<f32>(1.0));
+        let voxel = sample_dna_smooth(uvw, e.sdf_index);
+        let d_dna = voxel.dist * model_max_dim * e.instance_scale;
+
+        // --- 核心公式：max(d_box, d_dna) ---
+        // 这是 SDF 交集的标准公式。
+        // 在盒子外：d_box 占主导，提供远距离步进推力。
+        // 在盒子边缘的空气区：d_box 为 0，d_dna 为 0.5，结果为 0.5。
+        // 数值在跨越 AABB 表面时是完全连续的，阴影射线感知不到盒子的存在！
+        let d_final = max(d_box, d_dna);
+
+        if (abs(d_final) < abs(min_v.dist)) {
+            min_v = voxel;
+            min_v.dist = d_final;
+            min_v.entity_id = e_idx;
+        }
+    }
+    return min_v;
+}
+
+// 专为影子设计的极速采样（只针对特定物体，不循环）
+fn get_entity_dist_shadow(p: vec3<f32>, e_idx: u32) -> f32 {
+    let e = scene.entities[e_idx];
+    let local_p = (e.inv_model_matrix * vec4<f32>(p, 1.0)).xyz;
+    let dims = e.aabb_max.xyz - e.aabb_min.xyz;
+    let voxel = sample_dna_smooth((local_p - e.aabb_min.xyz) / dims, e.sdf_index);
+    return voxel.dist * max(dims.x, max(dims.y, dims.z)) * e.instance_scale;
+}
+
+fn calculate_luoer_tile_optimized(p: vec3<f32>, normal: vec3<f32>, L: vec3<f32>, id_xy: vec2<u32>, tile_base: u32, count: u32, e_idx_hit: u32) -> f32 {
+    let dither = interleavedGradientNoise(vec2<f32>(id_xy));
+    
+    // 1. 动态 Bias：基于模型缩放，解决影子偏移和漏光
+    let e_hit = scene.entities[e_idx_hit];
+    let dims_hit = e_hit.aabb_max.xyz - e_hit.aabb_min.xyz;
+    let dynamic_bias = max(dims_hit.x, max(dims_hit.y, dims_hit.z)) * e_hit.instance_scale / 64.0 * 1.5;
+    
+    // 影子射线起点：利用法线和光源方向的合力纠偏
+    let bias_dir = normalize(normal + L * 0.5);
+    let shadow_o = p + bias_dir * dynamic_bias;
+    
+    var res: f32 = 1.0;
+    let k: f32 = 16.0; // 软阴影系数：值越小影子越柔和
+
+    for (var j: u32 = 0u; j < count; j++) {
+        let e_idx = tile_data[tile_base + 4u + j];
+        let e = scene.entities[e_idx];
+        
+        let r = intersect_aabb_safe((e.inv_model_matrix * vec4<f32>(shadow_o, 1.0)).xyz, (e.inv_model_matrix * vec4<f32>(L, 0.0)).xyz, e.aabb_min.xyz, e.aabb_max.xyz);
+        
+        // 只有物体在光照路径上才有资格贡献阴影
+        if (r.y > 0.0 && r.x < 50.0) {
+            // st 是相对于起跳点 shadow_o 的距离
+            // 我们从 max(0.001, r.x) 开始，保证分母不为 0
+            var st = max(0.001, r.x);
+            let send = min(r.y, 50.0);
+            
+            // 如果是检测“自己”，起跳距离要翻倍，防止自遮挡
+            if (e_idx == e_idx_hit) {
+                st = max(st, dynamic_bias * 2.0);
+            }
+
+            var shadow_steps = 0u;
+            while (st < send) {
+                shadow_steps++;
+                let sd = get_entity_dist_shadow(shadow_o + L * st, e_idx);
+                
+                // 核心判定：如果有任何一处 dist < 0，说明绝对遮挡
+                if (sd < 0.0) { return 0.0; }
+                
+                // --- 软阴影公式：重点在于 st 的全局一致性 ---
+                // 这里的 st 诚实地记录了从 shadow_o 到当前采样点的距离
+                res = min(res, k * sd / st);
+                
+                // 步进：0.8 折扣保证精度，0.02 保底步长跨越台阶
+                st += max(sd * 0.8, 0.02);
+                
+                // 优化：如果影子已经黑透了，或者跑了太远，提前下班
+                if (res < 0.01 || st > 50.0 || shadow_steps > 64u) { break; }
+            }
+        }
+    }
+    // 最后的平滑过渡，消除硬边缘感
+    return smoothstep(0.0, 1.0, res);
+}
+
+// 对应的法线函数也需要修改为针对特定物体
+fn get_normal_fast(p: vec3<f32>, e_idx: u32) -> vec3<f32> {
+    let h = 0.02; 
+    let k = vec2<f32>(1.0, -1.0);
+    // 直接复用你之前写的 get_entity_dist_precise
+    return normalize(
+        k.xyy * get_entity_dist_precise(p + k.xyy * h, e_idx) +
+        k.yyx * get_entity_dist_precise(p + k.yyx * h, e_idx) +
+        k.yxy * get_entity_dist_precise(p + k.yxy * h, e_idx) +
+        k.xxx * get_entity_dist_precise(p + k.xxx * h, e_idx)
+    );
+}
 
 struct Params {
     view_inv: mat4x4<f32>,
@@ -2847,58 +3670,89 @@ struct Scene { entities: array<Entity, 64>, };
 struct Voxel {
     dist: f32,
     color: vec3<f32>, // 修改：从 color_id 变为直接存储颜色
+    normal: vec3<f32>, // 从 64-bit 数据中解码的法线
     modifier: f32,
     entity_id: u32, // 记录所属实体ID，用于法线隔离
 };
 
-fn unpack_voxel_safe(data: u32) -> Voxel {
+fn unpack_voxel_safe(data_r: u32, data_g: u32) -> Voxel {
     var v: Voxel;
-    // 1. 距离还原：显式处理 12bit 补码
-    let d_bits = (data >> 20u) & 0xFFFu;
-    var d_f32: f32;
-    if (d_bits >= 2048u) {
-        d_f32 = f32(i32(d_bits) - 4096i);
-    } else {
-        d_f32 = f32(d_bits);
-    }
-    // 关键：还原到 -1.0 到 1.0 的标准范围
-    v.dist = d_f32 / 2047.0;
-
-    // 2. 颜色还原：撞库
-    let id = (data >> 10u) & 0x3FFu;
-    v.color = palette[id].rgb;
     
-    // 3. 微调值
-    v.modifier = f32((data >> 2u) & 0xFFu) / 255.0;
+    // --- 1. 处理 R 通道 ---
+    let r_val = data_r;
+    let d_bits = (r_val >> 12u) & 0xFFFFFu; // 20bit
+    var d_i32 = i32(d_bits);
+    if (d_bits >= 524288u) { d_i32 -= 1048576i; } // 20bit 补码修正
+    v.dist = f32(d_i32) / 524287.0;
+
+    let col_id = r_val & 0xFFFu; // 12bit
+    v.color = palette[col_id].rgb;
+
+    // --- 2. 处理 G 通道 ---
+    let g_val = data_g;
+    // 解码法线 (10bit)
+    v.normal = decode_normal_10bit(g_val >> 22u); 
+    
+    // 解码 Ko (8bit)
+    v.modifier = f32((g_val >> 14u) & 0xFFu) / 255.0;
+
     return v;
 }
 
+// 八面体解码 10bit 版
+fn decode_normal_10bit(packed: u32) -> vec3<f32> {
+    let ux = f32((packed >> 5u) & 0x1Fu) / 31.0;
+    let uy = f32(packed & 0x1Fu) / 31.0;
+    var v = vec2<f32>(ux * 2.0 - 1.0, uy * 2.0 - 1.0);
+    var n = vec3<f32>(v.x, v.y, 1.0 - abs(v.x) - abs(v.y));
+    if (n.z < 0.0) {
+        let sign_v = vec2<f32>(select(-1.0, 1.0, v.x >= 0.0), select(-1.0, 1.0, v.y >= 0.0));
+        v = (1.0 - abs(v.yx)) * sign_v;
+        n = vec3<f32>(v.x, v.y, n.z);
+    }
+    return normalize(n);
+}
+
 fn sample_dna_smooth(uvw: vec3<f32>, sdf_index: u32) -> Voxel {
-    // 这里的 63.0 是为了保证索引不越界
     let tex_coord = clamp(uvw, vec3<f32>(0.0), vec3<f32>(1.0)) * 63.0;
     let i0 = vec3<i32>(floor(tex_coord));
     let i1 = min(i0 + vec3<i32>(1), vec3<i32>(63));
     let f = fract(tex_coord);
+    
+    // 关键修正：深度偏移恢复为 64，不再需要 *2
     let z_off = i32(sdf_index) * 64;
 
-    // 采样周围 8 个点
-    let v000 = unpack_voxel_safe(textureLoad(t_cem_data, vec3<i32>(i0.x, i0.y, i0.z + z_off), 0).r);
-    let v100 = unpack_voxel_safe(textureLoad(t_cem_data, vec3<i32>(i1.x, i0.y, i0.z + z_off), 0).r);
-    let v010 = unpack_voxel_safe(textureLoad(t_cem_data, vec3<i32>(i0.x, i1.y, i0.z + z_off), 0).r);
-    let v110 = unpack_voxel_safe(textureLoad(t_cem_data, vec3<i32>(i1.x, i1.y, i0.z + z_off), 0).r);
-    let v001 = unpack_voxel_safe(textureLoad(t_cem_data, vec3<i32>(i0.x, i0.y, i1.z + z_off), 0).r);
-    let v101 = unpack_voxel_safe(textureLoad(t_cem_data, vec3<i32>(i1.x, i0.y, i1.z + z_off), 0).r);
-    let v011 = unpack_voxel_safe(textureLoad(t_cem_data, vec3<i32>(i0.x, i1.y, i1.z + z_off), 0).r);
-    let v111 = unpack_voxel_safe(textureLoad(t_cem_data, vec3<i32>(i1.x, i1.y, i1.z + z_off), 0).r);
+    // 采样周围 8 个点，直接一次性拿到 R 和 G 通道
+    let v000_raw = textureLoad(t_cem_data, vec3<i32>(i0.x, i0.y, i0.z + z_off), 0).xy;
+    let v100_raw = textureLoad(t_cem_data, vec3<i32>(i1.x, i0.y, i0.z + z_off), 0).xy;
+    let v010_raw = textureLoad(t_cem_data, vec3<i32>(i0.x, i1.y, i0.z + z_off), 0).xy;
+    let v110_raw = textureLoad(t_cem_data, vec3<i32>(i1.x, i1.y, i0.z + z_off), 0).xy;
+    let v001_raw = textureLoad(t_cem_data, vec3<i32>(i0.x, i0.y, i1.z + z_off), 0).xy;
+    let v101_raw = textureLoad(t_cem_data, vec3<i32>(i1.x, i0.y, i1.z + z_off), 0).xy;
+    let v011_raw = textureLoad(t_cem_data, vec3<i32>(i0.x, i1.y, i1.z + z_off), 0).xy;
+    let v111_raw = textureLoad(t_cem_data, vec3<i32>(i1.x, i1.y, i1.z + z_off), 0).xy;
+
+    let v000 = unpack_voxel_safe(v000_raw.x, v000_raw.y);
+    let v100 = unpack_voxel_safe(v100_raw.x, v100_raw.y);
+    let v010 = unpack_voxel_safe(v010_raw.x, v010_raw.y);
+    let v110 = unpack_voxel_safe(v110_raw.x, v110_raw.y);
+    let v001 = unpack_voxel_safe(v001_raw.x, v001_raw.y);
+    let v101 = unpack_voxel_safe(v101_raw.x, v101_raw.y);
+    let v011 = unpack_voxel_safe(v011_raw.x, v011_raw.y);
+    let v111 = unpack_voxel_safe(v111_raw.x, v111_raw.y);
 
     var res: Voxel;
-    // 距离和颜色全插值
+    // 距离插值
     res.dist = mix(mix(mix(v000.dist, v100.dist, f.x), mix(v010.dist, v110.dist, f.x), f.y),
                    mix(mix(v001.dist, v101.dist, f.x), mix(v011.dist, v111.dist, f.x), f.y), f.z);
-    res.color = mix(mix(mix(v000.color, v100.color, f.x), mix(v010.color, v110.color, f.x), f.y),
-                    mix(mix(v001.color, v101.color, f.x), mix(v011.color, v111.color, f.x), f.y), f.z);
-    res.modifier = mix(mix(mix(v000.modifier, v100.modifier, f.x), mix(v010.modifier, v110.modifier, f.x), f.y),
-                       mix(mix(v001.modifier, v101.modifier, f.x), mix(v011.modifier, v111.modifier, f.x), f.y), f.z);
+    
+    // 法线插值：这是 64 位重构最强的武器，必须保留！
+    res.normal = normalize(mix(mix(mix(v000.normal, v100.normal, f.x), mix(v010.normal, v110.normal, f.x), f.y),
+                               mix(mix(v001.normal, v101.normal, f.x), mix(v011.normal, v111.normal, f.x), f.y), f.z));
+    
+    res.color = v000.color;
+    res.modifier = v000.modifier;
+    res.entity_id = v000.entity_id;
     return res;
 }
 
@@ -2909,44 +3763,56 @@ fn sdAABB(p: vec3<f32>, b_min: vec3<f32>, b_max: vec3<f32>) -> f32 {
     return length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);
 }
 
-fn get_scene_sdf_full(world_p: vec3<f32>) -> Voxel {
+// 1. 修正：只返回外部距离的 AABB 函数
+fn sdAABB_ext_only(p: vec3<f32>, b_min: vec3<f32>, b_max: vec3<f32>) -> f32 {
+    let center = (b_min + b_max) * 0.5;
+    let half_extents = (b_max - b_min) * 0.5;
+    let q = abs(p - center) - half_extents;
+    // 关键：外部返回正值，内部返回 0。这样包围盒就不会在内部产生实体感。
+    return length(max(q, vec3<f32>(0.0)));
+}
+
+// 2. 核心修正：无缝衔接的场景采样
+fn get_scene_sdf_safe(world_p: vec3<f32>) -> Voxel {
     var min_v: Voxel;
-    min_v.dist = 100.0;
-    min_v.color = vec3<f32>(0.2, 0.2, 0.2); // 默认背景色
+    min_v.dist = 1000.0;
 
     for (var i: u32 = 0u; i < params.entity_count; i++) {
         let e = scene.entities[i];
         let local_p = (e.inv_model_matrix * vec4<f32>(world_p, 1.0)).xyz;
-        
         let dims = e.aabb_max.xyz - e.aabb_min.xyz;
-        let model_world_size = max(dims.x, max(dims.y, dims.z));
+        let model_max_dim = max(dims.x, max(dims.y, dims.z));
         
-        // 核心：计算 AABB 的物理距离（带 instance_scale）
-        let d_box = sdAABB(local_p, e.aabb_min.xyz, e.aabb_max.xyz) * e.instance_scale;
-        
-        // 只有当射线足够靠近 AABB 时，才进入 DNA 采样
-        if (d_box < min_v.dist) {
-            let uvw = (local_p - e.aabb_min.xyz) / dims;
-            
-            // 判定是否在盒子内或非常接近边缘
-            if (all(uvw >= vec3<f32>(-0.01)) && all(uvw <= vec3<f32>(1.01))) {
-                let voxel = sample_dna_smooth(uvw, e.sdf_index);
-                // 还原 DNA 的绝对世界距离
-                let d_dna = voxel.dist * model_world_size * e.instance_scale;
-                
-                // 联合判断：必须真的比 AABB 距离更近才更新
-                if (d_dna < min_v.dist) {
-                    min_v = voxel;
-                    min_v.dist = d_dna;
-                    min_v.entity_id = i;
-                }
-            } else {
-                // 盒子外，作为占位符更新距离，方便跳跃
-                if (d_box < min_v.dist) {
-                    min_v.dist = d_box;
-                    min_v.entity_id = i;
-                }
+        // 获取 AABB 的纯外部距离（盒子内永远是 0）
+        let d_box_ext = sdAABB_ext_only(local_p, e.aabb_min.xyz, e.aabb_max.xyz) * e.instance_scale;
+
+        // 性能过滤：如果离盒子非常远，直接返回盒子距离，跳过纹理采样
+        if (d_box_ext > 1.0) {
+            if (d_box_ext < abs(min_v.dist)) {
+                min_v.dist = d_box_ext;
+                min_v.entity_id = i;
             }
+            continue;
+        }
+
+        // 采样 DNA（使用你代码里现成的五次插值 sample_dna_smooth）
+        let uvw = clamp((local_p - e.aabb_min.xyz) / dims, vec3<f32>(0.0), vec3<f32>(1.0));
+        let voxel = sample_dna_smooth(uvw, e.sdf_index);
+        
+        // 还原物理距离（保留符号！！这是防止镂空的关键）
+        let d_dna = voxel.dist * model_max_dim * e.instance_scale;
+
+        // --- 终极公式：距离 = 外部盒体推力 + 内部细节 ---
+        // 在盒子外：d_box_ext > 0，两者相加。
+        // 在盒子内：d_box_ext = 0，距离完全由 d_dna 决定。
+        // 因为相加操作是连续的，阴影射线在跨越边界时不会看到任何数值跳变！
+        let d_final = d_box_ext + d_dna;
+
+        // 比较绝对值找到最近表面，但保留符号返回以供命中判定
+        if (abs(d_final) < abs(min_v.dist)) {
+            min_v = voxel;
+            min_v.dist = d_final;
+            min_v.entity_id = i;
         }
     }
     return min_v;
@@ -2956,20 +3822,20 @@ fn get_normal(p: vec3<f32>) -> vec3<f32> {
     let h = 0.015; // 采样步长
     let k = vec2<f32>(1.0, -1.0);
     return normalize(
-        k.xyy * get_scene_sdf_full(p + k.xyy * h).dist +
-        k.yyx * get_scene_sdf_full(p + k.yyx * h).dist +
-        k.yxy * get_scene_sdf_full(p + k.yxy * h).dist +
-        k.xxx * get_scene_sdf_full(p + k.xxx * h).dist
+        k.xyy * get_scene_sdf_safe(p + k.xyy * h).dist +
+        k.yyx * get_scene_sdf_safe(p + k.yyx * h).dist +
+        k.yxy * get_scene_sdf_safe(p + k.yxy * h).dist +
+        k.xxx * get_scene_sdf_safe(p + k.xxx * h).dist
     );
 }
 
 fn get_normal_custom(p: vec3<f32>, h: f32) -> vec3<f32> {
     let k = vec2<f32>(1.0, -1.0);
     return normalize(
-        k.xyy * get_scene_sdf_full(p + k.xyy * h).dist +
-        k.yyx * get_scene_sdf_full(p + k.yyx * h).dist +
-        k.yxy * get_scene_sdf_full(p + k.yxy * h).dist +
-        k.xxx * get_scene_sdf_full(p + k.xxx * h).dist
+        k.xyy * get_scene_sdf_safe(p + k.xyy * h).dist +
+        k.yyx * get_scene_sdf_safe(p + k.yyx * h).dist +
+        k.yxy * get_scene_sdf_safe(p + k.yxy * h).dist +
+        k.xxx * get_scene_sdf_safe(p + k.xxx * h).dist
     );
 }
 
@@ -2995,20 +3861,51 @@ fn get_entity_sdf_only(world_p: vec3<f32>, entity_idx: u32) -> f32 {
 }
 
 // 智能法线函数 - 将 entity ID 传进去，实现"采样锁定"
+// 辅助函数：确保法线计算使用的公式与采样完全一致
+fn get_entity_sdf_combined(world_p: vec3<f32>, e_idx: u32) -> f32 {
+    let e = scene.entities[e_idx];
+    let local_p = (e.inv_model_matrix * vec4<f32>(world_p, 1.0)).xyz;
+    let dims = e.aabb_max.xyz - e.aabb_min.xyz;
+    let model_max_dim = max(dims.x, max(dims.y, dims.z));
+    
+    let d_box = sdAABB(local_p, e.aabb_min.xyz, e.aabb_max.xyz);
+    let uvw = clamp((local_p - e.aabb_min.xyz) / dims, vec3<f32>(0.0), vec3<f32>(1.0));
+    let voxel = sample_dna_smooth(uvw, e.sdf_index);
+    
+    // 必须使用与 get_scene_sdf_safe 完全一致的 max 逻辑
+    return max(d_box, voxel.dist) * model_max_dim * e.instance_scale;
+}
+
 fn get_normal_isolated(p: vec3<f32>, entity_idx: u32) -> vec3<f32> {
     let e = scene.entities[entity_idx];
     
-    // 关键：h 必须随缩放自适应！
-    // 确保 h 在局部空间始终占用大约 0.5 个体素的宽度
+    // --- 核心修正 1：收缩步长 ---
+    // 对于硬表面，h 必须极小，才能捕捉到锐利的转折
+    // 0.01 左右能有效防止法线"跨越棱角"去偷看另一面的光
     let h = 0.01 * e.instance_scale;
-    
+
     let k = vec2<f32>(1.0, -1.0);
+    // 注意：这里移除 p_dithered，法线需要绝对的确定性
     return normalize(
-        k.xyy * get_entity_sdf_only(p + k.xyy * h, entity_idx) +
-        k.yyx * get_entity_sdf_only(p + k.yyx * h, entity_idx) +
-        k.yxy * get_entity_sdf_only(p + k.yxy * h, entity_idx) +
-        k.xxx * get_entity_sdf_only(p + k.xxx * h, entity_idx)
+        k.xyy * get_entity_sdf_combined(p + k.xyy * h, entity_idx) +
+        k.yyx * get_entity_sdf_combined(p + k.yyx * h, entity_idx) +
+        k.yxy * get_entity_sdf_combined(p + k.yxy * h, entity_idx) +
+        k.xxx * get_entity_sdf_combined(p + k.xxx * h, entity_idx)
     );
+}
+
+fn get_entity_sdf_only_abs(world_p: vec3<f32>, entity_idx: u32) -> f32 {
+    let e = scene.entities[entity_idx];
+    let local_p = (e.inv_model_matrix * vec4<f32>(world_p, 1.0)).xyz;
+    let dims = e.aabb_max.xyz - e.aabb_min.xyz;
+    let model_world_size = max(dims.x, max(dims.y, dims.z));
+    let uvw = (local_p - e.aabb_min.xyz) / dims;
+    
+    let voxel = sample_dna_smooth(clamp(uvw, vec3<f32>(0.0), vec3<f32>(1.0)), e.sdf_index);
+    let d_box = sdAABB(local_p, e.aabb_min.xyz, e.aabb_max.xyz);
+    
+    // 统一使用 abs 还原距离
+    return (abs(voxel.dist) * model_world_size + max(d_box, 0.0)) * e.instance_scale;
 }
 
 fn calculate_luoer(p: vec3<f32>, normal: vec3<f32>, L: vec3<f32>) -> f32 {
@@ -3017,7 +3914,7 @@ fn calculate_luoer(p: vec3<f32>, normal: vec3<f32>, L: vec3<f32>) -> f32 {
     let k: f32 = 8.0;   // 软阴影硬度
     
     for (var i = 0; i < 24; i++) {
-        let d = get_scene_sdf_full(p + normal * 0.1 + L * t).dist;
+        let d = get_scene_sdf_safe(p + normal * 0.1 + L * t).dist;
         if (d < 0.001) { return 0.0; }
         res = min(res, k * d / t);
         t += max(d, 0.08);
@@ -3048,7 +3945,7 @@ fn calculate_luoer_smooth(p: vec3<f32>, normal: vec3<f32>, L: vec3<f32>, id_xy: 
         // 关键修正 3：计算采样位置时，沿法线方向再推出一点点 (normal * 0.05)
         // 这能帮射线逃离 12bit 数据在表面产生的"底噪区"
         let sample_p = p + normal * 0.04 + L * t;
-        let d = get_scene_sdf_full(sample_p).dist;
+        let d = get_scene_sdf_safe(sample_p).dist;
         
         // 撞击判定
         if (d < 0.001) { return 0.0; }
@@ -3071,36 +3968,51 @@ fn calculate_luoer_smooth(p: vec3<f32>, normal: vec3<f32>, L: vec3<f32>, id_xy: 
 fn calculate_luoer_precision(p: vec3<f32>, normal: vec3<f32>, L: vec3<f32>, id_xy: vec2<u32>) -> f32 {
     let dither = interleavedGradientNoise(vec2<f32>(id_xy));
     
-    // 关键修正 1：大幅降低初始偏置
-    // 只有这样，薄如纸片的模型才能被射线捕捉到
-    var t: f32 = 0.03 + 0.02 * dither;
+    // 核心修正：沿法线推开一个显著的距离（Bias）
+    // 0.1 是一个安全值，它能让阴影射线彻底飞离"台阶区"
+    var t: f32 = 0.1 + 0.05 * dither;
     
     var res: f32 = 1.0;
-    let k: f32 = 12.0;   // 稍微降低硬度，增加阴影的包容度
+    let k: f32 = 16.0; // 降低硬度，让阴影边缘更自然
     
-    for (var i = 0; i < 48; i++) { // 增加步进次数，保证精度
-        // 关键修正 2：法线偏置减小到 0.01
-        let sample_p = p + normal * 0.01 + L * t;
-        let d = get_scene_sdf_full(sample_p).dist;
+    for (var i = 0; i < 32; i++) {
+        // 采样点沿法线再偏移一丁点
+        let sample_p = p + normal * 0.05 + L * t;
+        let d = get_scene_sdf_safe(sample_p).dist;
         
-        // 关键修正 3：负距离判定 (内部命中)
-        // 在三线性插值下，薄片中心可能是负值。一旦发现负值，说明绝对撞上了。
+        // 如果 d 为负，说明绝对撞上了
         if (d < 0.0) { return 0.0; }
+        if (d < 0.001) { return 0.0; }
         
-        // 判定命中
-        if (d < 0.0005) { return 0.0; }
-        
-        // 软阴影公式
         res = min(res, k * d / t);
         
-        // 关键修正 4：微步进 (Micro-stepping)
-        // 将强制步进从 0.02 降低到 0.005
-        // 这样射线就像显微镜一样，不会跳过任何薄片
-        t += max(d, 0.005);
+        // 强制最小步进，防止卡在表面
+        t += max(d, 0.02);
         
+        if (t > 20.0 || res < 0.01) { break; }
+    }
+    return clamp(res, 0.0, 1.0);
+}
+
+// 影子函数现在需要传入 tile 信息，否则它依然是性能黑洞
+fn calculate_luoer_tile(p: vec3<f32>, normal: vec3<f32>, L: vec3<f32>, id_xy: vec2<u32>, base_addr: u32, count: u32) -> f32 {
+    let dither = interleavedGradientNoise(vec2<f32>(id_xy));
+    var t: f32 = 0.1 + 0.05 * dither;
+    var res: f32 = 1.0;
+    let k: f32 = 16.0;
+    
+    for (var i = 0; i < 24; i++) { // 影子步数可以稍微减少
+        let sample_p = p + normal * 0.05 + L * t;
+        
+        // 关键：影子也只查当前 Tile 里的物体！
+        let voxel = get_tile_sdf_safe(sample_p, base_addr, count);
+        let d = voxel.dist;
+        
+        if (d < 0.001) { return 0.0; }
+        res = min(res, k * d / t);
+        t += max(d, 0.02);
         if (t > 15.0 || res < 0.01) { break; }
     }
-    
     return clamp(res, 0.0, 1.0);
 }
 
@@ -3115,49 +4027,159 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let screen_size = textureDimensions(output_texture);
     if (id.x >= screen_size.x || id.y >= screen_size.y) { return; }
 
-    // 射线初始化
+    // 1. 初始化射线
     let screen_uv = vec2<f32>(id.xy) / vec2<f32>(screen_size);
     let uv = vec2<f32>(screen_uv.x * 2.0 - 1.0, (1.0 - screen_uv.y) * 2.0 - 1.0);
     let target_pos = params.proj_inv * vec4<f32>(uv.x, uv.y, 1.0, 1.0);
     let ray_dir = normalize((params.view_inv * vec4<f32>(normalize(target_pos.xyz / target_pos.w), 0.0)).xyz);
     let ray_p = params.cam_pos.xyz;
 
-    var t = 0.1;
-    var hit = false;
-    var final_v: Voxel;
+    // 1. 定位当前像素的竞技场 (Tile)
+    let tiles_x = (screen_size.x + 15u) / 16u;
+    let tile_idx = (id.y / 16u) * tiles_x + (id.x / 16u);
+    let base_addr = tile_idx * TILE_STRIDE;
+    let entity_count = min(tile_data[base_addr], 128u);
     
-    for (var i = 0; i < 128; i++) {
-        final_v = get_scene_sdf_full(ray_p + ray_dir * t);
+    // --- 模式 6: 分片热力图可视化 ---
+    if (params.debug_mode == 6u) {
+        let count = tile_data[base_addr];
+
+        // 1. 绘制 Tile 边界线 (16x16 像素的网格)
+        let is_border = (id.x % 16u == 0u) || (id.y % 16u == 0u);
         
-        // 关键：微小的命中阈值
-        if (final_v.dist < 0.001) { hit = true; break; }
+        // 2. 根据物体数量生成颜色 (热力图)
+        // 0个: 蓝色, 1-10个: 绿色, 11-32个: 黄色, 33-64个: 红色
+        var col = vec3<f32>(0.0, 0.0, 0.2); // 默认深蓝 (空)
+        if (count > 0u) {
+            let t = f32(count) / 128.0; // 归一化到 0-1
+            if (t < 0.2) {
+                col = mix(vec3<f32>(0.0, 0.1, 0.5), vec3<f32>(0.0, 1.0, 0.0), t * 5.0);
+            } else if (t < 0.5) {
+                col = mix(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 1.0, 0.0), (t - 0.2) * 3.33);
+            } else {
+                col = mix(vec3<f32>(1.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), (t - 0.5) * 2.0);
+            }
+        }
+
+        // 3. 叠加边界线
+        if (is_border) {
+            textureStore(output_texture, id.xy, vec4<f32>(1.0, 1.0, 1.0, 0.5)); // 白色网格
+        } else {
+            textureStore(output_texture, id.xy, vec4<f32>(col, 1.0));
+        }
+        return; // 立即返回，不进行后续渲染
+    }
+
+    // 2. 【候选人海选】：只看射线路径上的物体
+    var ranges: array<RayRange, 24>; // 减少到 24 以节省寄存器，提升 FPS
+    var cand_count = 0u;
+    for (var j = 0u; j < entity_count; j++) {
+        let e_idx = tile_data[base_addr + 4u + j];
+        let e = scene.entities[e_idx];
+        let r = intersect_aabb_alive((e.inv_model_matrix * vec4<f32>(ray_p, 1.0)).xyz, (e.inv_model_matrix * vec4<f32>(ray_dir, 0.0)).xyz, e.aabb_min.xyz, e.aabb_max.xyz);
+        if (r.y > 0.0 && r.x < r.y) {
+            ranges[cand_count] = RayRange(max(r.x, 0.0), r.y, e_idx);
+            cand_count++; if (cand_count >= 24u) { break; }
+        }
+    }
+
+    // 3. 【竞技场排序】：按深度排队
+    sort_ranges_robust(&ranges, cand_count);
+
+    // 4. 【深度优先步进】：遮挡剔除的灵魂
+    var t_hit_limit = 1000.0;
+    var hit = false;
+    var best_entity_id = 0u;
+
+    for (var i = 0u; i < cand_count; i++) {
+        let range = ranges[i];
         
-        // 关键：增加安全步长上限，防止射线在表面反复横跳
-        t += max(final_v.dist * 0.75, 0.0005); 
-        if (t > 80.0) { break; }
+        // --- 核心"自觉"逻辑：如果当前盒子入口比已知撞击点还远，后面的直接物理蒸发 ---
+        if (range.t_in > t_hit_limit) { break; }
+
+        var t_march = range.t_in;
+        let march_end = min(range.t_out, t_hit_limit);
+        var steps = 0u;
+
+        while (t_march < march_end) {
+            steps++;
+            let d = get_entity_dist_precise(ray_p + ray_dir * t_march, range.e_idx);
+            
+            // 远距离精度补偿：让判定更灵敏
+            let threshold = 0.001 + t_march * 0.00002;
+
+            if (d < threshold) {
+                if (t_march < t_hit_limit) {
+                    t_hit_limit = t_march;
+                    hit = true;
+                    best_entity_id = range.e_idx;
+                }
+                break; // 撞到了，跳出当前物体的 march，但可能还要检查重叠的其他物体
+            }
+
+            // --- 核心修正：步长压缩 ---
+            // 当距离小于 0.05（接近表面）时，强制使用更小的步长系数（0.5 而不是 0.8）
+            // 防止光线跳过细杆子
+            let step_factor = select(0.8, 0.5, d < 0.05);
+            t_march += max(d * step_factor, 0.0008);
+            
+            if (steps > 160u) { break; }
+        }
     }
 
     if (hit) {
-        let hit_p = ray_p + ray_dir * t;
-        let normal = get_normal_isolated(hit_p, final_v.entity_id);
+        // --- 最终采样：确保使用撞击时的 ID 和坐标 ---
+        let hit_p = ray_p + ray_dir * t_hit_limit;
+        let final_v = get_voxel_data_precise(hit_p, best_entity_id);
+        
+        // --- 性能飞跃：直接转换法线到世界空间 ---
+        // 不再需要采样 4 次 SDF，只需要 1 次矩阵变换
+        let e = scene.entities[best_entity_id];
+        let world_normal = normalize((e.model_matrix * vec4<f32>(final_v.normal, 0.0)).xyz);
+        
         let L = normalize(params.light_dir.xyz);
-
-        // 曦罗混合
-        let luoer = calculate_luoer_precision(hit_p, normal, L, id.xy);
         
-        // 关键修复：最终颜色对齐
-        let base_color = final_v.color * final_v.modifier;
-        let dot_nl = max(0.0, dot(normal, L));
+        // 影子也必须限制在名单内
+        let luoer = calculate_luoer_tile_optimized(hit_p, world_normal, L, id.xy, base_addr, entity_count, best_entity_id);
         
-        // 如果是 debug 4，看原始颜色
-        if (params.debug_mode == 4u) {
-            textureStore(output_texture, id.xy, vec4<f32>(final_v.color, 1.0));
+        // 最终光照：0.32 是环境底色。只有当 diffuse > 0 且没被影子遮挡时，光照才会提升
+        let lighting = mix(0.32, 1.0, luoer * max(0.0, dot(world_normal, L)));
+        
+        // 调试模式
+        if (params.debug_mode == 1u) {
+            // 1: 距离场(红正绿负)
+            let sdf_color = select(
+                vec3<f32>(final_v.dist, 0.0, 0.0),  // 正值：红色
+                vec3<f32>(0.0, -final_v.dist, 0.0), // 负值：绿色
+                final_v.dist < 0.0
+            );
+            textureStore(output_texture, id.xy, vec4<f32>(sdf_color, 1.0));
+        } else if (params.debug_mode == 2u) {
+            // 2: 坐标映射
+            let e = scene.entities[best_entity_id];
+            let local_p = (e.inv_model_matrix * vec4<f32>(hit_p, 1.0)).xyz;
+            let uvw = (local_p - e.aabb_min.xyz) / (e.aabb_max.xyz - e.aabb_min.xyz);
+            textureStore(output_texture, id.xy, vec4<f32>(uvw, 1.0));
+        } else if (params.debug_mode == 3u) {
+            // 3: 法线
+            let normal_color = (world_normal + 1.0) * 0.5; // 将法线从 [-1,1] 映射到 [0,1]
+            textureStore(output_texture, id.xy, vec4<f32>(normal_color, 1.0));
+        } else if (params.debug_mode == 4u) {
+            // 4: 原始颜色 (乘以微调整值)
+            textureStore(output_texture, id.xy, vec4<f32>(final_v.color * final_v.modifier, 1.0));
+        } else if (params.debug_mode == 5u) {
+            // 5: 距离场扫描(红内蓝外)
+            let sdf_color = select(
+                vec3<f32>(0.0, 0.0, 1.0), // 外部：蓝色
+                vec3<f32>(1.0, 0.0, 0.0), // 内部：红色
+                final_v.dist < 0.0
+            );
+            textureStore(output_texture, id.xy, vec4<f32>(sdf_color, 1.0));
         } else {
-            let lighting = mix(0.35, 1.0, luoer * smoothstep(0.0, 0.05, dot_nl));
-            textureStore(output_texture, id.xy, vec4<f32>(base_color * lighting, 1.0));
+            // 0: 关，正常渲染
+            textureStore(output_texture, id.xy, vec4<f32>(final_v.color * final_v.modifier * lighting, 1.0));
         }
     } else {
-        // 背景色
         textureStore(output_texture, id.xy, vec4<f32>(0.05, 0.05, 0.1, 1.0));
     }
 }

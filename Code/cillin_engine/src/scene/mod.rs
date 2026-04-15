@@ -3,6 +3,17 @@ use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use bytemuck::{Pod, Zeroable};
 
+pub const TILE_SIZE: u32 = 16; // 每个 Tile 16x16 像素
+pub const MAX_ENTITIES_PER_TILE: usize = 128; // 每个 Tile 最多记录 128 个物体
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TileData {
+    pub count: u32,
+    pub _padding: [u32; 3], // 16字节对齐
+    pub entity_indices: [u32; MAX_ENTITIES_PER_TILE],
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct InstanceRaw {
