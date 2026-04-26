@@ -20,7 +20,18 @@ pub struct ModelInfo {
     pub aabb_max: [f32; 4],
 }
 
-
+// --- 对应 C++ 的 256-bit 细胞结构 ---
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct VoxelCEM4 {
+    pub word0: u32,
+    pub word1: u32,
+    pub word2: u32,
+    pub word3: u32,
+    pub child_ptr: u32,
+    pub tetra_info: u32,
+    pub reserved: [u32; 2],
+}
 
 pub struct ModelAsset {
     pub vertex_buffer: Buffer,
@@ -35,8 +46,8 @@ pub struct ModelAsset {
     // SDF 3D 贴图
     pub sdf_view: wgpu::TextureView,
     
-    // 关键改变：统一使用 u32 存储 DNA 数据
-    pub dna_data: Vec<u32>,
+    // CEM4 核心数据：现在存储的是 Voxel 结构体
+    pub dna_data: Vec<VoxelCEM4>,
     
     // 原始贴图数据（用于贴图阵列）
     pub albedo_data: Option<Vec<u8>>,
@@ -60,7 +71,7 @@ pub fn load_glb(
     } else {
         // 如果没有 .cem，我们降级生成一个空的
         println!("警告: 未找到 .cem 文件，该模型将无法在 DNA 模式下渲染!");
-        (vec![0u32; 64*64*64], [0.0; 4], [0.0; 4])
+        (vec![VoxelCEM4::zeroed(); 64*64*64], [0.0; 4], [0.0; 4])
     };
 
     // 创建默认纹理
@@ -184,26 +195,25 @@ pub fn load_glb(
         instance_buffer,
         instance_capacity: initial_capacity,
         sdf_view,
-        dna_data: Vec::new(), // 释放 CPU 端的 DNA 数据，已经上传到显存
+        dna_data, // 保留 CPU 端的 DNA 数据，用于后续上传到显存
         albedo_data: Some(pixels),
         aabb_min,
         aabb_max,
     })
 }
 
-pub fn load_cem_data(path: &str) -> (Vec<u32>, [f32; 4], [f32; 4]) {
-    let mut file = File::open(path).expect("找不到 CEM 模型文件");
+pub fn load_cem_data(path: &str) -> (Vec<VoxelCEM4>, [f32; 4], [f32; 4]) {
+    let mut file = File::open(path).expect("找不到 CEM4 模型文件");
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer).expect("读取文件失败");
 
     // 1. 验证魔数
     let magic = &buffer[0..4];
-    let is_64bit = magic == b"CEM3";
-    if !is_64bit && magic != b"CEM2" {
-        panic!("模型格式不匹配！期望 CEM2 或 CEM3，得到 {:?}", magic);
+    if magic != b"CEM4" {
+        panic!("模型格式不匹配！期望 CEM4，得到 {:?}", magic);
     }
 
-    // 2. 提取 AABB (12字节 min + 12字节 max)
+    // 2. 提取 AABB (从偏移 8 开始，跳过 Res 4字节)
     let min_x = f32::from_le_bytes(buffer[8..12].try_into().unwrap());
     let min_y = f32::from_le_bytes(buffer[12..16].try_into().unwrap());
     let min_z = f32::from_le_bytes(buffer[16..20].try_into().unwrap());
@@ -212,27 +222,29 @@ pub fn load_cem_data(path: &str) -> (Vec<u32>, [f32; 4], [f32; 4]) {
     let max_y = f32::from_le_bytes(buffer[24..28].try_into().unwrap());
     let max_z = f32::from_le_bytes(buffer[28..32].try_into().unwrap());
 
-    // 3. 提取 Voxel 数据
-    let voxel_data_u32: Vec<u32> = if is_64bit {
-        // CEM3 格式：64-bit 体素 (8 字节 per voxel)
-        buffer[32..].chunks_exact(8)
-            .flat_map(|chunk| {
-                let r = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
-                let g = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
-                [r, g].into_iter()
-            })
-            .collect()
-    } else {
-        // CEM2 格式：32-bit 体素 (4 字节 per voxel)
-        buffer[32..].chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
-            .collect()
-    };
+    // 3. 提取 Voxel 数据 (每 32 字节一个 VoxelCEM4)
+    let voxel_data: Vec<VoxelCEM4> = buffer[32..]
+        .chunks_exact(32)
+        .map(|chunk| {
+            VoxelCEM4 {
+                word0: u32::from_le_bytes(chunk[0..4].try_into().unwrap()),
+                word1: u32::from_le_bytes(chunk[4..8].try_into().unwrap()),
+                word2: u32::from_le_bytes(chunk[8..12].try_into().unwrap()),
+                word3: u32::from_le_bytes(chunk[12..16].try_into().unwrap()),
+                child_ptr: u32::from_le_bytes(chunk[16..20].try_into().unwrap()),
+                tetra_info: u32::from_le_bytes(chunk[20..24].try_into().unwrap()),
+                reserved: [
+                    u32::from_le_bytes(chunk[24..28].try_into().unwrap()),
+                    u32::from_le_bytes(chunk[28..32].try_into().unwrap()),
+                ],
+            }
+        })
+        .collect();
 
-    println!("已成功加载cem资产: {} | 数据量: {} | 格式: {}", path, voxel_data_u32.len(), if is_64bit { "CEM3 (64-bit)" } else { "CEM2 (32-bit)" });
+    println!("Successfully loaded CEM4 asset: {} | Voxels: {}", path, voxel_data.len());
 
     let min_b: [f32; 4] = [min_x, min_y, min_z, 1.0];
     let max_b: [f32; 4] = [max_x, max_y, max_z, 1.0];
 
-    (voxel_data_u32, min_b, max_b)
+    (voxel_data, min_b, max_b)
 }

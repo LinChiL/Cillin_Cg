@@ -1,5 +1,17 @@
 use wgpu::{Device, Queue, Surface, TextureView, CommandEncoder, RenderPass, BindGroup, RenderPipeline, ComputePipeline};
 use glam::Mat4;
+use bytemuck::{Pod, Zeroable};
+
+pub mod pipeline;
+pub use pipeline::{VoxelRenderer, Params};
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, Pod, Zeroable)]
+pub struct LightUniform {
+    pub direction: [f32; 3],
+    pub _padding: u32,
+    pub color: [f32; 4],
+}
 
 pub struct RenderContext<'a> {
     pub surface: Surface<'a>,

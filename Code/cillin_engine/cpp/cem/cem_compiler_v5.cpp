@@ -78,6 +78,15 @@ private:
 
 // --- 工具函数 ---
 
+// 辅助函数：应用矩阵变换
+Vec3 multiply_matrix(const cgltf_float m[16], Vec3 v) {
+    return {
+        v.x * m[0] + v.y * m[4] + v.z * m[8] + m[12],
+        v.x * m[1] + v.y * m[5] + v.z * m[9] + m[13],
+        v.x * m[2] + v.y * m[6] + v.z * m[10] + m[14]
+    };
+}
+
 HSV rgb_to_hsv(Color c) {
     double r = c.r / 255.0, g = c.g / 255.0, b = c.b / 255.0;
     double max = std::max({r, g, b}), min = std::min({r, g, b});
@@ -229,12 +238,20 @@ Vec3 get_closest_point_barycentric(Vec3 p, Vec3 a, Vec3 b, Vec3 c, float& u, flo
 
 // --- 其他几何与导出函数 (保持逻辑一致) ---
 
+// 材质来源追踪结构
+struct TriangleSource {
+    int mesh_idx;
+    int prim_idx;
+    std::string node_name;
+};
+
 struct MeshData {
     std::vector<Vec3> vertices;
     std::vector<Vec3> normals; // 新增：存法线
     std::vector<Color> colors;
     std::vector<Vec2> uvs; // 新增：存储每个顶点的 UV
     std::vector<uint32_t> indices;
+    std::vector<TriangleSource> tri_sources; // 增加：三角形来源追踪
     
     // 增加对贴图的引用
     uint8_t* texture_data = nullptr;
@@ -267,24 +284,25 @@ uint32_t pack_voxel_v2(float dist, int color_id, float modifier, float world_siz
     return (d_bits << 20) | (id_bits << 10) | (mod_bits << 2);
 }
 
-MeshData load_glb(const std::string& path) {
-    cgltf_options options = {};
-    cgltf_data* data = nullptr;
-    if (cgltf_parse_file(&options, path.c_str(), &data) != cgltf_result_success) exit(-1);
-    cgltf_load_buffers(&options, data, path.c_str());
-    MeshData mesh; mesh.min_b = {1e10, 1e10, 1e10}; mesh.max_b = {-1e10, -1e10, -1e10};
-    int img_comp;
-    for (size_t m_idx = 0; m_idx < data->meshes_count; ++m_idx) {
-        for (int i = 0; i < data->meshes[m_idx].primitives_count; ++i) {
-            cgltf_primitive* prim = &data->meshes[m_idx].primitives[i];
+// 递归遍历节点
+void process_node(cgltf_node* node, const cgltf_float parent_matrix[16], MeshData& mesh, int& img_comp) {
+    cgltf_float global_matrix[16];
+    cgltf_node_transform_world(node, global_matrix);
+
+    if (node->mesh) {
+        printf("Node [%s] detected. World Offset Y: %f\n", node->name ? node->name : "unnamed", global_matrix[13]);
+        
+        for (int i = 0; i < node->mesh->primitives_count; ++i) {
+            cgltf_primitive* prim = &node->mesh->primitives[i];
             
-            // 关键：在这里读取并保留贴图数据
+            // 读取并保留贴图数据
             if (prim->material && prim->material->has_pbr_metallic_roughness && prim->material->pbr_metallic_roughness.base_color_texture.texture) {
                 auto* view = prim->material->pbr_metallic_roughness.base_color_texture.texture->image->buffer_view;
                 mesh.texture_data = stbi_load_from_memory(
                     (uint8_t*)view->buffer->data + view->offset,
                     view->size, &mesh.tex_w, &mesh.tex_h, &img_comp, 3
                 );
+                printf("  - Texture Loaded: %dx%d\n", mesh.tex_w, mesh.tex_h);
             }
 
             size_t vertex_offset = mesh.vertices.size();
@@ -293,14 +311,17 @@ MeshData load_glb(const std::string& path) {
                 if (prim->attributes[j].type == cgltf_attribute_type_position) pos_acc = prim->attributes[j].data;
                 if (prim->attributes[j].type == cgltf_attribute_type_texcoord) uv_acc = prim->attributes[j].data;
                 if (prim->attributes[j].type == cgltf_attribute_type_color) col_acc = prim->attributes[j].data;
-                if (prim->attributes[j].type == cgltf_attribute_type_normal) norm_acc = prim->attributes[j].data; // 拿法线！
+                if (prim->attributes[j].type == cgltf_attribute_type_normal) norm_acc = prim->attributes[j].data;
             }
             for (int k = 0; k < pos_acc->count; ++k) {
                 float v[3]; cgltf_accessor_read_float(pos_acc, k, v, 3);
-                Vec3 p = {v[0], v[1], v[2]}; mesh.vertices.push_back(p);
-                mesh.min_b.x = std::min(mesh.min_b.x, p.x); mesh.max_b.x = std::max(mesh.max_b.x, p.x);
-                mesh.min_b.y = std::min(mesh.min_b.y, p.y); mesh.max_b.y = std::max(mesh.max_b.y, p.y);
-                mesh.min_b.z = std::min(mesh.min_b.z, p.z); mesh.max_b.z = std::max(mesh.max_b.z, p.z);
+                // 应用变换矩阵
+                Vec3 p_local = {v[0], v[1], v[2]};
+                Vec3 p_world = multiply_matrix(global_matrix, p_local);
+                mesh.vertices.push_back(p_world);
+                mesh.min_b.x = std::min(mesh.min_b.x, p_world.x); mesh.max_b.x = std::max(mesh.max_b.x, p_world.x);
+                mesh.min_b.y = std::min(mesh.min_b.y, p_world.y); mesh.max_b.y = std::max(mesh.max_b.y, p_world.y);
+                mesh.min_b.z = std::min(mesh.min_b.z, p_world.z); mesh.max_b.z = std::max(mesh.max_b.z, p_world.z);
                 
                 // 读取 UV
                 if (uv_acc) {
@@ -327,9 +348,49 @@ MeshData load_glb(const std::string& path) {
                     mesh.normals.push_back({0, 1, 0}); // 兜底
                 }
             }
-            if (prim->indices) for (int k = 0; k < prim->indices->count; ++k) mesh.indices.push_back(vertex_offset + cgltf_accessor_read_index(prim->indices, k));
+            if (prim->indices) {
+                for (int k = 0; k < prim->indices->count; k += 3) {
+                    mesh.indices.push_back(vertex_offset + cgltf_accessor_read_index(prim->indices, k));
+                    mesh.indices.push_back(vertex_offset + cgltf_accessor_read_index(prim->indices, k+1));
+                    mesh.indices.push_back(vertex_offset + cgltf_accessor_read_index(prim->indices, k+2));
+                    mesh.tri_sources.push_back({(int)0, i, node->name ? node->name : "unnamed"});
+                }
+            }
         }
     }
+
+    for (int i = 0; i < node->children_count; ++i) {
+        process_node(node->children[i], global_matrix, mesh, img_comp);
+    }
+}
+
+MeshData load_glb(const std::string& path) {
+    cgltf_options options = {};
+    cgltf_data* data = nullptr;
+    if (cgltf_parse_file(&options, path.c_str(), &data) != cgltf_result_success) exit(-1);
+    cgltf_load_buffers(&options, data, path.c_str());
+    MeshData mesh; mesh.min_b = {1e10, 1e10, 1e10}; mesh.max_b = {-1e10, -1e10, -1e10};
+    int img_comp = 0;
+    
+    printf("\n--- GLB Node Topology Debug ---\n");
+    
+    // 初始矩阵（单位矩阵）
+    cgltf_float identity_matrix[16] = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 1.0f
+    };
+    
+    // 遍历所有根节点
+    for (size_t n_idx = 0; n_idx < data->nodes_count; ++n_idx) {
+        process_node(&data->nodes[n_idx], identity_matrix, mesh, img_comp);
+    }
+    
+    printf("Global AABB: Min(%f, %f, %f) Max(%f, %f, %f)\n", 
+           mesh.min_b.x, mesh.min_b.y, mesh.min_b.z, 
+           mesh.max_b.x, mesh.max_b.y, mesh.max_b.z);
+    
     cgltf_free(data); return mesh;
 }
 
@@ -461,6 +522,30 @@ void cook_cem_v3_64bit(const std::string& input_glb, const std::string& output_c
                     if (ray_intersects_triangle(p, ray_dir, mesh.vertices[mesh.indices[i]], mesh.vertices[mesh.indices[i+1]], mesh.vertices[mesh.indices[i+2]])) hit_count++;
                 }
                 float dist = std::sqrt(min_d_sq);
+                
+                // Debug: 输出树干变绿位置的信息
+                if (x == 32 && z == 32 && y == 10) {
+                    printf("\n--- Voxel Brain Debug (%d,%d,%d) ---", x, y, z);
+                    printf("Sample Point World Pos: (%f, %f, %f)\n", p.x, p.y, p.z);
+                    
+                    // 找到的最近三角形信息
+                    Vec3 v1 = mesh.vertices[mesh.indices[closest_tri]];
+                    Vec3 v2 = mesh.vertices[mesh.indices[closest_tri + 1]];
+                    Vec3 v3 = mesh.vertices[mesh.indices[closest_tri + 2]];
+                    
+                    printf("Closest Triangle Vertices:\n");
+                    printf("  V1: (%f, %f, %f)\n", v1.x, v1.y, v1.z);
+                    printf("  V2: (%f, %f, %f)\n", v2.x, v2.y, v2.z);
+                    printf("  V3: (%f, %f, %f)\n", v3.x, v3.y, v3.z);
+                    
+                    printf("Calculated Min Dist Sq: %f\n", min_d_sq);
+                    
+                    // 输出最近三角形所属的节点名称
+                    int tri_idx = closest_tri / 3;
+                    if (tri_idx >= 0 && tri_idx < (int)mesh.tri_sources.size()) {
+                        printf("Closest Triangle belongs to Node: [%s]\n", mesh.tri_sources[tri_idx].node_name.c_str());
+                    }
+                }
 
                 // --- 核心修正：针对细小几何体的保护 ---
                 // 如果当前点离任何一个三角形的距离小于“半个体素”的对角线

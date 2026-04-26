@@ -1,0 +1,16 @@
+[package]
+name = "cr_sculpt"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = "0.19"
+winit = { version = "0.29", features = ["rwh_05"] }
+egui = "0.27"
+egui-winit = "0.27"
+egui-wgpu = "0.27"
+glam = { version = "0.25", features = ["bytemuck"] }
+bytemuck = { version = "1.14", features = ["derive"] }
+pollster = "0.3"
+gltf = "1.4"
+rfd = "0.14" # 用于打开文件对话框

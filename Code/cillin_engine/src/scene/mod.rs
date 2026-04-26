@@ -3,6 +3,10 @@ use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use bytemuck::{Pod, Zeroable};
 
+pub mod tile_system;
+
+pub use tile_system::TileSystem;
+
 pub const TILE_SIZE: u32 = 16; // 每个 Tile 16x16 像素
 pub const MAX_ENTITIES_PER_TILE: usize = 128; // 每个 Tile 最多记录 128 个物体
 
@@ -30,8 +34,13 @@ pub struct EntityData {
     pub aabb_max: [f32; 4],             // 16
     pub sdf_index: u32,                 // 4
     pub instance_scale: f32,            // 4
-    // 修改：补齐到 256 字节 (256 - 184 = 72字节 = 18个u32)
-    pub _padding: [u32; 18],
+    
+    // --- 关键修复：增加 8 字节对齐补丁 ---
+    pub _align_pad: [u32; 2],           // 8 (确保下个字段从 192 字节开始, 192 % 16 == 0)
+    
+    pub screen_rect: [f32; 4],          // 16
+    pub flags: u32,                     // 4
+    pub _padding: [u32; 11],            // 44 (总和补齐至 256)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,7 +108,7 @@ impl Entity {
         }
     }
 
-    pub fn to_entity_data(&self, sdf_index: u32, aabb_min: [f32; 4], aabb_max: [f32; 4]) -> EntityData {
+    pub fn to_entity_data(&self, sdf_index: u32, aabb_min: [f32; 4], aabb_max: [f32; 4], screen_rect: [f32; 4], flags: u32) -> EntityData {
         let model_matrix = self.get_model_matrix();
         let inv_model_matrix = self.get_inv_model_matrix();
 
@@ -110,8 +119,11 @@ impl Entity {
             aabb_min,
             aabb_max,
             sdf_index,
-            instance_scale: self.scale.max_element(), // 缩放补偿系数
-            _padding: [0; 18],
+            instance_scale: self.scale.max_element(),
+            _align_pad: [0; 2], // 填充
+            screen_rect,
+            flags,
+            _padding: [0; 11],
         }
     }
 }

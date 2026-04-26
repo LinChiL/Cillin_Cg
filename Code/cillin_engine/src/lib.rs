@@ -1,7 +1,10 @@
 pub mod camera;
 pub mod console;
+pub mod core;
+pub mod editor;
 pub mod input;
 pub mod models;
 pub mod rendering;
+pub mod resources;
 pub mod scene;
 pub mod undo;

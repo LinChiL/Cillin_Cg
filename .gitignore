@@ -22,3 +22,7 @@ Desktop.ini
 .env.local
 
 Cargo.lock
+
+Document/
+
+Code/cr_sculpt/pr.md

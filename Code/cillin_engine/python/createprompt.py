@@ -32,10 +32,12 @@ for root, dirs, filenames in os.walk(src_dir):
             rel_path = os.path.relpath(full_path, project_dir)
             files.append((rel_path, full_path))
 
+
+
 # 处理特定的C++文件
 if os.path.exists(cpp_dir):
     # 包含 cpp/cem 目录下的文件
-    cpp_files = ["cem/cem_compiler_v4.cpp"]
+    cpp_files = ["cem/cem_compiler_v7.cpp"]
     for file in cpp_files:
         full_path = os.path.join(cpp_dir, file)
         if os.path.exists(full_path):
