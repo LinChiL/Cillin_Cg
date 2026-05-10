@@ -10,13 +10,6 @@ pub struct Primitive {
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct Anchor {
-    pub pos: [f32; 4],          // [x, y, z, 影响半径]
-    pub offset_attr: [f32; 4],   // [SDF偏移值, R, G, B]
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GridCell {
     pub offset: u32, // 该格子在排序后的锚点数组中的起点
     pub count: u32,  // 该格子里有多少个锚点
@@ -24,32 +17,75 @@ pub struct GridCell {
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Triangle {
+    pub v0: [f32; 4], // xyz = 顶点0, w = 属性
+    pub v1: [f32; 4], // xyz = 顶点1, w = 属性
+    pub v2: [f32; 4], // xyz = 顶点2, w = 属性
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Params {
-    pub view_inv: [[f32; 4]; 4],        // 64
-    pub proj_inv: [[f32; 4]; 4],        // 64
-    pub prev_view_proj: [[f32; 4]; 4],   // 64 (重投影矩阵)
-    pub cam_pos: [f32; 4],              // 16
-    pub light_dir: [f32; 4],            // 16
+    pub view_inv: [[f32; 4]; 4],      // 64 bytes
+    pub proj_inv: [[f32; 4]; 4],      // 64 bytes
+    pub prev_view_proj: [[f32; 4]; 4], // 64 bytes
+    pub cam_pos: [f32; 4],            // 16 bytes
+    pub light_dir: [f32; 4],          // 16 bytes
     
-    // 数据包 A
-    pub prim_count: u32,
-    pub anchor_count: u32,
-    pub scaffold_count: u32,
-    pub is_moving: u32,                 // 16
+    // 数据包 A (16 bytes)
+    pub prim_count: u32,      // 4
+    pub anchor_count: u32,    // 4
+    pub scaffold_count: u32,  // 4
+    pub is_moving: u32,       // 4
     
-    // --- 新增：空间网格参数 ---
-    pub grid_origin: [f32; 4], // 网格左下角起点 [x, y, z, cell_size]
+    pub grid_origin: [f32; 4],  // 16 bytes
     
-    pub time: f32,
-    pub _pad1: u32,
-    pub _pad2: u32,
-    pub _pad3: u32,                     // 16
+    // 数据包 B (16 bytes)
+    pub time: f32,    // 4
+    pub _pad1: u32,   // 4
+    pub _pad2: u32,   // 4
+    pub _pad3: u32,   // 4
 
-    // 最终对齐补丁：补齐到 320 字节 (还需要 64 字节)
-    pub _final_padding: [[f32; 4]; 4],  // 64
+    pub model_center: [f32; 4], // 16 bytes
+    
+    pub disk_center: [f32; 4],  // 16 bytes
+    pub disk_radius: f32,       // 4
+    pub base_radius: f32,       // 4
+    pub debug_mode: u32,        // 4 - 0=正常, 1=圆盘调试, 2=圆球调试
+    pub _padding: u32,          // 4 ← 确保总大小为 16 的倍数（400字节）
+}
 
-    // 模型几何中心 (用于径向位移场)
-    pub model_center: [f32; 4],
+impl Default for Params {
+    fn default() -> Self {
+        Self {
+            view_inv: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            proj_inv: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            prev_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            cam_pos: [0.0, 1.0, -5.0, 1.0],
+            light_dir: [0.0, 1.0, 0.0, 0.0],
+            prim_count: 0,
+            anchor_count: 0,
+            scaffold_count: 0,
+            is_moving: 0,
+            grid_origin: [-2.0, -2.0, -2.0, 4.0 / 16.0],
+            time: 0.0,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+            model_center: [0.0, 0.0, 0.0, 1.0],
+            disk_center: [0.0, 0.0, 0.0, 0.0],
+            disk_radius: 0.0,
+            base_radius: 1.0,
+            debug_mode: 0,
+            _padding: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct MeshSample {
+    pub pos: glam::Vec3,
+    pub normal: glam::Vec3,
 }
 
 pub struct Camera {

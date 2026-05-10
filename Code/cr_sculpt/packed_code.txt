@@ -1,0 +1,1387 @@
+===== app.rs =====
+// src/app.rs
+use std::sync::Arc;
+use winit::window::Window;
+use winit::dpi::PhysicalSize;
+use glam::Vec3;
+
+use crate::crem::{Primitive, Camera, AnchorSystem, AnchorBaker};
+use crate::renderer::SdfRenderer;
+
+pub struct App<'a> {
+    pub window: Arc<Window>,
+    pub surface: wgpu::Surface<'a>,
+    pub renderer: SdfRenderer,
+
+    pub primitives: Vec<Primitive>,
+    pub anchor_system: AnchorSystem,
+    pub camera: Camera,
+
+    pub scaffold_vertices: Vec<Vec3>,
+
+    pub egui_ctx: egui::Context,
+}
+
+impl<'a> App<'a> {
+    pub async fn new(window: Arc<Window>) -> Self {
+        let size = window.inner_size();
+
+        let instance = wgpu::Instance::default();
+        let surface = instance.create_surface(window.clone()).unwrap();
+
+        let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::default(),
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+        }).await.unwrap();
+
+        let (device, queue) = adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                label: None,
+            },
+            None,
+        ).await.unwrap();
+
+        let surface_caps = surface.get_capabilities(&adapter);
+        let surface_format = surface_caps.formats[0];
+
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: surface_format,
+            width: size.width,
+            height: size.height,
+            present_mode: surface_caps.present_modes[0],
+            alpha_mode: surface_caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+
+        surface.configure(&device, &config);
+
+        let renderer = SdfRenderer::new(device, queue, &config).await;
+
+        let mut app = Self {
+            window,
+            surface,
+            renderer,
+            primitives: Vec::new(),
+            anchor_system: AnchorSystem::new(),
+            camera: Camera::new(Vec3::new(0.0, 1.0, -5.0), 0.0, 0.0),
+            scaffold_vertices: Vec::new(),
+            egui_ctx: egui::Context::default(),
+        };
+
+        app.primitives.push(Primitive::new_sphere(Vec3::new(0.0, 0.0, 0.0), 1.2));
+        app.primitives.push(Primitive::new_box(Vec3::new(2.5, 0.0, 0.0), 0.9));
+
+        app.renderer.update_data(&app.primitives, &app.anchor_system);
+
+        let aspect_ratio = size.width as f32 / size.height as f32;
+        let cam_pos = Vec3::new(0.0, 3.0, -8.0);
+        let proj = glam::Mat4::perspective_rh(45.0_f32.to_radians(), aspect_ratio, 0.1, 100.0);
+        let view = glam::Mat4::look_at_rh(cam_pos, glam::Vec3::new(0.0, 1.0, 0.0), glam::Vec3::Y);
+        app.renderer.params.view_inv = view.inverse().to_cols_array_2d();
+        app.renderer.params.proj_inv = proj.inverse().to_cols_array_2d();
+        app.renderer.params.cam_pos = glam::Vec4::new(cam_pos.x, cam_pos.y, cam_pos.z, 1.0).into();
+        app.renderer.params.grid_origin = glam::Vec4::new(-5.0, -5.0, -5.0, 0.5).into();
+
+        app
+    }
+
+    pub fn update(&mut self, _dt: f32) {}
+    pub fn render(&mut self) {
+        let output = self.surface.get_current_texture().unwrap();
+        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.renderer.render(&view);
+        output.present();
+    }
+    pub fn resize(&mut self, size: PhysicalSize<u32>) {
+        self.renderer.resize(size, &self.surface);
+    }
+}
+
+===== main.rs =====
+mod app;
+mod crem;
+mod renderer;
+
+use std::sync::Arc;
+use winit::event_loop::EventLoop;
+use winit::window::Window;
+
+use crate::app::App;
+
+fn main() {
+    let event_loop = EventLoop::new().unwrap();
+    let window = Arc::new(Window::new(&event_loop).unwrap());
+    window.set_title("CrSculpt - CREM");
+
+    let mut app = pollster::block_on(App::new(window.clone()));
+
+    let mut last_time = std::time::Instant::now();
+
+    event_loop.run(move |event, elwt| {
+        match event {
+            winit::event::Event::WindowEvent { event, window_id } if window_id == app.window.id() => {
+                match event {
+                    winit::event::WindowEvent::CloseRequested => elwt.exit(),
+                    winit::event::WindowEvent::Resized(size) => app.resize(size),
+                    _ => {}
+                }
+            }
+            winit::event::Event::AboutToWait => {
+                let now = std::time::Instant::now();
+                let dt = (now - last_time).as_secs_f32();
+                last_time = now;
+
+                app.update(dt);
+                app.render();
+                app.window.request_redraw();
+            }
+            _ => {}
+        }
+    }).unwrap();
+}
+
+===== sculpt.wgsl =====
+struct Primitive {
+    inv_model_matrix: mat4x4<f32>,
+    color: vec4<f32>,
+    params: vec4<f32>,
+};
+
+struct Anchor {
+    local_pos: vec4<f32>,
+    offset: vec4<f32>,
+    attr: vec4<f32>,
+    prim_id: u32,
+    _padding: u32,
+};
+
+struct GridCell {
+    offset: u32,
+    count: u32,
+};
+
+struct Params {
+    view_inv: mat4x4<f32>,
+    proj_inv: mat4x4<f32>,
+    prev_view_proj: mat4x4<f32>, // 重投影矩阵
+    cam_pos: vec4<f32>,
+    light_dir: vec4<f32>,
+    
+    // 数据包 A
+    prim_count: u32,
+    anchor_count: u32,
+    scaffold_count: u32,
+    is_moving: u32,
+    
+    // --- 新增：空间网格参数 ---
+    grid_origin: vec4<f32>, // 网格左下角起点 [x, y, z, cell_size]
+    
+    // 数据包 B
+    time: f32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+
+    // 最终填充
+    _final_padding: array<vec4<f32>, 4>,
+
+    // 模型几何中心 (用于径向位移场)
+    model_center: vec4<f32>,
+};
+
+// 1. Compute 阶段使用的声明 (Group 0)
+@group(0) @binding(0) var output_texture: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(1) var<uniform> params: Params;
+@group(0) @binding(2) var<storage, read> primitives: array<Primitive>;
+@group(0) @binding(3) var<storage, read> anchors: array<Anchor>;
+@group(0) @binding(4) var<storage, read> grid_data: array<GridCell>;
+@group(0) @binding(5) var<storage, read> scaffold: array<vec4<f32>>;
+
+// 2. Render 阶段使用的声明 (注意：我们让它也用 Group 0，因为它们在不同的 Pass 运行)
+@group(0) @binding(0) var t_read: texture_2d<f32>;
+
+// 平滑并集 (Smooth Union)
+fn smin(d1: f32, d2: f32, k: f32) -> f32 {
+    let h = clamp(0.5 + 0.5 * (d2 - d1) / k, 0.0, 1.0);
+    return mix(d2, d1, h) - k * h * (1.0 - h);
+}
+
+// 胶囊体 SDF
+fn sdCapsule(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, r: f32) -> f32 {
+    let pa = p - a;
+    let ba = b - a;
+    let h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+    return length(pa - ba * h) - r;
+}
+
+// 场景 SDF 采样 (基础层)
+fn get_base_sdf(p: vec3<f32>) -> vec4<f32> {
+    var min_d = 1000.0;
+    var col = vec3<f32>(0.8);
+
+    for (var i = 0u; i < params.prim_count; i = i + 1u) {
+        let prim = primitives[i];
+        let local_p = (prim.inv_model_matrix * vec4<f32>(p, 1.0)).xyz;
+
+        var d = 1000.0;
+        let type_id = u32(prim.params.w);
+
+        if (type_id == 0u) { // 球体
+            d = length(local_p) - prim.params.x;
+        } else if (type_id == 1u) { // 圆角立方体
+            let q = abs(local_p) - vec3<f32>(prim.params.x);
+            d = length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0) - prim.params.y;
+        } else if (type_id == 2u) { // 胶囊体
+            let a = vec3<f32>(0.0, -prim.params.y, 0.0);
+            let b = vec3<f32>(0.0, prim.params.y, 0.0);
+            d = sdCapsule(local_p, a, b, prim.params.x);
+        }
+
+        let k = prim.params.z;
+        if (i == 0u) {
+            min_d = d;
+            col = prim.color.rgb;
+        } else {
+            let h = clamp(0.5 + 0.5 * (min_d - d) / k, 0.0, 1.0);
+            min_d = smin(min_d, d, k);
+            col = mix(col, prim.color.rgb, h);
+        }
+    }
+    return vec4<f32>(col, min_d);
+}
+
+// 修正后的 RBF 权重函数
+fn get_rbf_weight(dist: f32, radius: f32) -> f32 {
+    let x = clamp(dist / radius, 0.0, 1.0);
+    // 使用更高阶的平滑多项式，彻底消除"阶梯感"
+    return (1.0 - x * x) * (1.0 - x * x);
+}
+
+// 从空间网格中获取细节偏移
+fn get_detail_offset(p: vec3<f32>) -> f32 {
+    let origin = params.grid_origin.xyz;
+    let cell_len = params.grid_origin.w;
+    
+    // 1. 定位当前格子坐标
+    let g = vec3<i32>(floor((p - origin) / cell_len));
+    
+    if (any(g < vec3<i32>(0)) || any(g >= vec3<i32>(16))) { return 0.0; }
+    
+    var sum_off = 0.0;
+    var sum_w = 0.0;
+
+    // 2. 采样当前格子和周围 8 个邻居格子
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let neighbor_g = g + vec3<i32>(dx, dy, dz);
+                if (all(neighbor_g >= vec3<i32>(0)) && all(neighbor_g < vec3<i32>(16))) {
+                    let cell_idx = u32(neighbor_g.z * 256 + neighbor_g.y * 16 + neighbor_g.x);
+                    let cell = grid_data[cell_idx];
+
+                    for (var i = 0u; i < cell.count; i = i + 1u) {
+                        let a = anchors[cell.offset + i];
+                        let d = length(p - a.local_pos.xyz);
+                        let r = a.local_pos.w;
+
+                        if (d < r) {
+                            let w = exp(-5.0 * (d/r) * (d/r));
+                            sum_off = sum_off + a.offset.x * w;
+                            sum_w = sum_w + w;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    return select(0.0, sum_off / max(sum_w, 0.001), sum_w > 0.0);
+}
+
+fn get_anchor_offset_for_prim(p_local: vec3<f32>, prim_id: u32) -> f32 {
+    return 0.0;
+}
+
+fn get_sdf(p: vec3<f32>) -> vec4<f32> {
+    var res = get_base_sdf(p);
+    
+    let d_test_sphere = length(p - vec3<f32>(0.0, 1.0, 0.0)) - 1.0;
+    
+    if (d_test_sphere < res.w) {
+        res = vec4<f32>(1.0, 0.5, 0.2, d_test_sphere);
+    }
+    
+    return res;
+}
+
+// 高精度四面体法线 (Tetrahedron Normal)
+fn get_normal(p: vec3<f32>) -> vec3<f32> {
+    // 关键：对于解析几何，步长 h 设置为 0.005 能捕捉到极致的边缘锐度
+    let h = 0.005;
+    let k = vec4<f32>(1.0, -1.0, -1.0, 1.0);
+    return normalize(
+        k.xyy * get_sdf(p + k.xyy * h).w +
+        k.yyx * get_sdf(p + k.yyx * h).w +
+        k.yxy * get_sdf(p + k.yxy * h).w +
+        k.xxx * get_sdf(p + k.xxx * h).w
+    );
+}
+
+
+
+@compute @workgroup_size(8, 8)
+fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = textureDimensions(output_texture);
+    if (id.x >= size.x || id.y >= size.y) { return; }
+
+    let uv = (vec2<f32>(id.xy) + 0.5) / vec2<f32>(size);
+    let ndc = uv * 2.0 - 1.0;
+    let aspect = f32(size.x) / f32(size.y);
+
+    let fov_scale = 0.414;
+    let ray_dir_local = normalize(vec3<f32>(ndc.x * aspect * fov_scale, -ndc.y * fov_scale, 1.0));
+    
+    let ray_dir = (params.view_inv * vec4<f32>(ray_dir_local, 0.0)).xyz;
+    let ray_o = params.cam_pos.xyz;
+
+    var final_col = vec3<f32>(0.05, 0.05, 0.07);
+
+    var t = 0.0;
+    var hit = false;
+    for (var i = 0u; i < 128u; i = i + 1u) {
+        let p = ray_o + ray_dir * t;
+        let d = get_sdf(p).w;
+        if (d < 0.001) { hit = true; break; }
+        t = t + d;
+        if (t > 50.0) { break; }
+    }
+
+    if (hit) {
+        let p = ray_o + ray_dir * t;
+        let n = get_normal(p);
+        final_col = n * 0.5 + 0.5;
+    } else {
+        let sky_t = ray_dir.y * 0.5 + 0.5;
+        final_col = mix(vec3<f32>(0.1, 0.1, 0.2), vec3<f32>(0.4, 0.6, 1.0), sky_t);
+    }
+
+    textureStore(output_texture, vec2<i32>(id.xy), vec4<f32>(final_col, 1.0));
+}
+
+// --- 展示管线 (Blit) ---
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
+    let x = f32(i32(idx) / 2) * 4.0 - 1.0;
+    let y = f32(i32(idx) % 2) * 4.0 - 1.0;
+    return vec4<f32>(x, y, 0.0, 1.0);
+}
+
+@fragment
+fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    // 关键：现在 t_read 是普通 texture_2d，使用 textureLoad 是合法的
+    return textureLoad(t_read, vec2<i32>(i32(pos.x), i32(pos.y)), 0);
+}
+
+// --- 点云渲染管线 ---
+struct ScaffoldVertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+
+@vertex
+fn vs_scaffold(@builtin(vertex_index) idx: u32) -> ScaffoldVertexOutput {
+    var out: ScaffoldVertexOutput;
+    
+    // 直接从 Storage Buffer 拿顶点
+    let p_world = scaffold[idx].xyz;
+    
+    // 利用预计算的视图投影矩阵进行投影
+    let p_clip = params.prev_view_proj * vec4<f32>(p_world, 1.0);
+    
+    out.position = p_clip;
+    out.color = vec4<f32>(0.0, 0.6, 1.0, 0.5); // 蓝紫色半透明点
+    return out;
+}
+
+@fragment
+fn fs_scaffold(in: ScaffoldVertexOutput) -> @location(0) vec4<f32> {
+    return in.color;
+}
+
+===== utils.rs =====
+// utils.rs - 通用工具
+
+===== crem\anchor.rs =====
+// src/crem/anchor.rs
+use glam::Vec3;
+use crate::crem::types::{Anchor, GridCell, Primitive};
+
+/// Anchor 管理系统（负责空间加速结构）
+pub struct AnchorSystem {
+    pub anchors: Vec<Anchor>,
+    pub grid_cells: Vec<GridCell>,
+    pub grid_origin: Vec3,
+    pub cell_size: f32,
+    pub grid_resolution: u32,   // 默认 32
+}
+
+impl AnchorSystem {
+    pub fn new() -> Self {
+        Self {
+            anchors: Vec::new(),
+            grid_cells: Vec::new(),
+            grid_origin: Vec3::new(-2.0, -2.0, -2.0),
+            cell_size: 4.0 / 32.0,
+            grid_resolution: 32,
+        }
+    }
+
+    /// 清空所有 Anchor
+    pub fn clear(&mut self) {
+        self.anchors.clear();
+        self.grid_cells.clear();
+    }
+
+    /// 构建空间网格（烘焙后调用）
+    pub fn build_grid(&mut self) {
+        if self.anchors.is_empty() {
+            self.grid_cells = vec![GridCell { offset: 0, count: 0 }; (self.grid_resolution.pow(3)) as usize];
+            return;
+        }
+
+        let grid_size = self.grid_resolution as usize;
+        let mut buckets: Vec<Vec<Anchor>> = vec![Vec::new(); grid_size * grid_size * grid_size];
+
+        for &anchor in &self.anchors {
+            let p = Vec3::from_slice(&anchor.local_pos[0..3]); // 注意：这里是局部坐标，后面会转世界
+            let grid_pos = ((p - self.grid_origin) / self.cell_size).floor();
+            
+            let ix = grid_pos.x as i32;
+            let iy = grid_pos.y as i32;
+            let iz = grid_pos.z as i32;
+
+            // 注入到当前格子和相邻格子（保证连续性）
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        let nx = ix + dx;
+                        let ny = iy + dy;
+                        let nz = iz + dz;
+                        
+                        if nx >= 0 && nx < self.grid_resolution as i32 &&
+                           ny >= 0 && ny < self.grid_resolution as i32 &&
+                           nz >= 0 && nz < self.grid_resolution as i32 {
+                            
+                            let idx = (nz as usize * grid_size * grid_size) +
+                                     (ny as usize * grid_size) +
+                                     (nx as usize);
+                            buckets[idx].push(anchor);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 压扁成线性数组 + GridCell
+        self.grid_cells.clear();
+        let mut sorted_anchors = Vec::new();
+
+        for bucket in buckets {
+            let offset = sorted_anchors.len() as u32;
+            self.grid_cells.push(GridCell {
+                offset,
+                count: bucket.len() as u32,
+            });
+            sorted_anchors.extend(bucket);
+        }
+
+        self.anchors = sorted_anchors;
+    }
+}
+
+===== crem\baker.rs =====
+// src/crem/baker.rs
+use glam::Vec3;
+use crate::crem::{
+    types::{Anchor, Primitive},
+    primitive::evaluate_primitive_sdf,
+    AnchorSystem,
+};
+
+pub struct AnchorBaker;
+
+impl AnchorBaker {
+    /// 高质量烘焙：从脚手架点云生成 Anchor
+    pub fn bake(
+        primitives: &[Primitive],
+        scaffold_vertices: &[Vec3],
+        anchor_system: &mut AnchorSystem,
+    ) {
+        if primitives.is_empty() || scaffold_vertices.is_empty() {
+            println!("警告：没有基座几何体或脚手架点，无法烘焙");
+            return;
+        }
+
+        anchor_system.clear();
+
+        // 计算模型中心（可选）
+        let mut center = Vec3::ZERO;
+        for &v in scaffold_vertices {
+            center += v;
+        }
+        center /= scaffold_vertices.len() as f32;
+
+        println!("开始烘焙 {} 个脚手架点...", scaffold_vertices.len());
+
+        for &world_pos in scaffold_vertices.iter().take(40000) {  // 限制数量，防止爆炸
+            // 找到最近的 Primitive
+            let mut best_prim_id = 0;
+            let mut best_dist = f32::MAX;
+            let mut best_local_pos = Vec3::ZERO;
+
+            for (i, prim) in primitives.iter().enumerate() {
+                let local_p = glam::Mat4::from_cols_array_2d(&prim.inv_model_matrix)
+                    .transform_point3(world_pos);
+                
+                let d = evaluate_primitive_sdf(prim, world_pos).abs();
+                
+                if d < best_dist {
+                    best_dist = d;
+                    best_prim_id = i as u32;
+                    best_local_pos = local_p;
+                }
+            }
+
+            // 创建 Anchor（存储在局部空间）
+            let anchor = Anchor {
+                local_pos: best_local_pos.extend(0.25).into(),
+                offset: Vec3::ZERO.extend(0.0).into(),
+                attr: [0.8, 0.8, 0.8, 1.0],
+                prim_id: best_prim_id,
+                _padding: 0,
+            };
+
+            anchor_system.anchors.push(anchor);
+        }
+
+        // 构建空间网格
+        anchor_system.build_grid();
+
+        println!("烘焙完成！生成 {} 个 Anchor", anchor_system.anchors.len());
+    }
+}
+
+===== crem\camera.rs =====
+// src/crem/camera.rs
+use glam::{Vec3, Mat4};
+
+pub struct Camera {
+    pub eye: Vec3,
+    pub yaw: f32,
+    pub pitch: f32,
+}
+
+impl Camera {
+    pub fn new(eye: Vec3, yaw: f32, pitch: f32) -> Self {
+        Self { eye, yaw, pitch }
+    }
+
+    pub fn get_forward(&self) -> Vec3 {
+        Vec3::new(
+            self.yaw.cos() * self.pitch.cos(),
+            self.pitch.sin(),
+            self.yaw.sin() * self.pitch.cos(),
+        ).normalize()
+    }
+
+    pub fn get_right(&self) -> Vec3 {
+        Vec3::new(-self.yaw.sin(), 0.0, self.yaw.cos()).normalize()
+    }
+
+    pub fn get_up(&self) -> Vec3 {
+        self.get_right().cross(self.get_forward()).normalize()
+    }
+
+    pub fn get_view_matrix(&self) -> Mat4 {
+        Mat4::look_to_rh(self.eye, self.get_forward(), Vec3::Y)
+    }
+
+    pub fn rotate(&mut self, dx: f32, dy: f32) {
+        self.yaw += dx * 0.002;
+        self.pitch -= dy * 0.002;
+        self.pitch = self.pitch.clamp(-1.57, 1.57);
+    }
+
+    pub fn pan(&mut self, dx: f32, dy: f32) {
+        let sensitivity = 0.01;
+        self.eye -= self.get_right() * dx * sensitivity;
+        self.eye += self.get_up() * dy * sensitivity;
+    }
+
+    pub fn zoom(&mut self, delta: f32) {
+        self.eye += self.get_forward() * delta * 0.5;
+    }
+}
+
+===== crem\mod.rs =====
+// src/crem/mod.rs
+pub mod types;
+pub mod primitive;
+pub mod camera;
+pub mod anchor;
+pub mod baker;
+
+pub use types::*;
+pub use primitive::*;
+pub use camera::Camera;
+pub use anchor::AnchorSystem;
+pub use baker::AnchorBaker;
+
+===== crem\primitive.rs =====
+// src/crem/primitive.rs
+use glam::{Vec3, Mat4};
+use crate::crem::types::Primitive;
+
+/// Primitive 相关的 SDF 计算函数（CPU 端使用）
+pub fn evaluate_primitive_sdf(prim: &Primitive, world_pos: Vec3) -> f32 {
+    let local_p = Mat4::from_cols_array_2d(&prim.inv_model_matrix)
+        .transform_point3(world_pos);
+
+    let type_id = prim.params[3] as u32;
+    let d = match type_id {
+        0 => { // Sphere
+            local_p.length() - prim.params[0]
+        }
+        1 => { // Rounded Box
+            let q = local_p.abs() - Vec3::splat(prim.params[0]);
+            let exterior = q.max(Vec3::ZERO).length();
+            let interior = q.x.max(q.y).max(q.z).min(0.0);
+            exterior + interior - prim.params[1]
+        }
+        _ => 1000.0,
+    };
+
+    d
+}
+
+/// 计算世界空间中到所有 Primitive 的平滑 SDF + 颜色
+pub fn get_base_sdf(primitives: &[Primitive], p: Vec3) -> (f32, Vec3) {
+    if primitives.is_empty() {
+        return (1000.0, Vec3::new(0.8, 0.8, 0.8));
+    }
+
+    let mut min_d = 1000.0f32;
+    let mut color = primitives[0].color;
+
+    for (i, prim) in primitives.iter().enumerate() {
+        let d = evaluate_primitive_sdf(prim, p);
+        let k = prim.params[2]; // 平滑度
+
+        if i == 0 {
+            min_d = d;
+            color = prim.color;
+        } else {
+            // Smooth Union
+            let h = (0.5 + 0.5 * (min_d - d) / k).clamp(0.0, 1.0);
+            min_d = min_d.min(d) - k * h * (1.0 - h);
+            let col1 = Vec3::from_array([color[0], color[1], color[2]]);
+            let col2 = Vec3::from_array([prim.color[0], prim.color[1], prim.color[2]]);
+            let blended = col1.lerp(col2, h);
+            color = [blended.x, blended.y, blended.z, 1.0];
+        }
+    }
+
+    // color 是 [f32;4]，转 Vec3
+    let col_vec3 = Vec3::new(color[0], color[1], color[2]);
+    (min_d, col_vec3)
+}
+
+impl Primitive {
+    /// 更新位置（方便编辑）
+    pub fn set_position(&mut self, new_pos: Vec3) {
+        self.inv_model_matrix = Mat4::from_translation(new_pos).inverse().to_cols_array_2d();
+    }
+
+    /// 获取当前位置
+    pub fn get_position(&self) -> Vec3 {
+        Mat4::from_cols_array_2d(&self.inv_model_matrix)
+            .inverse()
+            .transform_point3(Vec3::ZERO)
+    }
+}
+
+===== crem\types.rs =====
+// src/crem/types.rs
+use bytemuck::{Pod, Zeroable};
+use glam::{Mat4, Vec3, Vec4};
+
+/// ==================== Primitive（基座几何体） ====================
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct Primitive {
+    /// 逆矩阵：世界坐标 → 局部坐标
+    pub inv_model_matrix: [[f32; 4]; 4],   // 64 bytes
+    
+    /// 基础颜色（后续可改成全局色库索引）
+    pub color: [f32; 4],                    // 16 bytes
+    
+    /// 参数包 [x: 主尺寸, y: 副参数(高度/圆角), z: 平滑度, w: 类型ID]
+    pub params: [f32; 4],                   // 16 bytes
+    
+    /// 扩展参数（为后续动画、材质做准备）
+    pub extra: [f32; 4],                    // 16 bytes
+    
+    /// 标志位
+    pub flags: u32,                         // 4 bytes
+    pub _padding: u32,                      // 4 bytes
+}
+
+impl Primitive {
+    pub fn new_sphere(center: Vec3, radius: f32) -> Self {
+        Self {
+            inv_model_matrix: Mat4::from_translation(center).inverse().to_cols_array_2d(),
+            color: [1.0, 1.0, 1.0, 1.0],
+            params: [radius, 0.0, 0.8, 0.0],     // 类型 0 = Sphere
+            extra: [0.0; 4],
+            flags: 0,
+            _padding: 0,
+        }
+    }
+
+    pub fn new_box(center: Vec3, half_size: f32) -> Self {
+        Self {
+            inv_model_matrix: Mat4::from_translation(center).inverse().to_cols_array_2d(),
+            color: [1.0, 1.0, 1.0, 1.0],
+            params: [half_size, 0.1, 0.8, 1.0],  // 类型 1 = Rounded Box
+            extra: [0.0; 4],
+            flags: 0,
+            _padding: 0,
+        }
+    }
+}
+
+/// ==================== Anchor（细节偏移点） ====================
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct Anchor {
+    /// 在所属 Primitive 局部空间下的位置 + 影响半径
+    pub local_pos: [f32; 4],
+    
+    /// 偏移向量 + sdf 修正值
+    pub offset: [f32; 4],
+    
+    /// 细节属性（颜色、粗糙度等）
+    pub attr: [f32; 4],
+    
+    /// 所属 Primitive 的索引（关键！）
+    pub prim_id: u32,
+    pub _padding: u32,
+}
+
+/// ==================== 空间网格 ====================
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct GridCell {
+    pub offset: u32,   // 在 anchors 数组中的起始位置
+    pub count: u32,    // 本格子里的 Anchor 数量
+}
+
+/// ==================== Uniform 参数 ====================
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct Params {
+    pub view_inv: [[f32; 4]; 4],
+    pub proj_inv: [[f32; 4]; 4],
+    pub prev_view_proj: [[f32; 4]; 4],
+    pub cam_pos: [f32; 4],
+    pub light_dir: [f32; 4],
+
+    pub prim_count: u32,
+    pub anchor_count: u32,
+    pub scaffold_count: u32,
+    pub is_moving: u32,
+
+    pub grid_origin: [f32; 4],
+
+    pub time: f32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+    pub _pad3: u32,
+
+    pub _final_padding: [[f32; 4]; 4],
+
+    pub model_center: [f32; 4],
+}
+
+impl Default for Params {
+    fn default() -> Self {
+        Self {
+            view_inv: Mat4::IDENTITY.to_cols_array_2d(),
+            proj_inv: Mat4::IDENTITY.to_cols_array_2d(),
+            prev_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+            cam_pos: [0.0, 1.0, -5.0, 1.0],
+            light_dir: [0.5, 1.0, 0.5, 0.0],
+            prim_count: 0,
+            anchor_count: 0,
+            scaffold_count: 0,
+            is_moving: 0,
+            grid_origin: [-5.0, -5.0, -5.0, 0.5],
+            time: 0.0,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+            _final_padding: [[0.0; 4]; 4],
+            model_center: [0.0; 4],
+        }
+    }
+}
+
+===== renderer\mod.rs =====
+// src/renderer/mod.rs
+pub mod sdf_renderer;
+
+pub use sdf_renderer::SdfRenderer;
+
+===== renderer\sdf_renderer.rs =====
+// src/renderer/sdf_renderer.rs
+use std::sync::Arc;
+use wgpu::util::DeviceExt;
+use winit::dpi::PhysicalSize;
+
+use crate::crem::{Primitive, Params, AnchorSystem, Camera};
+
+pub struct SdfRenderer {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+
+    compute_pipeline: wgpu::ComputePipeline,
+    render_pipeline: wgpu::RenderPipeline,
+    scaffold_pipeline: wgpu::RenderPipeline,
+
+    compute_bind_group_layout: wgpu::BindGroupLayout,
+    render_bind_group_layout: wgpu::BindGroupLayout,
+    scaffold_bind_group_layout: wgpu::BindGroupLayout,
+
+    params_buffer: wgpu::Buffer,
+    primitives_buffer: wgpu::Buffer,
+    anchor_buffer: wgpu::Buffer,
+    grid_buffer: wgpu::Buffer,
+    scaffold_buffer: wgpu::Buffer,
+
+    output_texture: wgpu::Texture,
+    output_view: wgpu::TextureView,
+
+    compute_bind_group: wgpu::BindGroup,
+    render_bind_group: wgpu::BindGroup,
+    scaffold_bind_group: wgpu::BindGroup,
+
+    pub params: Params,
+    surface_config: wgpu::SurfaceConfiguration,
+}
+
+impl SdfRenderer {
+    pub async fn new(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        config: &wgpu::SurfaceConfiguration,
+    ) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("CREM SDF Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("../sculpt.wgsl"))),
+        });
+
+        // === Buffers ===
+        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Params Buffer"),
+            size: std::mem::size_of::<Params>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let primitives_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Primitives Buffer"),
+            size: (128 * std::mem::size_of::<Primitive>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let anchor_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Anchor Buffer"),
+            size: (100_000 * std::mem::size_of::<crate::crem::Anchor>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let grid_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Grid Buffer"),
+            size: (32768 * std::mem::size_of::<crate::crem::GridCell>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let scaffold_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Scaffold Buffer"),
+            size: (100_000 * std::mem::size_of::<glam::Vec4>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // === Bind Group Layouts ===
+        let compute_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Compute Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        // === Output Texture ===
+        let output_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Output Texture"),
+            size: wgpu::Extent3d {
+                width: config.width,
+                height: config.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let output_view = output_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // === Compute Bind Group ===
+        let compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Compute Bind Group"),
+            layout: &compute_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&output_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: primitives_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: anchor_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: grid_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: scaffold_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // === Compute Pipeline ===
+        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Compute Pipeline"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Compute Layout"),
+                bind_group_layouts: &[&compute_bind_group_layout],
+                push_constant_ranges: &[],
+            })),
+            module: &shader,
+            entry_point: "cs_main",
+        });
+
+        // === Render Bind Group Layout ===
+        let render_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Render Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        // === Render Pipeline ===
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Render Layout"),
+                bind_group_layouts: &[&render_bind_group_layout],
+                push_constant_ranges: &[],
+            })),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+
+        // === Render Bind Group ===
+        let render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Render Bind Group"),
+            layout: &render_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&output_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // === Scaffold Bind Group Layout ===
+        let scaffold_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Scaffold Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        // === Scaffold Bind Group ===
+        let scaffold_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Scaffold Bind Group"),
+            layout: &scaffold_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: primitives_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: scaffold_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // === Scaffold Pipeline ===
+        let scaffold_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Scaffold Pipeline"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Scaffold Layout"),
+                bind_group_layouts: &[&scaffold_bind_group_layout],
+                push_constant_ranges: &[],
+            })),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_scaffold",
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_scaffold",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::PointList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+
+        Self {
+            device,
+            queue,
+            compute_pipeline,
+            render_pipeline,
+            scaffold_pipeline,
+            compute_bind_group_layout,
+            render_bind_group_layout,
+            scaffold_bind_group_layout,
+            params_buffer,
+            primitives_buffer,
+            anchor_buffer,
+            grid_buffer,
+            scaffold_buffer,
+            output_texture,
+            output_view,
+            compute_bind_group,
+            render_bind_group,
+            scaffold_bind_group,
+            params: Params::default(),
+            surface_config: config.clone(),
+        }
+    }
+
+    pub fn update_data(&mut self, primitives: &[Primitive], anchor_system: &AnchorSystem) {
+        self.params.prim_count = primitives.len() as u32;
+        self.params.anchor_count = anchor_system.anchors.len() as u32;
+
+        self.queue.write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&[self.params]));
+        self.queue.write_buffer(&self.primitives_buffer, 0, bytemuck::cast_slice(primitives));
+        self.queue.write_buffer(&self.anchor_buffer, 0, bytemuck::cast_slice(&anchor_system.anchors));
+        self.queue.write_buffer(&self.grid_buffer, 0, bytemuck::cast_slice(&anchor_system.grid_cells));
+    }
+
+    pub fn resize(&mut self, new_size: PhysicalSize<u32>, surface: &wgpu::Surface) {
+        if new_size.width == 0 || new_size.height == 0 { return; }
+
+        self.surface_config.width = new_size.width;
+        self.surface_config.height = new_size.height;
+        surface.configure(&self.device, &self.surface_config);
+
+        self.output_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Output Texture"),
+            size: wgpu::Extent3d {
+                width: new_size.width,
+                height: new_size.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+
+        self.output_view = self.output_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        self.compute_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Compute Bind Group"),
+            layout: &self.compute_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.output_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.primitives_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.anchor_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.grid_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.scaffold_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        self.render_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Render Bind Group"),
+            layout: &self.render_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.output_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        self.scaffold_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Scaffold Bind Group"),
+            layout: &self.scaffold_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.primitives_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.scaffold_buffer.as_entire_binding(),
+                },
+            ],
+        });
+    }
+
+    pub fn render(&mut self, view: &wgpu::TextureView) {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Render Encoder"),
+        });
+
+        let workgroup_x = (self.surface_config.width + 7) / 8;
+        let workgroup_y = (self.surface_config.height + 7) / 8;
+
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("SDF Compute Pass"),
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&self.compute_pipeline);
+            compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+            compute_pass.dispatch_workgroups(workgroup_x, workgroup_y, 1);
+        }
+
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Final Blit Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_bind_group(0, &self.render_bind_group, &[]);
+            render_pass.draw(0..3, 0..1);
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+}
+

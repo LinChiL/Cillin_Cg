@@ -4,52 +4,55 @@ struct Primitive {
     params: vec4<f32>,
 };
 
-struct Anchor {
-    pos: vec4<f32>,
-    offset_attr: vec4<f32>,
+struct Triangle {
+    v0: vec4<f32>,
+    v1: vec4<f32>,
+    v2: vec4<f32>,
 };
 
-struct GridCell {
-    offset: u32,
-    count: u32,
-};
+const TRI_INDEX_MAP_SIZE: u32 = 64u;
+const TRI_PER_CELL: u32 = 4u;
+
+
 
 struct Params {
-    view_inv: mat4x4<f32>,
-    proj_inv: mat4x4<f32>,
-    prev_view_proj: mat4x4<f32>, // 重投影矩阵
-    cam_pos: vec4<f32>,
-    light_dir: vec4<f32>,
+    view_inv: mat4x4<f32>,      // 64 bytes
+    proj_inv: mat4x4<f32>,      // 64 bytes
+    prev_view_proj: mat4x4<f32>, // 64 bytes
+    cam_pos: vec4<f32>,         // 16 bytes
+    light_dir: vec4<f32>,       // 16 bytes
     
-    // 数据包 A
-    prim_count: u32,
-    anchor_count: u32,
-    scaffold_count: u32,
-    is_moving: u32,
+    // 数据包 A (16 bytes)
+    prim_count: u32,      // 4
+    anchor_count: u32,    // 4
+    scaffold_count: u32,  // 4
+    is_moving: u32,       // 4
     
-    // --- 新增：空间网格参数 ---
-    grid_origin: vec4<f32>, // 网格左下角起点 [x, y, z, cell_size]
+    grid_origin: vec4<f32>,  // 16 bytes
     
-    // 数据包 B
-    time: f32,
-    _pad1: u32,
-    _pad2: u32,
-    _pad3: u32,
+    // 数据包 B (16 bytes)
+    time: f32,    // 4
+    _pad1: u32,   // 4
+    _pad2: u32,   // 4
+    _pad3: u32,   // 4
 
-    // 最终填充
-    _final_padding: array<vec4<f32>, 4>,
-
-    // 模型几何中心 (用于径向位移场)
-    model_center: vec4<f32>,
+    model_center: vec4<f32>, // 16 bytes
+    
+    disk_center: vec4<f32>,  // 16 bytes
+    disk_radius: f32,        // 4
+    base_radius: f32,        // 4
+    debug_mode: u32,         // 4 - 0=正常, 1=圆盘调试, 2=圆球调试
+    _padding: u32,           // 4 ← 确保总大小为 16 的倍数（400字节）
 };
 
 // 1. Compute 阶段使用的声明 (Group 0)
 @group(0) @binding(0) var output_texture: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(1) var<uniform> params: Params;
 @group(0) @binding(2) var<storage, read> primitives: array<Primitive>;
-@group(0) @binding(3) var<storage, read> anchors: array<Anchor>;
-@group(0) @binding(4) var<storage, read> grid_data: array<GridCell>;
-@group(0) @binding(5) var<storage, read> scaffold: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> triangles: array<Triangle>;
+@group(0) @binding(4) var<storage, read> scaffold: array<vec4<f32>>;
+@group(0) @binding(5) var depth_tex: texture_2d<f32>;
+@group(0) @binding(6) var tri_id_tex: texture_2d<u32>;
 
 // 2. Render 阶段使用的声明 (注意：我们让它也用 Group 0，因为它们在不同的 Pass 运行)
 @group(0) @binding(0) var t_read: texture_2d<f32>;
@@ -60,165 +63,208 @@ fn smin(d1: f32, d2: f32, k: f32) -> f32 {
     return mix(d2, d1, h) - k * h * (1.0 - h);
 }
 
-// 场景 SDF 采样 (基础层)
-fn get_base_sdf(p: vec3<f32>) -> vec4<f32> {
-    var min_d = 1000.0;
-    var col = vec3<f32>(0.8);
-
-    for (var i = 0u; i < params.prim_count; i = i + 1u) {
-        let prim = primitives[i];
-        let local_p = (prim.inv_model_matrix * vec4<f32>(p, 1.0)).xyz;
-
-        var d = 1000.0;
-        let type_id = u32(prim.params.w);
-
-        if (type_id == 0u) { // 球体
-            d = length(local_p) - prim.params.x;
-        } else if (type_id == 1u) { // 圆角立方体
-            let q = abs(local_p) - vec3<f32>(prim.params.x);
-            d = length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0) - prim.params.y;
-        }
-
-        let k = prim.params.z;
-        if (i == 0u) {
-            min_d = d;
-            col = prim.color.rgb;
-        } else {
-            let h = clamp(0.5 + 0.5 * (min_d - d) / k, 0.0, 1.0);
-            min_d = smin(min_d, d, k);
-            col = mix(col, prim.color.rgb, h);
-        }
-    }
-    return vec4<f32>(col, min_d);
+fn dot2(v: vec3<f32>) -> f32 {
+    return dot(v, v);
 }
 
-// 修正后的 RBF 权重函数
-fn get_rbf_weight(dist: f32, radius: f32) -> f32 {
-    let x = clamp(dist / radius, 0.0, 1.0);
-    // 使用更高阶的平滑多项式，彻底消除"阶梯感"
-    return (1.0 - x * x) * (1.0 - x * x);
+// 计算点 p 到三角形 abc 的最短距离 (Unsigned Distance)
+fn udTriangle(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, c: vec3<f32>) -> f32 {
+    let ba = b - a;
+    let pa = p - a;
+    let cb = c - b;
+    let pb = p - b;
+    let ac = a - c;
+    let pc = p - c;
+    let nor = cross(ba, ac);
+
+    let d = sign(dot(cross(ba, nor), pa)) +
+            sign(dot(cross(cb, nor), pb)) +
+            sign(dot(cross(ac, nor), pc));
+
+    if (d < 2.0) {
+        return sqrt(min(min(
+            dot2(ba * clamp(dot(ba, pa) / dot2(ba), 0.0, 1.0) - pa),
+            dot2(cb * clamp(dot(cb, pb) / dot2(cb), 0.0, 1.0) - pb)),
+            dot2(ac * clamp(dot(ac, pc) / dot2(ac), 0.0, 1.0) - pc)));
+    } else {
+        return sqrt(dot(nor, pa) * dot(nor, pa) / dot2(nor));
+    }
 }
 
-// 从空间网格中获取细节偏移
-fn get_detail_offset(p: vec3<f32>) -> f32 {
-    let origin = params.grid_origin.xyz;
-    let cell_len = params.grid_origin.w;
-    
-    // 1. 定位当前格子坐标
-    let g = vec3<i32>(floor((p - origin) / cell_len));
-    
-    if (any(g < vec3<i32>(0)) || any(g >= vec3<i32>(16))) { return 0.0; }
-    
-    var sum_off = 0.0;
-    var sum_w = 0.0;
-
-    // 2. 采样当前格子和周围 8 个邻居格子
-    for (var dz = -1; dz <= 1; dz = dz + 1) {
-        for (var dy = -1; dy <= 1; dy = dy + 1) {
-            for (var dx = -1; dx <= 1; dx = dx + 1) {
-                let neighbor_g = g + vec3<i32>(dx, dy, dz);
-                if (all(neighbor_g >= vec3<i32>(0)) && all(neighbor_g < vec3<i32>(16))) {
-                    let cell_idx = u32(neighbor_g.z * 256 + neighbor_g.y * 16 + neighbor_g.x);
-                    let cell = grid_data[cell_idx];
-
-                    for (var i = 0u; i < cell.count; i = i + 1u) {
-                        let a = anchors[cell.offset + i];
-                        let d = length(p - a.pos.xyz);
-                        let r = a.pos.w;
-                        
-                        if (d < r) {
-                            let w = exp(-5.0 * (d/r) * (d/r)); // 高斯平滑
-                            sum_off = sum_off + a.offset_attr.x * w;
-                            sum_w = sum_w + w;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    return select(0.0, sum_off / max(sum_w, 0.001), sum_w > 0.0);
+// ====================== 圆盘极坐标调试 ======================
+fn is_in_disk(screen_pos: vec2<f32>) -> bool {
+    let c = params.disk_center.xy;
+    let r = params.disk_radius * 1.12;   // 留一点 margin
+    return distance(screen_pos, c) <= r + 8.0; // 额外再加 8 像素 padding
 }
 
-fn get_sdf(p: vec3<f32>) -> vec4<f32> {
-    let base_res = get_base_sdf(p);
-    let d_base = base_res.w;
-
-    // --- 极致优化 1：洋葱皮剪裁 ---
-    // 只有当射线距离基座表面 0.15 单位内，才开启锚点计算
-    if (abs(d_base) > 0.15) { return base_res; }
-
-    // --- 极致优化 2：单格快速查表 ---
-    // 32x32x32 网格，只查 1 个格子
-    let g = vec3<i32>(floor((p - params.grid_origin.xyz) / params.grid_origin.w));
-    let cell_idx = u32(g.z * 1024 + g.y * 32 + g.x);
-    let cell = grid_data[cell_idx];
-
-    var weighted_offset = 0.0;
-    var total_w = 0.0;
-
-    // 此时 cell.count 应该被控制在 8-16 个点以内
-    for (var i = 0u; i < cell.count; i = i + 1u) {
-        let a = anchors[cell.offset + i];
-        let diff = p - a.pos.xyz;
-        let d = length(diff);
-        let r = a.pos.w;
-
-        if (d < r) {
-            // --- 核心精度修复：4次幂核函数 ---
-            let weight = pow(1.0 - d / r, 4.0); // 更锐利的权重，增加细节
-            weighted_offset += a.offset_attr.x * weight;
-            total_w += weight;
-        }
-    }
-
-    // --- 归一化蒙皮 ---
-    var displacement = 0.0;
-    if (total_w > 0.0) {
-        displacement = weighted_offset / total_w;
-    }
-
-    // --- 极致精度补丁：Lipschitz 纠偏 ---
-    // 强行限制位移场的影响范围，防止梯度溢出导致的缩放异常
-    let influence = smoothstep(0.15, 0.0, abs(d_base));
-    let d_final = d_base + (displacement * influence);
-
-    return vec4<f32>(base_res.rgb, d_final);
-}
-
-// 高精度四面体法线 (Tetrahedron Normal)
-fn get_normal(p: vec3<f32>) -> vec3<f32> {
-    // 关键：对于解析几何，步长 h 设置为 0.005 能捕捉到极致的边缘锐度
-    let h = 0.005;
-    let k = vec4<f32>(1.0, -1.0, -1.0, 1.0);
-    return normalize(
-        k.xyy * get_sdf(p + k.xyy * h).w +
-        k.yyx * get_sdf(p + k.yyx * h).w +
-        k.yxy * get_sdf(p + k.yxy * h).w +
-        k.xxx * get_sdf(p + k.xxx * h).w
+fn get_polar_coords(screen_pos: vec2<f32>) -> vec3<f32> {
+    let c = params.disk_center.xy;
+    let delta = screen_pos - c;
+    let r = length(delta) / params.disk_radius;
+    let theta = atan2(delta.y, delta.x) / (3.1415926 * 2.0) + 0.5;
+    return vec3<f32>(
+        r,
+        theta,
+        1.0 - r * 0.7
     );
 }
 
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
+    let c = v * s;
+    let x = c * (1.0 - abs(fract(h * 6.0) * 2.0 - 1.0));
+    let m = v - c;
 
+    var rgb: vec3<f32>;
+    let sector = i32(h * 6.0);
+
+    if (sector == 0)      { rgb = vec3<f32>(c, x, 0.0); }
+    else if (sector == 1) { rgb = vec3<f32>(x, c, 0.0); }
+    else if (sector == 2) { rgb = vec3<f32>(0.0, c, x); }
+    else if (sector == 3) { rgb = vec3<f32>(0.0, x, c); }
+    else if (sector == 4) { rgb = vec3<f32>(x, 0.0, c); }
+    else                  { rgb = vec3<f32>(c, 0.0, x); }
+
+    return rgb + m;
+}
+
+// 使用 Triangle ID 直接计算完美几何法线
+fn get_geometry_normal(tri_idx: u32) -> vec3<f32> {
+    if (tri_idx >= params.anchor_count) {
+        return vec3<f32>(0.0, 1.0, 0.0);
+    }
+
+    let tri = triangles[tri_idx];
+    let e1 = tri.v1.xyz - tri.v0.xyz;
+    let e2 = tri.v2.xyz - tri.v0.xyz;
+    
+    return normalize(cross(e1, e2));
+}
+
+fn get_sdf_precise(p: vec3<f32>, target_tri_id: u32) -> vec4<f32> {
+    let base_center = params.model_center.xyz;
+    let base_radius = primitives[0].params.x;
+    let d_base = length(p - base_center) - base_radius;
+    
+    if (target_tri_id == 0u) {
+        return vec4<f32>(primitives[0].color.rgb, d_base);
+    }
+
+    // 直接使用三角形距离，不再融合球
+    let tri = triangles[target_tri_id - 1u];
+    let d_tri = udTriangle(p, tri.v0.xyz, tri.v1.xyz, tri.v2.xyz) - 0.001;
+    
+    return vec4<f32>(primitives[0].color.rgb, d_tri);
+}
+
+fn get_blended_normal(p: vec3<f32>, tri_id: u32) -> vec3<f32> {
+    let h = 0.001;
+    let k = vec4<f32>(1.0, -1.0, -1.0, 1.0);
+    return normalize(
+        k.xyy * get_sdf_precise(p + k.xyy * h, tri_id).w +
+        k.yyx * get_sdf_precise(p + k.yyx * h, tri_id).w +
+        k.yxy * get_sdf_precise(p + k.yxy * h, tri_id).w +
+        k.xxx * get_sdf_precise(p + k.xxx * h, tri_id).w
+    );
+}
 
 @compute @workgroup_size(8, 8)
 fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
-    // 关键修正 1：显式处理 textureDimensions 的返回值
     let size_u = textureDimensions(output_texture);
-    let screen_size = vec2<f32>(f32(size_u.x), f32(size_u.y));
+    let screen_coord = vec2<i32>(i32(id.x), i32(id.y));
+    
+    if (screen_coord.x >= i32(size_u.x) || screen_coord.y >= i32(size_u.y)) { return; }
 
-    if (f32(id.x) >= screen_size.x || f32(id.y) >= screen_size.y) { return; }
+    // === 圆盘 + Voronoi 调试模式 ===
+    if (params.debug_mode == 1u) {
+        let screen_pos = vec2<f32>(f32(id.x), f32(id.y));
 
-    // 2. 初始化射线 (使用更稳健的坐标转换)
+        var col = vec3<f32>(0.06, 0.06, 0.10);
+
+        if (is_in_disk(screen_pos)) {
+            var closest_dist = 999999.0;
+            var closest_idx: u32 = 0u;
+            var second_dist = 999999.0;
+
+            for (var i = 0u; i < params.scaffold_count; i = i + 1u) {
+                let p = scaffold[i].xy;
+                let d = distance(screen_pos, p);
+
+                if (d < closest_dist) {
+                    second_dist = closest_dist;
+                    closest_dist = d;
+                    closest_idx = i;
+                } else if (d < second_dist) {
+                    second_dist = d;
+                }
+            }
+
+            let hue = f32(closest_idx % 37u) / 37.0 * 6.28;
+            col = hsv_to_rgb(hue / 6.28, 0.9, 0.95);
+
+            let edge = abs(closest_dist - second_dist);
+            if (edge < 2.5) {
+                col = mix(col, vec3<f32>(0.0, 0.0, 0.0), 0.85);
+            }
+
+            if (closest_dist < 5.0) {
+                col = vec3<f32>(1.0, 1.0, 1.0);
+            }
+        } else {
+            col = vec3<f32>(0.4, 0.05, 0.05) * 0.6;
+        }
+
+        textureStore(output_texture, screen_coord, vec4<f32>(col, 1.0));
+        return;
+    }
+
+    // === 圆球调试模式 (Vs球可视化) ===
+    if (params.debug_mode == 3u) {
+        let screen_size = vec2<f32>(f32(size_u.x), f32(size_u.y));
+        let screen_pos = vec2<f32>(f32(id.x), f32(id.y));
+        let uv = (screen_pos / screen_size) * 2.0 - 1.0;
+        let ray_target = params.proj_inv * vec4<f32>(uv.x, -uv.y, 1.0, 1.0);
+        let ray_dir = normalize((params.view_inv * vec4<f32>(normalize(ray_target.xyz / ray_target.w), 0.0)).xyz);
+        let ray_o = params.cam_pos.xyz;
+        
+        let sphere_center = params.model_center.xyz;
+        let sphere_radius = params.base_radius;
+        
+        let oc = ray_o - sphere_center;
+        let b = dot(oc, ray_dir);
+        let c = dot(oc, oc) - sphere_radius * sphere_radius;
+        let discriminant = b * b - c;
+        
+        if (discriminant > 0.0) {
+            let t = -b - sqrt(discriminant);
+            if (t > 0.0) {
+                let hit_pos = ray_o + ray_dir * t;
+                let normal = normalize(hit_pos - sphere_center);
+                
+                let light_dir = normalize(params.light_dir.xyz);
+                let diffuse = max(dot(normal, light_dir), 0.0);
+                let col = vec3<f32>(0.8, 0.2, 0.2) * (diffuse * 0.8 + 0.2);
+                textureStore(output_texture, screen_coord, vec4<f32>(col, 1.0));
+                return;
+            }
+        }
+        
+        textureStore(output_texture, screen_coord, vec4<f32>(0.1, 0.1, 0.12, 1.0));
+        return;
+    }
+
+    // 1. 获取该像素对应的三角形 ID (来自光栅化 Pass)
+    // 0 = 背景/无三角形, >0 = 三角形索引+1
+    let tri_id = textureLoad(tri_id_tex, screen_coord, 0).r;
+
+    // 2. 初始化射线和背景网格
     let screen_pos = vec2<f32>(f32(id.x), f32(id.y));
-    let uv = (screen_pos / screen_size) * 2.0 - 1.0;
-
-    // 注意：翻转 Y 轴以对齐 WGPU 坐标系
+    let uv = (screen_pos / vec2<f32>(size_u)) * 2.0 - 1.0;
     let ray_target = params.proj_inv * vec4<f32>(uv.x, -uv.y, 1.0, 1.0);
     let ray_dir = normalize((params.view_inv * vec4<f32>(normalize(ray_target.xyz / ray_target.w), 0.0)).xyz);
     let ray_o = params.cam_pos.xyz;
 
-    // 2. 初始背景：深色工业感背景
+    // 绘制背景网格
     var final_col = vec3<f32>(0.1, 0.1, 0.12);
     let t_grid = -ray_o.y / (ray_dir.y + 0.00001);
     if (t_grid > 0.0 && t_grid < 100.0) {
@@ -228,69 +274,106 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
         final_col = mix(final_col, vec3<f32>(0.2, 0.2, 0.25), grid);
     }
 
+    // 3. 【核心改进】收集邻域内的所有三角形候选者
+    var candidates: array<u32, 9>;
+    var candidate_count = 0u;
 
+    for (var oy = -1; oy <= 1; oy++) {
+        for (var ox = -1; ox <= 1; ox++) {
+            let neighbor_coord = screen_coord + vec2<i32>(ox, oy);
+            let tid = textureLoad(tri_id_tex, neighbor_coord, 0).r;
+            
+            if (tid > 0u) {
+                candidates[candidate_count] = tid;
+                candidate_count++;
+            }
+        }
+    }
 
-    // 3. 步进 (Raymarching)
+    // 4. 射线步进
     var t = 0.0;
     var hit = false;
-    var res = vec4<f32>(0.0);
-    for (var i = 0u; i < 200u; i = i + 1u) { // 步数加满
+    
+    // 只有当有候选三角形时才进行步进
+    if (candidate_count > 0u) {
+        let sphere_center = params.model_center.xyz;
+        let sphere_radius = params.base_radius;
+        
+        let oc = ray_o - sphere_center;
+        let b = dot(oc, ray_dir);
+        let c = dot(oc, oc) - sphere_radius * sphere_radius;
+        let discriminant = b * b - c;
+        
+        if (discriminant > 0.0) {
+            let t_sphere = -b - sqrt(discriminant);
+            if (t_sphere > 0.0) {
+                t = t_sphere; // 从球表面开始
+            }
+        }
+        
+        for (var i = 0u; i < 128u; i = i + 1u) {
+            let p = ray_o + ray_dir * t;
+            
+            var min_d_tri = 1000.0;
+            
+            // 【核心改进】不再只算一个，而是算这几个候选三角形里最近的
+            for (var c = 0u; c < candidate_count; c++) {
+                let tri = triangles[candidates[c] - 1u];
+                let d_tri = udTriangle(p, tri.v0.xyz, tri.v1.xyz, tri.v2.xyz) - 0.001;
+                min_d_tri = min(min_d_tri, d_tri);
+            }
+            
+            // 直接使用三角形距离，不再融合球
+            let d = min_d_tri;
+
+            if (d < 0.0005) { hit = true; break; }
+            t = t + d;
+            if (t > 20.0) { break; }
+        }
+    }
+    // candidate_count == 0 时不步进，直接显示背景网格
+
+    // 5. 最终着色
+    if (hit) {
         let p = ray_o + ray_dir * t;
-        res = get_sdf(p);
-        let d = res.w;
-
-        if (abs(d) < 0.0001) { hit = true; break; }
-
-        // --- 核心性能修复：双速步进 ---
-        var step_dist = d;
-        if (abs(d) > 0.1) {
-            step_dist = d * 0.9; // 远距离大跳
+        
+        // 获取法线
+        var n: vec3<f32>;
+        if (candidate_count > 0u) {
+            // 使用主像素的 tri_id 获取法线
+            if (tri_id > 0u) {
+                n = get_geometry_normal(tri_id - 1u);
+            } else {
+                // 如果主像素没有 tri_id，使用第一个候选的法线
+                n = get_geometry_normal(candidates[0] - 1u);
+            }
         } else {
-            step_dist = d * 0.35; // 表面附近细查细节
+            n = normalize(p - params.model_center.xyz);
         }
 
-        t = t + step_dist;
-        if (t > 50.0) { break; }
-    }
+        // === 法线调试模式：直接显示法线颜色 ===
+        if (params.debug_mode == 4u) {
+            final_col = (n * 0.5 + 0.5);
+            textureStore(output_texture, screen_coord, vec4<f32>(final_col, 1.0));
+            return;
+        }
 
-    // 3. 最终混合渲染
-    if (hit) {
-        // 渲染实体模型 (带摄影棚光照)
-        let p = ray_o + ray_dir * t;
-        let n = get_normal(p);
-        let base_color = res.rgb;
-
-        // --- 摄影棚级光照逻辑 (Snapshot Material) ---
-        let L_key = normalize(vec3<f32>(0.5, 1.0, 0.5));   // 主光
-        let L_back = normalize(vec3<f32>(0.0, -0.5, -1.0)); // 轮廓背光
-
-        // A. 粘土感漫反射
-        let key_diff = max(dot(n, L_key), 0.0);
+        // 光照计算
+        let L = normalize(vec3<f32>(0.5, 1.0, 0.5));
+        let diff = max(dot(n, L), 0.0) * 0.8 + 0.2;
         
-        // B. 边缘高光 (Rim Light)：突出模型的体积感
-        let rim = pow(1.0 - max(dot(n, -ray_dir), 0.0), 4.0);
-        let rim_light = rim * max(dot(n, L_back), 0.0) * 0.4;
-
-        // C. 高亮反射 (Specular)：模拟抛光效果
-        let h_vec = normalize(L_key - ray_dir);
-        let specular = pow(max(dot(n, h_vec), 0.0), 32.0) * 0.3;
-
-        // D. 菲涅尔环境光：让暗部不至于死黑，且带有空气感
-        let ambient = (n.y * 0.5 + 0.5) * 0.15;
-
-        // 最终合成
-        var col = base_color * (key_diff + ambient);
-        col = col + (rim_light * vec3<f32>(0.7, 0.8, 1.0)); // 蓝色冷调背光
-        col = col + specular;
-
-        // E. 调色板映射与 Gamma 修正
-        col = col / (col + vec3<f32>(1.0)); // 简单的 ToneMapping
-        final_col = pow(col, vec3<f32>(1.0 / 2.2));
+        // 如果是三角形区域，给点不一样的颜色看看
+        var base_color = primitives[0].color.rgb;
+        if (tri_id > 0u) {
+            base_color = vec3<f32>(0.4, 0.6, 1.0); // 蓝色模型
+        }
+        
+        final_col = base_color * diff;
+        final_col = pow(final_col, vec3<f32>(1.0 / 2.2));
     }
 
-    // 关键修正 2：确保 textureStore 参数符合 2D Storage Texture 规范 (3个参数)
-    // 1. Texture, 2. vec2<i32> 坐标, 3. vec4 值
-    textureStore(output_texture, vec2<i32>(i32(id.x), i32(id.y)), vec4<f32>(final_col, 1.0));
+    // 统一输出，保证网格线不消失
+    textureStore(output_texture, screen_coord, vec4<f32>(final_col, 1.0));
 }
 
 // --- 展示管线 (Blit) ---
@@ -332,3 +415,57 @@ fn vs_scaffold(@builtin(vertex_index) idx: u32) -> ScaffoldVertexOutput {
 fn fs_scaffold(in: ScaffoldVertexOutput) -> @location(0) vec4<f32> {
     return in.color;
 }
+
+// ====================== 轻量深度图管线 ======================
+struct DepthVertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) triangle_id: u32,
+};
+
+@vertex
+fn vs_depth(@builtin(vertex_index) vertex_index: u32) -> DepthVertexOutput {
+    let tri_idx = vertex_index / 3u;
+    let local_idx = vertex_index % 3u;
+
+    let tri = triangles[tri_idx];
+    var p: vec3<f32>;
+
+    if (local_idx == 0u) {
+        p = tri.v0.xyz;
+    } else if (local_idx == 1u) {
+        p = tri.v1.xyz;
+    } else {
+        p = tri.v2.xyz;
+    }
+
+    let clip_pos = params.prev_view_proj * vec4<f32>(p, 1.0);
+
+    var out: DepthVertexOutput;
+    out.position = clip_pos;
+    out.triangle_id = tri_idx;
+    return out;
+}
+
+struct DepthFragmentOutput {
+    @location(0) triangle_id: u32,
+};
+
+@fragment
+fn fs_depth(in: DepthVertexOutput) -> DepthFragmentOutput {
+    var out: DepthFragmentOutput;
+    out.triangle_id = in.triangle_id + 1u;
+    return out;
+}
+
+@group(0) @binding(1) var depth_blit_tex: texture_2d<f32>;
+
+@fragment
+fn fs_depth_blit(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let depth = textureLoad(depth_blit_tex, vec2<i32>(i32(pos.x), i32(pos.y)), 0).r;
+    let vis = (1.0 - depth) * 0.5;
+    let near_color = vec3<f32>(1.0, 0.8, 0.4);
+    let far_color = vec3<f32>(0.2, 0.3, 0.8);
+    let color = mix(far_color, near_color, vis);
+    return vec4<f32>(color, 1.0);
+}
+// ============================================================

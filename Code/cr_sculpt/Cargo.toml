@@ -14,3 +14,4 @@ bytemuck = { version = "1.14", features = ["derive"] }
 pollster = "0.3"
 gltf = "1.4"
 rfd = "0.14" # 用于打开文件对话框
+rand = "0.8"
