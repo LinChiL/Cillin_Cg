@@ -1,0 +1,740 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>CLEM 张力素流体模拟 - 2D原型</title>
+    <style>
+        body {
+            margin: 0;
+            min-height: 100vh;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        
+        .container {
+            background: rgba(0,0,0,0.3);
+            border-radius: 24px;
+            padding: 20px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.4);
+        }
+        
+        canvas {
+            display: block;
+            margin: 0 auto;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            cursor: pointer;
+        }
+        
+        .controls {
+            margin-top: 20px;
+            display: flex;
+            gap: 12px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        
+        button {
+            background: #0f3460;
+            border: none;
+            color: white;
+            padding: 10px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.2s ease;
+            font-family: inherit;
+        }
+        
+        button:hover {
+            background: #1a4a7a;
+            transform: translateY(-2px);
+        }
+        
+        button:active {
+            transform: translateY(0);
+        }
+        
+        .btn-danger {
+            background: #e94560;
+        }
+        
+        .btn-danger:hover {
+            background: #ff6b6b;
+        }
+        
+        .btn-success {
+            background: #00b4d8;
+        }
+        
+        .btn-success:hover {
+            background: #48cae4;
+        }
+        
+        .info {
+            margin-top: 16px;
+            text-align: center;
+            color: #aaa;
+            font-size: 12px;
+            display: flex;
+            justify-content: center;
+            gap: 24px;
+            flex-wrap: wrap;
+        }
+        
+        .info-item {
+            background: rgba(0,0,0,0.5);
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-family: monospace;
+        }
+        
+        .info-label {
+            color: #00b4d8;
+            font-weight: bold;
+        }
+        
+        h3 {
+            margin: 0 0 10px 0;
+            color: #00b4d8;
+            font-size: 14px;
+            text-align: center;
+        }
+        
+        .status {
+            color: #4ecdc4;
+            font-weight: bold;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 0.6; }
+            50% { opacity: 1; }
+        }
+        
+        .simulating {
+            animation: pulse 1s ease-in-out infinite;
+        }
+    </style>
+</head>
+<body>
+<div>
+    <div class="container">
+        <canvas id="fluidCanvas" width="512" height="512"></canvas>
+        
+        <div class="controls">
+            <button id="resetBtn">🔄 重置</button>
+            <button id="splashBtn" class="btn-success">💧 点击飞溅</button>
+            <button id="gravityToggle" class="btn-danger">⚡ 重力: 开启</button>
+            <button id="clearBtn">🧹 清除飞溅</button>
+        </div>
+        
+        <div class="info">
+            <div class="info-item">
+                <span class="info-label">📊 张力素体素:</span>
+                <span id="voxelCount">0</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">💧 渲染粒子:</span>
+                <span id="particleCount">0</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">⚙️ FPS:</span>
+                <span id="fps">0</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">🧪 液面梯度:</span>
+                <span id="surfaceArea">0</span>
+            </div>
+        </div>
+        <div style="text-align: center; margin-top: 12px; font-size: 11px; color: #666;">
+            🖱️ 点击/拖动水面 = 产生扰动 | 张力素物理传播 (Navier-Stokes简化)
+        </div>
+    </div>
+</div>
+
+<script>
+    (function(){
+        // ---------- CLEM 张力素核心参数 ----------
+        const SIZE = 64;            // 64x64 张力素场 (性能与精度的平衡)
+        const CELL_SIZE = 512 / SIZE; // 8px/体素
+        
+        // 物理参数
+        let GRAVITY_ENABLED = true;
+        let DT = 0.016;             // 模拟时间步长 (约60fps)
+        let VISCOSITY = 0.98;       // 粘性阻尼
+        let PRESSURE_STRENGTH = 0.25; // 压力传播强度
+        let SURFACE_TENSION = 0.12;   // 表面张力系数
+        let SPLASH_ENERGY = 1.2;       // 飞溅能量
+        
+        // 张力素场 (value: 0-1, 0=空气, 1=完全液体)
+        let tension = new Array(SIZE).fill().map(() => new Array(SIZE).fill(0));
+        
+        // 速度场 (u, v)
+        let velocityU = new Array(SIZE).fill().map(() => new Array(SIZE).fill(0));
+        let velocityV = new Array(SIZE).fill().map(() => new Array(SIZE).fill(0));
+        
+        // 压力场（临时）
+        let pressure = new Array(SIZE).fill().map(() => new Array(SIZE).fill(0));
+        
+        // 辅助数组 (用于平流)
+        let newTension = new Array(SIZE).fill().map(() => new Array(SIZE).fill(0));
+        let newU = new Array(SIZE).fill().map(() => new Array(SIZE).fill(0));
+        let newV = new Array(SIZE).fill().map(() => new Array(SIZE).fill(0));
+        
+        // 渲染粒子系统 (仅视觉，不参与物理)
+        let renderParticles = [];
+        let MAX_PARTICLES = 8000;
+        
+        // LOD Tile合并信息 (用于性能统计)
+        let mergedTiles = [];
+        
+        // 飞溅/扰动标记
+        let mouseDown = false;
+        let lastMouseX = -1, lastMouseY = -1;
+        let mouseVelocity = { x: 0, y: 0 };
+        
+        // 动画与性能
+        let lastTimestamp = 0;
+        let frameCount = 0;
+        let currentFPS = 60;
+        let animationId = null;
+        let canvas = document.getElementById('fluidCanvas');
+        let ctx = canvas.getContext('2d');
+        
+        // ---------- 初始化: 半满水 ----------
+        function initTension() {
+            // 重置张力场: 下半部分为液体 (y >= SIZE/2)
+            for(let y = 0; y < SIZE; y++) {
+                for(let x = 0; x < SIZE; x++) {
+                    // 半满: y >= 32 为液体
+                    tension[x][y] = (y >= SIZE/2) ? 1.0 : 0.0;
+                    velocityU[x][y] = 0;
+                    velocityV[x][y] = 0;
+                    pressure[x][y] = 0;
+                }
+            }
+            
+            // 添加一点初始扰动，让水面自然波动
+            for(let x = 0; x < SIZE; x++) {
+                const surfaceY = SIZE/2;
+                if(x > SIZE/4 && x < 3*SIZE/4) {
+                    // 水面附近给点微小速度
+                    velocityV[x][Math.floor(surfaceY)] = (Math.sin(x * 0.5) * 0.5);
+                }
+            }
+            
+            updateMergedTiles();
+        }
+        
+        // ---------- Tile合并 (LOD思想，用于性能统计和渲染优化) ----------
+        function updateMergedTiles() {
+            mergedTiles = [];
+            const visited = new Array(SIZE).fill().map(() => new Array(SIZE).fill(false));
+            
+            for(let y = 0; y < SIZE; y++) {
+                for(let x = 0; x < SIZE; x++) {
+                    if(!visited[x][y]) {
+                        const val = tension[x][y];
+                        // BFS/洪水填充合并同值区域
+                        let minX = x, maxX = x, minY = y, maxY = y;
+                        let queue = [{x, y}];
+                        let idx = 0;
+                        visited[x][y] = true;
+                        
+                        while(idx < queue.length) {
+                            const p = queue[idx++];
+                            minX = Math.min(minX, p.x);
+                            maxX = Math.max(maxX, p.x);
+                            minY = Math.min(minY, p.y);
+                            maxY = Math.max(maxY, p.y);
+                            
+                            // 四连通探索
+                            const neighbors = [[-1,0],[1,0],[0,-1],[0,1]];
+                            for(let [dx, dy] of neighbors) {
+                                const nx = p.x + dx;
+                                const ny = p.y + dy;
+                                if(nx>=0 && nx<SIZE && ny>=0 && ny<SIZE && !visited[nx][ny] && 
+                                   Math.abs(tension[nx][ny] - val) < 0.05) {
+                                    visited[nx][ny] = true;
+                                    queue.push({x: nx, y: ny});
+                                }
+                            }
+                        }
+                        
+                        // 记录合并块
+                        mergedTiles.push({
+                            x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1,
+                            value: val,
+                            area: (maxX - minX + 1) * (maxY - minY + 1)
+                        });
+                    }
+                }
+            }
+        }
+        
+        // ---------- 梯度计算: 检测液面 (表面张力定位) ----------
+        function computeGradient(x, y) {
+            // 中心差分
+            const gx = ((x+1 < SIZE ? tension[x+1][y] : tension[x][y]) - 
+                        (x-1 >= 0 ? tension[x-1][y] : tension[x][y])) / 2.0;
+            const gy = ((y+1 < SIZE ? tension[x][y+1] : tension[x][y]) - 
+                        (y-1 >= 0 ? tension[x][y-1] : tension[x][y])) / 2.0;
+            return { gx, gy, len: Math.sqrt(gx*gx + gy*gy) };
+        }
+        
+        // ---------- 物理更新: 压力投影 + 平流 + 重力 ----------
+        function updatePhysics() {
+            // 1. 计算压力场 (基于张力梯度，仅表面张力 + 高度差扩散)
+            for(let y = 0; y < SIZE; y++) {
+                for(let x = 0; x < SIZE; x++) {
+                    const grad = computeGradient(x, y);
+                    const curvature = grad.len;
+                    // 压力 = 表面张力系数 * 曲率 + 高度差扩散 (重力贡献极小，主要靠直接加速度)
+                    pressure[x][y] = SURFACE_TENSION * curvature + (SIZE - y) * 0.02;
+                }
+            }
+            
+            // 2. 重力直接作用在速度上（底部不加重力，防止穿透）
+            for(let y = 0; y < SIZE; y++) {
+                for(let x = 0; x < SIZE; x++) {
+                    if(GRAVITY_ENABLED && tension[x][y] > 0.01 && y < SIZE-2) {
+                        velocityV[x][y] += 0.8 * DT;  // 直接给向下加速度
+                    }
+                }
+            }
+            
+            // 3. 压力梯度驱动速度更新 (NS: du/dt = -∇p)
+            for(let y = 0; y < SIZE; y++) {
+                for(let x = 0; x < SIZE; x++) {
+                    const gradPx = ((x+1 < SIZE ? pressure[x+1][y] : pressure[x][y]) - 
+                                    (x-1 >= 0 ? pressure[x-1][y] : pressure[x][y])) / 2.0;
+                    const gradPy = ((y+1 < SIZE ? pressure[x][y+1] : pressure[x][y]) - 
+                                    (y-1 >= 0 ? pressure[x][y-1] : pressure[x][y])) / 2.0;
+                    
+                    let du = -PRESSURE_STRENGTH * gradPx;
+                    let dv = -PRESSURE_STRENGTH * gradPy;
+                    
+                    velocityU[x][y] += du * DT;
+                    velocityV[x][y] += dv * DT;
+                    
+                    // 粘性阻尼
+                    velocityU[x][y] *= VISCOSITY;
+                    velocityV[x][y] *= VISCOSITY;
+                    
+                    // 限速 (放宽限制，允许下落加速)
+                    velocityU[x][y] = Math.min(Math.max(velocityU[x][y], -8.0), 8.0);
+                    velocityV[x][y] = Math.min(Math.max(velocityV[x][y], -8.0), 8.0);
+                }
+            }
+            
+            // 3. 半拉格朗日平流 (Advect Tension 和 Velocity)
+            // 平流张力场
+            for(let y = 0; y < SIZE; y++) {
+                for(let x = 0; x < SIZE; x++) {
+                    // 反向追踪
+                    let u = velocityU[x][y];
+                    let v = velocityV[x][y];
+                    let backX = x - u * DT * SIZE / 64.0;  // 缩放因子适配网格
+                    let backY = y - v * DT * SIZE / 64.0;
+                    
+                    // 双线性采样原张力值
+                    let val = sampleTension(backX, backY);
+                    // 如果采样到墙壁(1.0），但原来有液体，需要保持（防止被墙壁吃掉）
+                    if(val > 0.99 && tension[x][y] > 0.1) {
+                        val = tension[x][y];  // 保留原液体
+                    }
+                    newTension[x][y] = val;
+                }
+            }
+            
+            // 平流速度场 (自平流)
+            for(let y = 0; y < SIZE; y++) {
+                for(let x = 0; x < SIZE; x++) {
+                    let u = velocityU[x][y];
+                    let v = velocityV[x][y];
+                    let backX = x - u * DT * SIZE / 64.0;
+                    let backY = y - v * DT * SIZE / 64.0;
+                    
+                    newU[x][y] = sampleVelocityU(backX, backY);
+                    newV[x][y] = sampleVelocityV(backX, backY);
+                }
+            }
+            
+            // 交换缓冲区
+            for(let y = 0; y < SIZE; y++) {
+                for(let x = 0; x < SIZE; x++) {
+                    tension[x][y] = newTension[x][y];
+                    velocityU[x][y] = newU[x][y];
+                    velocityV[x][y] = newV[x][y];
+                }
+            }
+            
+            // 4. 边界处理: 容器壁 (无滑移)
+            for(let y = 0; y < SIZE; y++) {
+                velocityU[0][y] = 0;
+                velocityU[SIZE-1][y] = 0;
+                velocityV[0][y] = 0;
+                velocityV[SIZE-1][y] = 0;
+            }
+            for(let x = 0; x < SIZE; x++) {
+                velocityU[x][0] = 0;
+                velocityU[x][SIZE-1] = 0;
+                velocityV[x][0] = 0;
+                velocityV[x][SIZE-1] = 0;
+            }
+            
+            // 底部边界：禁止向下速度
+            for(let x = 0; x < SIZE; x++) {
+                // 底部：禁止向下速度
+                if(velocityV[x][SIZE-1] > 0) {
+                    velocityV[x][SIZE-1] = 0;
+                }
+            }
+            
+            // 更新 Tile 合并信息
+            updateMergedTiles();
+        }
+        
+        // 采样函数 (双线性插值)
+        function sampleTension(x, y) {
+            // 核心修复：边界外返回固体墙壁（张力=1.0），不让液体流出去
+            if(x < 0) return 1.0;
+            if(x >= SIZE) return 1.0;
+            if(y < 0) return 1.0;
+            if(y >= SIZE) return 1.0;
+            
+            const x1 = Math.floor(x);
+            const y1 = Math.floor(y);
+            const x2 = Math.min(x1 + 1, SIZE - 1);
+            const y2 = Math.min(y1 + 1, SIZE - 1);
+            const fx = x - x1;
+            const fy = y - y1;
+            const v00 = tension[x1][y1];
+            const v10 = tension[x2][y1];
+            const v01 = tension[x1][y2];
+            const v11 = tension[x2][y2];
+            return (1-fx)*(1-fy)*v00 + fx*(1-fy)*v10 + (1-fy)*v01 + fx*fy*v11;
+        }
+        
+        function sampleVelocityU(x, y) {
+            // 边界外返回0（无速度），而不是让速度把液体拉出去
+            if(x < 0 || x >= SIZE || y < 0 || y >= SIZE) return 0;
+            const x1 = Math.floor(x);
+            const y1 = Math.floor(y);
+            const x2 = Math.min(x1 + 1, SIZE - 1);
+            const y2 = Math.min(y1 + 1, SIZE - 1);
+            const fx = x - x1;
+            const fy = y - y1;
+            const v00 = velocityU[x1][y1];
+            const v10 = velocityU[x2][y1];
+            const v01 = velocityU[x1][y2];
+            const v11 = velocityU[x2][y2];
+            return (1-fx)*(1-fy)*v00 + fx*(1-fy)*v10 + (1-fx)*fy*v01 + fx*fy*v11;
+        }
+        
+        function sampleVelocityV(x, y) {
+            // 边界外返回0（无速度）
+            if(x < 0 || x >= SIZE || y < 0 || y >= SIZE) return 0;
+            const x1 = Math.floor(x);
+            const y1 = Math.floor(y);
+            const x2 = Math.min(x1 + 1, SIZE - 1);
+            const y2 = Math.min(y1 + 1, SIZE - 1);
+            const fx = x - x1;
+            const fy = y - y1;
+            const v00 = velocityV[x1][y1];
+            const v10 = velocityV[x2][y1];
+            const v01 = velocityV[x1][y2];
+            const v11 = velocityV[x2][y2];
+            return (1-fx)*(1-fy)*v00 + fx*(1-fy)*v10 + (1-fx)*fy*v01 + fx*fy*v11;
+        }
+        
+        // 渲染粒子生成: 基于液面梯度 (粒子铺满液面，形成可视化)
+        function updateRenderParticles() {
+            renderParticles = [];
+            const step = 2; // 每隔2个体素采样一个粒子
+            
+            for(let y = 0; y < SIZE; y += step) {
+                for(let x = 0; x < SIZE; x += step) {
+                    const grad = computeGradient(x, y);
+                    // 梯度大 = 液面 = 水面, 生成粒子
+                    const isSurface = grad.len > 0.12 && tension[x][y] > 0.1 && tension[x][y] < 0.95;
+                    if(isSurface && renderParticles.length < MAX_PARTICLES) {
+                        // 屏幕坐标
+                        const px = x * CELL_SIZE + CELL_SIZE/2;
+                        const py = y * CELL_SIZE + CELL_SIZE/2;
+                        // 速度用于粒子运动(视觉)
+                        const vx = velocityU[x][y];
+                        const vy = velocityV[x][y];
+                        // 液滴形态: 随机偏移模拟飞溅
+                        const splashOffset = Math.random() * (Math.abs(vx) + Math.abs(vy)) * 1.5;
+                        renderParticles.push({
+                            x: px + (Math.random() - 0.5) * 3,
+                            y: py + (Math.random() - 0.5) * 3,
+                            vx: vx * 1.2,
+                            vy: vy * 1.2,
+                            life: 1.0,
+                            size: 2 + Math.random() * 2
+                        });
+                    }
+                }
+            }
+            
+            // 额外：飞溅区域（孤立的高张力区）生成更多粒子
+            for(let y = 0; y < SIZE; y++) {
+                for(let x = 0; x < SIZE; x++) {
+                    const grad = computeGradient(x, y);
+                    const isSplash = grad.len > 0.35 && tension[x][y] > 0.2 && tension[x][y] < 0.9;
+                    if(isSplash && renderParticles.length < MAX_PARTICLES) {
+                        for(let i=0; i<2; i++) {
+                            const px = x * CELL_SIZE + CELL_SIZE/2;
+                            const py = y * CELL_SIZE + CELL_SIZE/2;
+                            renderParticles.push({
+                                x: px + (Math.random() - 0.5) * 5,
+                                y: py + (Math.random() - 0.5) * 5,
+                                vx: velocityU[x][y] * 1.5 + (Math.random() - 0.5),
+                                vy: velocityV[x][y] * 1.5 - 1.0,
+                                life: 0.7 + Math.random() * 0.5,
+                                size: 1.5 + Math.random() * 2
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        
+        // ---------- 飞溅/扰动: 添加能量到张力素场和速度场 ----------
+        function addSplash(screenX, screenY, radius, forceX, forceY) {
+            const gridX = Math.floor(screenX / CELL_SIZE);
+            const gridY = Math.floor(screenY / CELL_SIZE);
+            const rad = Math.floor(radius / CELL_SIZE);
+            
+            for(let dy = -rad; dy <= rad; dy++) {
+                for(let dx = -rad; dx <= rad; dx++) {
+                    const nx = gridX + dx;
+                    const ny = gridY + dy;
+                    if(nx>=0 && nx<SIZE && ny>=0 && ny<SIZE) {
+                        const dist = Math.sqrt(dx*dx + dy*dy);
+                        const strength = Math.max(0, 1 - dist/rad) * SPLASH_ENERGY;
+                        // 增加速度扰动
+                        velocityU[nx][ny] += forceX * strength * 0.5;
+                        velocityV[nx][ny] += forceY * strength * 0.5;
+                        // 增加张力 (局部液体增多)
+                        tension[nx][ny] = Math.min(1.0, tension[nx][ny] + strength * 0.2);
+                    }
+                }
+            }
+        }
+        
+        // ---------- 绘制容器、张力素场和粒子(可视化) ----------
+        function draw() {
+            ctx.clearRect(0, 0, 512, 512);
+            
+            // 1. 绘制容器背景
+            ctx.fillStyle = '#0a0a1a';
+            ctx.fillRect(0, 0, 512, 512);
+            
+            // 2. 绘制张力素场背景 (半透明表示液体区域)
+            for(let y = 0; y < SIZE; y++) {
+                for(let x = 0; x < SIZE; x++) {
+                    const val = tension[x][y];
+                    if(val > 0.05) {
+                        // 液体区域: 蓝色渐变
+                        const intensity = Math.min(1.0, val * 1.2);
+                        ctx.fillStyle = `rgba(0, 100, 180, ${intensity * 0.5})`;
+                        ctx.fillRect(x * CELL_SIZE, y * CELL_SIZE, CELL_SIZE, CELL_SIZE);
+                    }
+                }
+            }
+            
+            // 3. 绘制渲染粒子 (液面指示器)
+            for(let p of renderParticles) {
+                ctx.beginPath();
+                const brightness = 0.6 + Math.sin(Date.now() * 0.005) * 0.2;
+                ctx.fillStyle = `rgba(80, 200, 255, ${p.life * 0.8})`;
+                ctx.arc(p.x, p.y, p.size * 0.8, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.shadowBlur = 4;
+                ctx.shadowColor = 'rgba(0,200,255,0.5)';
+            }
+            ctx.shadowBlur = 0;
+            
+            // 4. 绘制液面轮廓 (基于梯度)
+            ctx.beginPath();
+            ctx.strokeStyle = '#4ecdc4';
+            ctx.lineWidth = 1.5;
+            for(let y = 1; y < SIZE-1; y++) {
+                for(let x = 1; x < SIZE-1; x++) {
+                    const grad = computeGradient(x, y);
+                    if(grad.len > 0.15 && tension[x][y] > 0.1 && tension[x][y] < 0.9) {
+                        ctx.fillStyle = 'rgba(0, 230, 200, 0.3)';
+                        ctx.fillRect(x * CELL_SIZE, y * CELL_SIZE, CELL_SIZE, CELL_SIZE);
+                    }
+                }
+            }
+            
+            // 5. 绘制容器边框
+            ctx.strokeStyle = '#4ecdc4';
+            ctx.lineWidth = 3;
+            ctx.strokeRect(2, 2, 508, 508);
+            
+            // 6. 绘制速度向量 (调试用，少量)
+            ctx.beginPath();
+            for(let y = 0; y < SIZE; y+=4) {
+                for(let x = 0; x < SIZE; x+=4) {
+                    const vx = velocityU[x][y];
+                    const vy = velocityV[x][y];
+                    const len = Math.sqrt(vx*vx + vy*vy);
+                    if(len > 0.05) {
+                        const cx = x * CELL_SIZE + CELL_SIZE/2;
+                        const cy = y * CELL_SIZE + CELL_SIZE/2;
+                        ctx.beginPath();
+                        ctx.moveTo(cx, cy);
+                        ctx.lineTo(cx + vx * 5, cy + vy * 5);
+                        ctx.strokeStyle = `rgba(255, 200, 100, ${Math.min(0.6, len)})`;
+                        ctx.stroke();
+                    }
+                }
+            }
+        }
+        
+        // ---------- 动画循环 + 物理更新 ----------
+        let lastUpdateTime = 0;
+        function animate(timestamp) {
+            if(!canvas.isConnected) return;
+            
+            // FPS计算
+            frameCount++;
+            if(timestamp - lastTimestamp >= 1000) {
+                currentFPS = frameCount;
+                frameCount = 0;
+                lastTimestamp = timestamp;
+                document.getElementById('fps').innerText = currentFPS;
+            }
+            
+            // 物理步长: 固定时间步长，保证稳定
+            if(!lastUpdateTime) lastUpdateTime = timestamp;
+            let dt = Math.min(0.033, (timestamp - lastUpdateTime) / 1000);
+            if(dt > 0.01) {
+                DT = dt;
+                updatePhysics();      // CLEM 张力素核心物理
+                updateRenderParticles(); // 粒子生成(液面指示器)
+                draw();
+                lastUpdateTime = timestamp;
+            } else {
+                draw();
+            }
+            
+            // 统计信息更新
+            let totalVoxels = 0;
+            for(let i=0; i<mergedTiles.length; i++) totalVoxels += mergedTiles[i].area;
+            document.getElementById('voxelCount').innerText = totalVoxels;
+            document.getElementById('particleCount').innerText = renderParticles.length;
+            
+            let surfaceGradCount = 0;
+            for(let y=0; y<SIZE; y++) {
+                for(let x=0; x<SIZE; x++) {
+                    const g = computeGradient(x, y);
+                    if(g.len > 0.15) surfaceGradCount++;
+                }
+            }
+            document.getElementById('surfaceArea').innerText = surfaceGradCount;
+            
+            animationId = requestAnimationFrame(animate);
+        }
+        
+        // ---------- 事件绑定 (交互飞溅) ----------
+        function handleCanvasEvent(e) {
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            let clientX, clientY;
+            if(e.touches) {
+                clientX = e.touches[0].clientX;
+                clientY = e.touches[0].clientY;
+                e.preventDefault();
+            } else {
+                clientX = e.clientX;
+                clientY = e.clientY;
+            }
+            const canvasX = (clientX - rect.left) * scaleX;
+            const canvasY = (clientY - rect.top) * scaleY;
+            if(canvasX>=0 && canvasX<=512 && canvasY>=0 && canvasY<=512) {
+                const forceX = (canvasX - lastMouseX) * 0.5;
+                const forceY = (canvasY - lastMouseY) * 0.5;
+                addSplash(canvasX, canvasY, 32, forceX, forceY);
+                lastMouseX = canvasX;
+                lastMouseY = canvasY;
+            }
+        }
+        
+        function startDrag(e) {
+            mouseDown = true;
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            let clientX, clientY;
+            if(e.touches) {
+                clientX = e.touches[0].clientX;
+                clientY = e.touches[0].clientY;
+                e.preventDefault();
+            } else {
+                clientX = e.clientX;
+                clientY = e.clientY;
+            }
+            lastMouseX = (clientX - rect.left) * scaleX;
+            lastMouseY = (clientY - rect.top) * scaleY;
+        }
+        
+        function endDrag() {
+            mouseDown = false;
+            lastMouseX = -1;
+            lastMouseY = -1;
+        }
+        
+        function resetSimulation() {
+            initTension();
+            renderParticles = [];
+            updateMergedTiles();
+        }
+        
+        function clearSplash() {
+            // 清除高扰动区域，重置速度
+            for(let y=0; y<SIZE; y++) {
+                for(let x=0; x<SIZE; x++) {
+                    velocityU[x][y] *= 0.2;
+                    velocityV[x][y] *= 0.2;
+                }
+            }
+        }
+        
+        // UI按钮
+        document.getElementById('resetBtn').onclick = resetSimulation;
+        document.getElementById('splashBtn').onclick = () => addSplash(256, 256, 60, 2, -3);
+        document.getElementById('clearBtn').onclick = clearSplash;
+        document.getElementById('gravityToggle').onclick = function() {
+            GRAVITY_ENABLED = !GRAVITY_ENABLED;
+            this.innerText = GRAVITY_ENABLED ? "⚡ 重力: 开启" : "⚡ 重力: 关闭";
+            this.style.background = GRAVITY_ENABLED ? "#e94560" : "#0f3460";
+        };
+        
+        canvas.addEventListener('mousedown', startDrag);
+        window.addEventListener('mouseup', endDrag);
+        window.addEventListener('mousemove', (e) => { if(mouseDown) handleCanvasEvent(e); });
+        canvas.addEventListener('touchstart', startDrag);
+        canvas.addEventListener('touchmove', handleCanvasEvent);
+        canvas.addEventListener('touchend', endDrag);
+        
+        // 启动
+        initTension();
+        updateRenderParticles();
+        lastTimestamp = performance.now();
+        animationId = requestAnimationFrame(animate);
+    })();
+</script>
+</body>
+</html>

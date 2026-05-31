@@ -182,35 +182,39 @@ impl<'a> App<'a> {
         path: &str,
     ) -> (Vec<math::Triangle>, wgpu::TextureView) {
         let (document, buffers, images) = gltf::import(path).expect("加载 GLB 失败");
-        let mut triangles = Vec::new();
+
+        let mut all_positions: Vec<[f32; 3]> = Vec::new();
+        let mut all_indices: Vec<u32> = Vec::new();
+        let mut all_normals: Vec<[f32; 3]> = Vec::new();
+        let mut all_uvs: Vec<[f32; 2]> = Vec::new();
 
         for mesh in document.meshes() {
             for prim in mesh.primitives() {
                 let reader = prim.reader(|b| Some(&buffers[b.index()]));
-                let pos_iter: Vec<[f32;3]> = reader.read_positions().unwrap().collect();
+                let positions: Vec<[f32; 3]> = reader.read_positions().unwrap().collect();
                 let indices: Vec<u32> = reader.read_indices().unwrap().into_u32().collect();
-                let uv_iter: Vec<[f32; 2]> = reader.read_tex_coords(0)
+                let uvs: Vec<[f32; 2]> = reader.read_tex_coords(0)
                     .map(|it| it.into_f32().collect())
-                    .unwrap_or_else(|| vec![[0.0, 0.0]; pos_iter.len()]);
+                    .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
+                let normals: Vec<[f32; 3]> = reader.read_normals()
+                    .map(|it| it.collect())
+                    .unwrap_or_else(|| vec![[0.0, 1.0, 0.0]; positions.len()]);
 
-                for chunk in indices.chunks_exact(3) {
-                    let p0 = pos_iter[chunk[0] as usize];
-                    let p1 = pos_iter[chunk[1] as usize];
-                    let p2 = pos_iter[chunk[2] as usize];
-                    let uv0 = uv_iter[chunk[0] as usize];
-                    let uv1 = uv_iter[chunk[1] as usize];
-                    let uv2 = uv_iter[chunk[2] as usize];
-
-                    triangles.push(math::Triangle {
-                        v0: [p0[0], p0[1], p0[2], 1.0],
-                        v1: [p1[0], p1[1], p1[2], 1.0],
-                        v2: [p2[0], p2[1], p2[2], 1.0],
-                        uv01: [uv0[0], uv0[1], uv1[0], uv1[1]],
-                        uv2: [uv2[0], uv2[1], 0.0, 0.0],
-                    });
-                }
+                let base_idx = all_positions.len() as u32;
+                all_positions.extend(positions);
+                all_indices.extend(indices.iter().map(|&i| base_idx + i));
+                all_uvs.extend(uvs);
+                all_normals.extend(normals);
             }
         }
+
+        let triangles = math::process_glb_to_crem_data(&all_positions, &all_indices, &all_normals, &all_uvs);
+
+        let mut n_count = 0;
+        for t in &triangles {
+            if t.neighbors[0] != u32::MAX { n_count += 1; }
+        }
+        println!("邻居链接成功：{}/{} 的三角形找到了邻居", n_count, triangles.len());
 
         let texture_view = if let Some(image) = images.first() {
             let width = image.width;
@@ -284,34 +288,34 @@ impl<'a> App<'a> {
 
     fn load_glb_triangles_only(path: &str) -> Vec<math::Triangle> {
         let (document, buffers, _) = gltf::import(path).expect("加载 GLB 失败");
-        let mut triangles = Vec::new();
+        let mut all_positions: Vec<[f32; 3]> = Vec::new();
+        let mut all_indices: Vec<u32> = Vec::new();
+        let mut all_uvs: Vec<[f32; 2]> = Vec::new();
+
         for mesh in document.meshes() {
             for prim in mesh.primitives() {
                 let reader = prim.reader(|b| Some(&buffers[b.index()]));
-                let pos_iter: Vec<[f32;3]> = reader.read_positions().unwrap().collect();
+                let positions: Vec<[f32; 3]> = reader.read_positions().unwrap().collect();
                 let indices: Vec<u32> = reader.read_indices().unwrap().into_u32().collect();
-                let uv_iter: Vec<[f32; 2]> = reader.read_tex_coords(0)
+                let uvs: Vec<[f32; 2]> = reader.read_tex_coords(0)
                     .map(|it| it.into_f32().collect())
-                    .unwrap_or_else(|| vec![[0.0, 0.0]; pos_iter.len()]);
+                    .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
 
-                for chunk in indices.chunks_exact(3) {
-                    let p0 = pos_iter[chunk[0] as usize];
-                    let p1 = pos_iter[chunk[1] as usize];
-                    let p2 = pos_iter[chunk[2] as usize];
-                    let uv0 = uv_iter[chunk[0] as usize];
-                    let uv1 = uv_iter[chunk[1] as usize];
-                    let uv2 = uv_iter[chunk[2] as usize];
-
-                    triangles.push(math::Triangle {
-                        v0: [p0[0], p0[1], p0[2], 1.0],
-                        v1: [p1[0], p1[1], p1[2], 1.0],
-                        v2: [p2[0], p2[1], p2[2], 1.0],
-                        uv01: [uv0[0], uv0[1], uv1[0], uv1[1]],
-                        uv2: [uv2[0], uv2[1], 0.0, 0.0],
-                    });
-                }
+                let base_idx = all_positions.len() as u32;
+                all_positions.extend(positions);
+                all_indices.extend(indices.iter().map(|&i| base_idx + i));
+                all_uvs.extend(uvs);
             }
         }
+
+        let mut triangles = math::process_glb_to_crem_data(&all_positions, &all_indices, &[[0.0, 1.0, 0.0]], &all_uvs);
+
+        for tri in triangles.iter_mut() {
+            tri.n0[3] = 0.0;
+            tri.n1[3] = 0.0;
+            tri.n2[3] = 0.0;
+        }
+
         triangles
     }
 
@@ -815,8 +819,8 @@ impl<'a> App<'a> {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
@@ -938,7 +942,7 @@ impl<'a> App<'a> {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
                 depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_compare: wgpu::CompareFunction::Less,
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
@@ -1580,18 +1584,20 @@ impl<'a> App<'a> {
                     };
 
                     // 创建预览实例
+                    let model_mat = glam::Mat4::from_scale_rotation_translation(
+                        scale,
+                        glam::Quat::IDENTITY,
+                        intersect_pos
+                    );
                     let preview_instance = math::InstanceData {
-                        model_matrix: glam::Mat4::from_scale_rotation_translation(
-                            scale,
-                            glam::Quat::IDENTITY,
-                            intersect_pos
-                        ).to_cols_array_2d(),
+                        model_matrix: model_mat.to_cols_array_2d(),
+                        model_matrix_inv: model_mat.inverse().to_cols_array_2d(),
                         model_id,
                         instance_id: 9999, // 标记为预览
                         tri_start,
                         _pad_inner: 0,
                         extra_data: [0.0, 0.0],
-                        _pad: [0; 10],
+                        _pad: [0; 8],
                     };
 
                     // 临时推入显示，下一帧会被 update 覆盖
@@ -1781,14 +1787,16 @@ impl<'a> App<'a> {
                 if t > 0.0 {
                     let pos = ray_o + ray_dir * t;
                     let tri_start = self.model_registry.get(&model_id).map(|m| m.tri_start).unwrap_or(0);
+                    let model_mat = glam::Mat4::from_translation(pos);
                     let preview = math::InstanceData {
-                        model_matrix: glam::Mat4::from_translation(pos).to_cols_array_2d(),
+                        model_matrix: model_mat.to_cols_array_2d(),
+                        model_matrix_inv: model_mat.inverse().to_cols_array_2d(),
                         model_id,
                         instance_id: 9999,
                         tri_start,
                         _pad_inner: 0,
                         extra_data: [0.0, 0.0],
-                        _pad: [0; 10],
+                        _pad: [0; 8],
                     };
                     instances_to_draw.push(preview);
                 }
@@ -1799,14 +1807,16 @@ impl<'a> App<'a> {
         if instances_to_draw.is_empty() {
             instances_to_draw.push(math::InstanceData {
                 model_matrix: glam::Mat4::IDENTITY.to_cols_array_2d(),
+                model_matrix_inv: glam::Mat4::IDENTITY.to_cols_array_2d(),
                 model_id: 0,
                 instance_id: 0,
                 tri_start: 0,
                 _pad_inner: 0,
                 extra_data: [0.0, 0.0],
-                _pad: [0; 10],
+                _pad: [0; 8],
             });
         }
+
         self.queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&instances_to_draw));
 
         let output = self.surface.get_current_texture().unwrap();
@@ -1966,70 +1976,49 @@ impl<'a> App<'a> {
             .add_filter("GLB Files", &["glb"])
             .add_filter("GLTF Files", &["gltf"])
             .pick_file() {
-            
-            // 保存路径供后续烘焙使用
+
             self.scaffold_path = Some(path.to_str().unwrap().to_string());
-            
-            // 加载三角形、顶点和贴图
+
             let (document, buffers, images) = gltf::import(&path).unwrap();
-            
-            let mut triangles = Vec::new();
-            let mut scaffold_vertices = Vec::new(); // 存储顶点位置和法线
-            
+
+            let mut all_positions: Vec<[f32; 3]> = Vec::new();
+            let mut all_indices: Vec<u32> = Vec::new();
+            let mut all_normals: Vec<[f32; 3]> = Vec::new();
+            let mut all_uvs: Vec<[f32; 2]> = Vec::new();
+            let mut scaffold_vertices = Vec::new();
+
             for mesh in document.meshes() {
                 for prim in mesh.primitives() {
                     let reader = prim.reader(|b| Some(&buffers[b.index()]));
-                    
-                    let pos_iter: Vec<[f32;3]> = reader.read_positions().unwrap().collect();
+
+                    let positions: Vec<[f32; 3]> = reader.read_positions().unwrap().collect();
                     let indices: Vec<u32> = reader.read_indices().unwrap().into_u32().collect();
-                    
-                    // 读取 UV 坐标（如果存在）
-                    let uv_iter: Vec<[f32; 2]> = reader.read_tex_coords(0)
+
+                    let uvs: Vec<[f32; 2]> = reader.read_tex_coords(0)
                         .map(|it| it.into_f32().collect())
-                        .unwrap_or_else(|| vec![[0.0, 0.0]; pos_iter.len()]);
-                    
-                    // 读取法线（如果存在，不存在则计算）
-                    let normal_iter: Vec<[f32; 3]> = reader.read_normals()
+                        .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
+
+                    let normals: Vec<[f32; 3]> = reader.read_normals()
                         .map(|it| it.collect())
-                        .unwrap_or_else(|| vec![[0.0, 1.0, 0.0]; pos_iter.len()]);
-                    
-                    for chunk in indices.chunks_exact(3) {
-                        let i0 = chunk[0] as usize;
-                        let i1 = chunk[1] as usize;
-                        let i2 = chunk[2] as usize;
-                        
-                        let p0 = pos_iter[i0];
-                        let p1 = pos_iter[i1];
-                        let p2 = pos_iter[i2];
-                        
-                        let uv0 = uv_iter[i0];
-                        let uv1 = uv_iter[i1];
-                        let uv2 = uv_iter[i2];
-                        
-                        triangles.push(math::Triangle {
-                            v0: [p0[0], p0[1], p0[2], 1.0],
-                            v1: [p1[0], p1[1], p1[2], 1.0],
-                            v2: [p2[0], p2[1], p2[2], 1.0],
-                            uv01: [uv0[0], uv0[1], uv1[0], uv1[1]],
-                            uv2: [uv2[0], uv2[1], 0.0, 0.0],
-                        });
-                    }
-                    
-                    // 收集所有顶点（位置 + 法线）用于点云显示
-                    // 格式：[pos.x, pos.y, pos.z, packed_normal]
-                    for (i, p) in pos_iter.iter().enumerate() {
-                        let n = normal_iter[i];
-                        // 将法线打包到 w 分量：将 [-1,1] 映射到 [0,1] 然后乘以 255 转为整数
-                        let packed_normal = ((n[0] * 0.5 + 0.5) * 65535.0).round() as u16;
-                        let packed_normal_high = ((n[1] * 0.5 + 0.5) * 65535.0).round() as u16;
-                        // 简单处理：只存储 x 分量用于背面剔除判断
+                        .unwrap_or_else(|| vec![[0.0, 1.0, 0.0]; positions.len()]);
+
+                    for (i, p) in positions.iter().enumerate() {
+                        let n = normals[i];
                         let packed = ((n[0] * 0.5 + 0.5) * 255.0).round() as f32 / 255.0;
                         scaffold_vertices.push(glam::Vec4::new(p[0], p[1], p[2], packed));
                     }
+
+                    let base_idx = all_positions.len() as u32;
+                    all_positions.extend(positions);
+                    all_indices.extend(indices.iter().map(|&i| base_idx + i));
+                    all_uvs.extend(uvs);
+                    all_normals.extend(normals);
                 }
             }
-            
-            self.scaffold_vertices.clear(); // 保持向后兼容，不再使用
+
+            let triangles = math::process_glb_to_crem_data(&all_positions, &all_indices, &all_normals, &all_uvs);
+
+            self.scaffold_vertices.clear();
             self.triangles = triangles;
             
             println!("三角形: {}, 顶点数: {}", 
@@ -2227,12 +2216,13 @@ impl<'a> App<'a> {
             let tri_start = self.model_registry.get(&0).map(|m| m.tri_start).unwrap_or(0);
             let first_instance = math::InstanceData {
                 model_matrix: glam::Mat4::IDENTITY.to_cols_array_2d(),
+                model_matrix_inv: glam::Mat4::IDENTITY.to_cols_array_2d(),
                 model_id: 0,
                 instance_id: 0,
                 tri_start,
                 _pad_inner: 0,
                 extra_data: [0.0, 0.0],
-                _pad: [0; 10],
+                _pad: [0; 8],
             };
             self.instances.clear();
             self.instances.push(first_instance);
@@ -2354,19 +2344,21 @@ fn main() {
                                         
                                         if let Some(model_info) = app.model_registry.get(&model_id) {
                                             let scale = model_info.info.default_scale;
+                                            let model_mat = glam::Mat4::from_scale_rotation_translation(
+                                                glam::Vec3::from_slice(&scale),
+                                                glam::Quat::IDENTITY,
+                                                intersect_pos
+                                            );
                                             
                                             let new_instance = math::InstanceData {
-                                                model_matrix: glam::Mat4::from_scale_rotation_translation(
-                                                    glam::Vec3::from_slice(&scale),
-                                                    glam::Quat::IDENTITY,
-                                                    intersect_pos
-                                                ).to_cols_array_2d(),
+                                                model_matrix: model_mat.to_cols_array_2d(),
+                                                model_matrix_inv: model_mat.inverse().to_cols_array_2d(),
                                                 model_id,
                                                 instance_id: app.instances.len() as u32,
                                                 tri_start: model_info.tri_start,
                                                 _pad_inner: 0,
                                                 extra_data: [0.0, 0.0],
-                                                _pad: [0; 10],
+                                                _pad: [0; 8],
                                             };
                                             
                                             app.instances.push(new_instance);

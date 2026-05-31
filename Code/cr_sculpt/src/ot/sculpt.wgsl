@@ -1,19 +1,26 @@
+const INFLATION: f32 = 0.3;
+
 struct Triangle {
     v0: vec4<f32>,
     v1: vec4<f32>,
     v2: vec4<f32>,
-    uv01: vec4<f32>, // [u0, v0, u1, v1]
-    uv2: vec4<f32>,  // [u2, v2, 0.0, 0.0] - 保持对齐
+    n0: vec4<f32>,
+    n1: vec4<f32>,
+    n2: vec4<f32>,
+    uv01: vec4<f32>,
+    uv2: vec4<f32>,
+    neighbors: vec4<u32>,
 };
 
 struct InstanceData {
     model_matrix: mat4x4<f32>,
+    model_matrix_inv: mat4x4<f32>,
     model_id: u32,
     instance_id: u32,
     tri_start: u32,
     _pad_inner: u32,
     extra_data: vec2<f32>,
-    _pad: array<vec4<u32>, 2>,
+    _pad: array<u32, 10>,
 };
 
 struct Params {
@@ -101,29 +108,21 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let size_u = textureDimensions(output_texture);
     if (any(id.xy >= size_u)) { return; }
 
-    let tri_id = textureLoad(tri_id_tex, screen_coord, 0).r;
-    
-    // 只有背景才画网格
-    if (tri_id == 0u) {
-        let screen_pos = vec2<f32>(id.xy);
-        let uv = (screen_pos / vec2<f32>(size_u)) * 2.0 - 1.0;
-        let ray_target = params.proj_inv * vec4<f32>(uv.x, -uv.y, 1.0, 1.0);
-        let ray_dir = normalize((params.view_inv * vec4<f32>(normalize(ray_target.xyz / ray_target.w), 0.0)).xyz);
-        let ray_o = params.cam_pos.xyz;
+    let screen_pos = vec2<f32>(id.xy);
+    let uv = (screen_pos / vec2<f32>(size_u)) * 2.0 - 1.0;
+    let ray_target = params.proj_inv * vec4<f32>(uv.x, -uv.y, 1.0, 1.0);
+    let ray_dir = normalize((params.view_inv * vec4<f32>(normalize(ray_target.xyz / ray_target.w), 0.0)).xyz);
+    let ray_o = params.cam_pos.xyz;
 
-        var bg_col = vec3<f32>(0.1, 0.1, 0.12);
-        let t_grid = -ray_o.y / (ray_dir.y + 0.00001);
-        if (t_grid > 0.0 && t_grid < 100.0) {
-            let p = ray_o + ray_dir * t_grid;
-            let grid_uv = abs(fract(p.xz - 0.5) - 0.5);
-            let grid = smoothstep(0.02, 0.0, grid_uv.x) + smoothstep(0.02, 0.0, grid_uv.y);
-            bg_col = mix(bg_col, vec3<f32>(0.2, 0.2, 0.25), grid * 0.5);
-        }
-        textureStore(output_texture, screen_coord, vec4<f32>(bg_col, 1.0));
-    } else {
-        // 物体区域留空，交给 fs_mesh 画
-        textureStore(output_texture, screen_coord, vec4<f32>(0.0, 0.0, 0.0, 0.0));
+    var bg_col = vec3<f32>(0.1, 0.1, 0.12);
+    let t_grid = -ray_o.y / (ray_dir.y + 0.00001);
+    if (t_grid > 0.0 && t_grid < 100.0) {
+        let p = ray_o + ray_dir * t_grid;
+        let grid_uv = abs(fract(p.xz - 0.5) - 0.5);
+        let grid = smoothstep(0.02, 0.0, grid_uv.x) + smoothstep(0.02, 0.0, grid_uv.y);
+        bg_col = mix(bg_col, vec3<f32>(0.2, 0.2, 0.25), grid * 0.5);
     }
+    textureStore(output_texture, screen_coord, vec4<f32>(bg_col, 1.0));
 }
 
 // --- 展示管线 (Blit) ---
@@ -204,23 +203,26 @@ fn vs_depth(
     let tri = triangles[tri_idx];
     var p_local: vec3<f32>;
     var uv: vec2<f32>;
+    var vertex_normal: vec3<f32>;
 
     if (local_idx == 0u) {
-        p_local = tri.v0.xyz; uv = tri.uv01.xy;
+        p_local = tri.v0.xyz; uv = tri.uv01.xy; vertex_normal = tri.n0.xyz;
     } else if (local_idx == 1u) {
-        p_local = tri.v1.xyz; uv = tri.uv01.zw;
+        p_local = tri.v1.xyz; uv = tri.uv01.zw; vertex_normal = tri.n1.xyz;
     } else {
-        p_local = tri.v2.xyz; uv = tri.uv2.xy;
+        p_local = tri.v2.xyz; uv = tri.uv2.xy; vertex_normal = tri.n2.xyz;
     }
 
-    let world_pos = instance.model_matrix * vec4<f32>(p_local, 1.0);
+    let inflated_p = p_local + vertex_normal * INFLATION;
+
+    let world_pos = instance.model_matrix * vec4<f32>(inflated_p, 1.0);
     let clip_pos = params.prev_view_proj * world_pos;
 
     var out: DepthVertexOutput;
     out.position = clip_pos;
     out.triangle_id = tri_idx;
     out.uv = uv;
-    out.instance_id = instance_index; // 传入实例索引
+    out.instance_id = instance_index;
     return out;
 }
 
@@ -267,21 +269,20 @@ fn vs_mesh(
     @builtin(instance_index) i_idx: u32
 ) -> MeshVertexOutput {
     let instance = instances[i_idx];
-    let tri_idx = instance.tri_start + v_idx / 3u;
+    let tri_idx = v_idx / 3u;
     let local_idx = v_idx % 3u;
     let tri = triangles[tri_idx];
 
-    var p: vec3<f32>; var uv: vec2<f32>;
-    if (local_idx == 0u) { p = tri.v0.xyz; uv = tri.uv01.xy; }
-    else if (local_idx == 1u) { p = tri.v1.xyz; uv = tri.uv01.zw; }
-    else { p = tri.v2.xyz; uv = tri.uv2.xy; }
+    var p: vec3<f32>; var uv: vec2<f32>; var vertex_normal: vec3<f32>;
+    if (local_idx == 0u) { p = tri.v0.xyz; uv = tri.uv01.xy; vertex_normal = tri.n0.xyz; }
+    else if (local_idx == 1u) { p = tri.v1.xyz; uv = tri.uv01.zw; vertex_normal = tri.n1.xyz; }
+    else { p = tri.v2.xyz; uv = tri.uv2.xy; vertex_normal = tri.n2.xyz; }
 
-    let world_pos = (instance.model_matrix * vec4<f32>(p, 1.0)).xyz;
-    
-    // 计算法线
-    let e1 = tri.v1.xyz - tri.v0.xyz;
-    let e2 = tri.v2.xyz - tri.v0.xyz;
-    let normal = normalize((instance.model_matrix * vec4<f32>(cross(e1, e2), 0.0)).xyz);
+    let inflated_p = p + vertex_normal * INFLATION;
+
+    let world_pos = (instance.model_matrix * vec4<f32>(inflated_p, 1.0)).xyz;
+
+    let normal = normalize((instance.model_matrix * vec4<f32>(vertex_normal, 0.0)).xyz);
 
     var out: MeshVertexOutput;
     out.position = params.prev_view_proj * vec4<f32>(world_pos, 1.0);
@@ -297,65 +298,194 @@ fn vs_mesh(
 @group(1) @binding(0) var t_material: texture_2d<f32>;
 @group(1) @binding(1) var s_material: sampler;
 
-@fragment
-fn fs_mesh(in: MeshVertexOutput) -> @location(0) vec4<f32> {
-    // 1. 直接使用从顶点着色器传来的全局三角形索引
-    let tri = triangles[in.global_tri_idx];
-    
-    // 将顶点变换到世界空间（与 vs_mesh 一致）
-    let instance = instances[in.instance_id];
-    let v0 = (instance.model_matrix * tri.v0).xyz;
-    let v1 = (instance.model_matrix * tri.v1).xyz;
-    let v2 = (instance.model_matrix * tri.v2).xyz;
+fn apply_distortion(p: vec3<f32>) -> vec3<f32> {
+    let offset = vec3<f32>(
+        sin(p.y * 10.0 + params.time * 2.0) * 0.05,
+        0.0,
+        cos(p.y * 10.0 + params.time * 2.0) * 0.05
+    );
+    return p + offset;
+}
 
-    // 2. 射线设置
-    let ray_o = params.cam_pos.xyz;
-    let view_dir = normalize(in.world_pos - ray_o);
-    
-    // 精准起跳：从光栅化位置往回退一点，开始真正的数学步进
-    var t = distance(ray_o, in.world_pos) - 0.01;
-    var hit = false;
-    var p = vec3<f32>(0.0);
+fn smin(d1: f32, d2: f32, k: f32) -> f32 {
+    let h = clamp(0.5 + 0.5 * (d2 - d1) / k, 0.0, 1.0);
+    return mix(d2, d1, h) - k * h * (1.0 - h);
+}
 
-    // 3. 真正的数学步进
-    for (var i = 0u; i < 12u; i++) {
-        p = ray_o + view_dir * t;
-        let d = udTriangle(p, v0, v1, v2) - 0.005;
-        
-        if (d < 0.0001) {
-            hit = true;
-            break;
+fn inverse_warp(p: vec3<f32>) -> vec3<f32> {
+    let distortion = sin(p.y * 15.0 + params.time * 3.0) * 0.05;
+    return p - vec3<f32>(distortion, 0.0, 0.0);
+}
+
+fn get_local_sdf(
+    p_local: vec3<f32>,
+    tri_idx: u32
+) -> f32
+{
+    let p = p_local;
+
+    var d = 1e9;
+
+    let tri = triangles[tri_idx];
+
+    d = min(
+        d,
+        udTriangle(
+            p,
+            tri.v0.xyz,
+            tri.v1.xyz,
+            tri.v2.xyz
+        )
+    );
+
+    for(var i=0u;i<3u;i++)
+    {
+        let nid = tri.neighbors[i];
+
+        if(nid!=0xFFFFFFFFu)
+        {
+            let nt = triangles[nid];
+
+            d = min(
+                d,
+                udTriangle(
+                    p,
+                    nt.v0.xyz,
+                    nt.v1.xyz,
+                    nt.v2.xyz
+                )
+            );
+
+            for(var j=0u;j<3u;j++)
+            {
+                let nid2 = nt.neighbors[j];
+
+                if(
+                    nid2!=0xFFFFFFFFu &&
+                    nid2!=tri_idx
+                )
+                {
+                    let nt2 = triangles[nid2];
+
+                    d = min(
+                        d,
+                        udTriangle(
+                            p,
+                            nt2.v0.xyz,
+                            nt2.v1.xyz,
+                            nt2.v2.xyz
+                        )
+                    );
+                }
+            }
         }
-        t += d;
     }
 
-    if (!hit) { discard; }
+    let distortion =
+        sin(p.y*15.0 + params.time*3.0)
+        *0.05;
 
-    // 4. 计算 SDF 梯度法线
-    let n = get_sdf_normal_fine(p, v0, v1, v2);
+    return d - 0.01 - abs(distortion);
+}
 
-    // 5. 材质与渲染
-    let tex_color = textureSample(t_material, s_material, in.uv).rgb;
+fn get_barycentric_uv(p: vec3<f32>, tri: Triangle) -> vec2<f32> {
+    let v0 = tri.v0.xyz;
+    let v1 = tri.v1.xyz;
+    let v2 = tri.v2.xyz;
+
+    let uv0 = tri.uv01.xy;
+    let uv1 = tri.uv01.zw;
+    let uv2 = tri.uv2.xy;
+
+    let v10 = v1 - v0;
+    let v20 = v2 - v0;
+    let vp0 = p - v0;
+
+    let d00 = dot(v10, v10);
+    let d01 = dot(v10, v20);
+    let d11 = dot(v20, v20);
+    let d20 = dot(vp0, v10);
+    let d21 = dot(vp0, v20);
+    let denom = d00 * d11 - d01 * d01;
+
+    if (abs(denom) < 1e-6) { return uv0; }
+
+    let v = (d11 * d20 - d01 * d21) / denom;
+    let w = (d00 * d21 - d01 * d20) / denom;
+    let u = 1.0 - v - w;
+
+    return uv0 * u + uv1 * v + uv2 * w;
+}
+
+struct FragmentOutput {
+    @location(0) color: vec4<f32>,
+    @builtin(frag_depth) depth: f32,
+};
+
+@fragment
+fn fs_mesh(in: MeshVertexOutput) -> FragmentOutput {
+    let instance = instances[in.instance_id];
+    let ray_o_world = params.cam_pos.xyz;
+    let view_dir_world = normalize(in.world_pos - ray_o_world);
+
+    let inv_model = instance.model_matrix_inv;
+    let ray_o = (inv_model * vec4<f32>(ray_o_world, 1.0)).xyz;
+    let ray_dir = normalize((inv_model * vec4<f32>(view_dir_world, 0.0)).xyz);
+
+    let local_hit_pos = (inv_model * vec4<f32>(in.world_pos, 1.0)).xyz;
+    var t = 0.0;
+
+    var hit = false;
+    var p: vec3<f32>;
+
+    for (var i = 0u; i < 256u; i++) {
+        p = ray_o + ray_dir * t;
+        let d = get_local_sdf(p, in.global_tri_idx);
+
+        if (d < 0.0005) { hit = true; break; }
+
+        t += max(d,0.0005);
+
+        if (t > 20.0) { break; }
+    }
+
+    if (!hit)
+    {
+        discard;
+    }
+
+    let h = 0.01;
+    let k = vec2<f32>(1.0, -1.0);
+    let n_local = normalize(
+        k.xyy * get_local_sdf(p + k.xyy * h, in.global_tri_idx) +
+        k.yyx * get_local_sdf(p + k.yyx * h, in.global_tri_idx) +
+        k.yxy * get_local_sdf(p + k.yxy * h, in.global_tri_idx) +
+        k.xxx * get_local_sdf(p + k.xxx * h, in.global_tri_idx)
+    );
+    let n = normalize((instance.model_matrix * vec4<f32>(n_local, 0.0)).xyz);
+
+    let tri = triangles[in.global_tri_idx];
+    var real_uv = get_barycentric_uv(p, tri);
+
+    let tex_color = textureSample(t_material, s_material, real_uv).rgb;
+
     let L = normalize(vec3<f32>(0.5, 1.0, 0.5));
     let diff = max(dot(n, L), 0.0) * 0.8 + 0.2;
-    
     var final_col = tex_color * diff;
+
     if (in.instance_id == params.selected_instance_id) {
         final_col = mix(final_col, vec3<f32>(1.0, 0.5, 0.0), 0.4);
     }
 
-    return vec4<f32>(pow(final_col, vec3<f32>(1.0 / 2.2)), 1.0);
+    let world_pos = instance.model_matrix * vec4<f32>(p, 1.0);
+    let clip_pos = params.prev_view_proj * world_pos;
+    let ndc_depth = clip_pos.z / clip_pos.w;
+
+    var out: FragmentOutput;
+    out.color = vec4<f32>(pow(final_col, vec3<f32>(1.0 / 2.2)), 1.0);
+    out.depth = ndc_depth;
+
+    return out;
 }
 
-// 辅助函数：通过 SDF 梯度计算完美法线
-fn get_sdf_normal_fine(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, c: vec3<f32>) -> vec3<f32> {
-    let h = 0.0001;
-    let k = vec2<f32>(1.0, -1.0);
-    return normalize(
-        k.xyy * (udTriangle(p + k.xyy * h, a, b, c)) +
-        k.yyx * (udTriangle(p + k.yyx * h, a, b, c)) +
-        k.yxy * (udTriangle(p + k.yxy * h, a, b, c)) +
-        k.xxx * (udTriangle(p + k.xxx * h, a, b, c))
-    );
-}
 // ============================================================

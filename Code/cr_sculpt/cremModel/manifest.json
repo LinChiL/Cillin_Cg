@@ -1,0 +1,46 @@
+{
+  "models": [
+    {
+      "id": 0,
+      "name": "ComeCube",
+      "file": "ComeCube.glb",
+      "tags": ["ComeCube", "test"],
+      "default_scale": [1.0, 1.0, 1.0]
+    },
+    {
+      "id": 1,
+      "name": "tree",
+      "file": "Tree.glb",
+      "tags": ["tree", "nature"],
+      "default_scale": [1.0, 1.0, 1.0]
+    },
+    {
+      "id": 2,
+      "name": "rock",
+      "file": "rock.glb",
+      "tags": ["rock", "nature"],
+      "default_scale": [0.8, 0.8, 0.8]
+    },
+    {
+      "id": 3,
+      "name": "flower",
+      "file": "flower.glb",
+      "tags": ["flower", "nature"],
+      "default_scale": [1.0, 1.0, 1.0]
+    },
+    {
+      "id": 4,
+      "name": "ComeSphere",
+      "file": "ComeSphere.glb",
+      "tags": ["ComeSphere", "test"],
+      "default_scale": [1.0, 1.0, 1.0]
+    },
+    {
+      "id": 5,
+      "name": "smilesphere",
+      "file": "smilesphere.glb",
+      "tags": ["smilesphere", "test"],
+      "default_scale": [1.0, 1.0, 1.0]
+    }
+  ]
+}
