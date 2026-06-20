@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use glam::{Vec3, Vec4, Vec3Swizzles, Vec4Swizzles};
@@ -6,13 +7,210 @@ use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::EventLoop;
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::Window;
 
 use gltf;
 use rfd;
 
+#[derive(Hash, Copy, Clone, PartialEq, Eq)]
+struct VertexKey {
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+impl VertexKey {
+    fn from_pos(p: [f32; 3]) -> Self {
+        Self {
+            x: (p[0] * 1000.0) as i32,
+            y: (p[1] * 1000.0) as i32,
+            z: (p[2] * 1000.0) as i32,
+        }
+    }
+}
+
+// ===== 性能监控 =====
+#[derive(Clone)]
+struct PerfStats {
+    frame_time_ms: f32,
+    fps: f32,
+    // 各 pass 耗时 (ms)
+    depth_pass_ms: f32,
+    compute_pass_ms: f32,
+    ap3_pass_ms: f32,
+    draw_pass_ms: f32,
+    scaffold_pass_ms: f32,
+    ui_pass_ms: f32,
+    // 非渲染开销 (ms)
+    egui_build_ms: f32,       // begin_frame + end_frame + tessellate
+    buffer_upload_ms: f32,    // write_buffer 调用
+    surface_acquire_ms: f32,  // get_current_texture (含 vsync 等待)
+    submit_present_ms: f32,   // submit + present
+    // GPU 时间 (ms) - 来自 Timestamp Query
+    gpu_depth_ms: f32,
+    gpu_compute_ms: f32,
+    gpu_ap3_ms: f32,
+    gpu_draw_ms: f32,
+    gpu_scaffold_ms: f32,
+    gpu_total_ms: f32,
+    // Draw calls
+    depth_draw_calls: u32,
+    forward_draw_calls: u32,
+    draw_draw_calls: u32,
+    scaffold_draw_calls: u32,
+    // 几何体
+    total_triangles: u32,
+    rendered_triangles: u32,
+    instance_count: u32,
+    // 内存 (bytes)
+    triangle_buffer_size: u64,
+    instance_buffer_size: u64,
+    // 历史采样 (用于绘制曲线)
+    frame_history: Vec<f32>,
+    max_history: usize,
+}
+
+impl PerfStats {
+    fn new() -> Self {
+        Self {
+            frame_time_ms: 0.0,
+            fps: 0.0,
+            depth_pass_ms: 0.0,
+            compute_pass_ms: 0.0,
+            ap3_pass_ms: 0.0,
+            draw_pass_ms: 0.0,
+            scaffold_pass_ms: 0.0,
+            ui_pass_ms: 0.0,
+            egui_build_ms: 0.0,
+            buffer_upload_ms: 0.0,
+            surface_acquire_ms: 0.0,
+            submit_present_ms: 0.0,
+            gpu_depth_ms: 0.0,
+            gpu_compute_ms: 0.0,
+            gpu_ap3_ms: 0.0,
+            gpu_draw_ms: 0.0,
+            gpu_scaffold_ms: 0.0,
+            gpu_total_ms: 0.0,
+            depth_draw_calls: 0,
+            forward_draw_calls: 0,
+            draw_draw_calls: 0,
+            scaffold_draw_calls: 0,
+            total_triangles: 0,
+            rendered_triangles: 0,
+            instance_count: 0,
+            triangle_buffer_size: 0,
+            instance_buffer_size: 0,
+            frame_history: Vec::new(),
+            max_history: 120,
+        }
+    }
+
+    fn push_frame(&mut self, frame_time_ms: f32) {
+        self.frame_history.push(frame_time_ms);
+        if self.frame_history.len() > self.max_history {
+            self.frame_history.remove(0);
+        }
+    }
+}
+
+fn compute_smoothed_triangles(
+    positions: &[[f32; 3]],
+    indices: &[u32],
+    uvs: &[[f32; 2]],
+    threshold_deg: f32,
+) -> (Vec<math::Triangle>, usize) {
+    let threshold_cos = threshold_deg.to_radians().cos();
+    let mut tris = Vec::new();
+
+    let mut face_normals = Vec::new();
+    for chunk in indices.chunks_exact(3) {
+        let p0 = Vec3::from_slice(&positions[chunk[0] as usize]);
+        let p1 = Vec3::from_slice(&positions[chunk[1] as usize]);
+        let p2 = Vec3::from_slice(&positions[chunk[2] as usize]);
+        let n = if (p1 - p0).cross(p2 - p0).length_squared() > 0.0001 {
+            (p1 - p0).cross(p2 - p0).normalize()
+        } else {
+            Vec3::Y
+        };
+        face_normals.push(n);
+    }
+
+    let mut pos_to_faces: HashMap<VertexKey, Vec<usize>> = HashMap::new();
+    for (face_idx, chunk) in indices.chunks_exact(3).enumerate() {
+        for &v_idx in chunk {
+            let p = positions[v_idx as usize];
+            let key = VertexKey::from_pos(p);
+            pos_to_faces.entry(key).or_default().push(face_idx);
+        }
+    }
+    
+    let unique_vertex_count = pos_to_faces.len();
+
+    for (face_idx, chunk) in indices.chunks_exact(3).enumerate() {
+        let current_face_normal = face_normals[face_idx];
+        let mut vertex_smoothed_normals = [Vec3::ZERO; 3];
+        let mut vertex_warp_normals = [Vec3::ZERO; 3];
+
+        for i in 0..3 {
+            let v_idx = chunk[i] as usize;
+            let p = positions[v_idx];
+            let key = VertexKey::from_pos(p);
+
+            let mut visual_sum_n = Vec3::ZERO;
+            let mut warp_sum_n = Vec3::ZERO;
+            if let Some(adjacent_faces) = pos_to_faces.get(&key) {
+                for &adj_face_idx in adjacent_faces {
+                    let adj_normal = face_normals[adj_face_idx];
+                    if current_face_normal.dot(adj_normal) >= threshold_cos {
+                        visual_sum_n += adj_normal;
+                    }
+                    warp_sum_n += adj_normal;
+                }
+            }
+            vertex_smoothed_normals[i] = if visual_sum_n.length_squared() > 0.0001 {
+                visual_sum_n.normalize()
+            } else {
+                current_face_normal
+            };
+            vertex_warp_normals[i] = if warp_sum_n.length_squared() > 0.0001 {
+                warp_sum_n.normalize()
+            } else {
+                vertex_smoothed_normals[i]
+            };
+        }
+
+        let p0 = positions[chunk[0] as usize];
+        let p1 = positions[chunk[1] as usize];
+        let p2 = positions[chunk[2] as usize];
+        let uv0 = uvs[chunk[0] as usize];
+        let uv1 = uvs[chunk[1] as usize];
+        let uv2 = uvs[chunk[2] as usize];
+
+        tris.push(math::Triangle {
+            v0: [p0[0], p0[1], p0[2], 1.0],
+            v1: [p1[0], p1[1], p1[2], 1.0],
+            v2: [p2[0], p2[1], p2[2], 1.0],
+            n0: vertex_smoothed_normals[0].extend(0.0).to_array(),
+            n1: vertex_smoothed_normals[1].extend(0.0).to_array(),
+            n2: vertex_smoothed_normals[2].extend(0.0).to_array(),
+            warp_n0: vertex_warp_normals[0].extend(0.0).to_array(),
+            warp_n1: vertex_warp_normals[1].extend(0.0).to_array(),
+            warp_n2: vertex_warp_normals[2].extend(0.0).to_array(),
+            uv01: [uv0[0], uv0[1], uv1[0], uv1[1]],
+            uv2: [uv2[0], uv2[1], 0.0, 0.0],
+        });
+    }
+
+    (tris, unique_vertex_count)
+}
+
 mod math;
 use math::{Params, MeshSample, Triangle};
+
+fn pixel_buffer_size<T>(width: u32, height: u32) -> u64 {
+    (width as u64) * (height as u64) * (std::mem::size_of::<T>() as u64)
+}
 
 // 编辑模式枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +277,10 @@ struct App<'a> {
     tri_id_texture: wgpu::Texture,
     tri_id_texture_view: wgpu::TextureView,
     tri_id_texture_view_for_render: wgpu::TextureView,
+    warp_buffer: wgpu::Buffer,
+    sdf_buffer: wgpu::Buffer,
+    ap2_pipeline: wgpu::ComputePipeline,
+    ap3_pipeline: wgpu::ComputePipeline,
     depth_bind_group_layout: wgpu::BindGroupLayout,
     depth_bind_group: wgpu::BindGroup,
     depth_render_pipeline: wgpu::RenderPipeline,
@@ -86,16 +288,43 @@ struct App<'a> {
     depth_blit_bind_group: wgpu::BindGroup,
     show_depth_debug: bool,
     show_normal_debug: bool,
+    show_perf_monitor: bool,
+    perf_stats: PerfStats,
+    debug_mode: u32,
     
-    // UV G-Buffer
+    // UV G-Buffer (存世界坐标)
     uv_texture: wgpu::Texture,
     uv_texture_view: wgpu::TextureView,
     uv_texture_view_for_render: wgpu::TextureView,
     
-    // Albedo 贴图
+    // 模型 UV 纹理 (存模型的 UV 坐标)
+    model_uv_texture: wgpu::Texture,
+    model_uv_texture_view: wgpu::TextureView,
+    model_uv_texture_view_for_render: wgpu::TextureView,
+
+    // 世界法线纹理
+    normal_texture: wgpu::Texture,
+    normal_texture_view: wgpu::TextureView,
+    normal_texture_view_for_render: wgpu::TextureView,
+
+    // 扭曲后世界位置纹理
+    warped_pos_texture: wgpu::Texture,
+    warped_pos_texture_view: wgpu::TextureView,
+    warped_pos_texture_view_for_render: wgpu::TextureView,
+
+    // Albedo 贴图（Atlas）
     albedo_texture: wgpu::Texture,
     albedo_texture_view: wgpu::TextureView,
     albedo_sampler: wgpu::Sampler,
+    atlas_width: u32,
+    atlas_height: u32,
+    atlas_cursor_x: u32,
+    atlas_cursor_y: u32,
+    atlas_row_height: u32,
+    // GPU Timestamp Query
+    ts_query_set: wgpu::QuerySet,
+    ts_resolve_buffer: wgpu::Buffer,
+    ts_staging_buffer: wgpu::Buffer,
 
     // 模型库管理
     model_registry: std::collections::HashMap<u32, math::ModelRegistryItem>,
@@ -130,23 +359,117 @@ impl<'a> App<'a> {
         std::collections::HashMap<u32, math::ModelRegistryItem>,
         std::collections::HashMap<u32, wgpu::BindGroup>,
         Vec<math::Triangle>,
+        wgpu::Texture,
+        wgpu::TextureView,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
     ) {
         let manifest_path = "cremModel/manifest.json";
         let manifest_str = std::fs::read_to_string(manifest_path).expect("无法读取 manifest.json");
         let manifest: math::ModelManifest = serde_json::from_str(&manifest_str).expect("解析 JSON 失败");
 
+        const MAX_ATLAS_WIDTH: u32 = 8192;
+
+        let mut loaded_models = Vec::new();
+        // Shelf-packing 预计算布局
+        let mut atlas_width: u32 = 0;
+        let mut atlas_height: u32 = 0;
+        let mut model_positions: Vec<(u32, u32)> = Vec::new(); // (x, y) 在 atlas 中的位置
+        {
+            let mut cx: u32 = 0;
+            let mut cy: u32 = 0;
+            let mut row_h: u32 = 0;
+            for item in &manifest.models {
+                let file_path = format!("cremModel/{}", item.file);
+                println!("正在预加载模型: {}", file_path);
+                let (tris, rgba_pixels, width, height, material_color) = Self::load_glb_for_atlas(&file_path);
+                let w = width.max(1);
+                let h = height.max(1);
+                // 如果当前行放不下，换行
+                if cx + w > MAX_ATLAS_WIDTH {
+                    cx = 0;
+                    cy += row_h;
+                    row_h = 0;
+                }
+                model_positions.push((cx, cy));
+                cx += w;
+                row_h = row_h.max(h);
+                atlas_width = atlas_width.max(cx);
+                atlas_height = atlas_height.max(cy + row_h);
+                loaded_models.push((item, tris, rgba_pixels, w, h, material_color));
+            }
+        }
+        let atlas_cursor_x = atlas_width; // 实际上 atlas_width 就是当前行末尾
+        let atlas_cursor_y = atlas_height.saturating_sub(if model_positions.is_empty() { 0 } else { loaded_models.last().map(|m| m.4).unwrap_or(1) }); // 最后一个模型所在行
+        // 重新计算正确的 cursor 位置
+        let (atlas_cursor_x, atlas_cursor_y, atlas_row_height) = {
+            let mut cx: u32 = 0;
+            let mut cy: u32 = 0;
+            let mut row_h: u32 = 0;
+            for (_, _, _, w, h, _) in &loaded_models {
+                if cx + w > MAX_ATLAS_WIDTH {
+                    cx = 0;
+                    cy += row_h;
+                    row_h = 0;
+                }
+                cx += *w;
+                row_h = row_h.max(*h);
+            }
+            (cx, cy, row_h)
+        };
+
+        atlas_width = atlas_width.max(1);
+        atlas_height = atlas_height.max(1);
+        let mut atlas_pixels = vec![255u8; (atlas_width * atlas_height * 4) as usize];
+        let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Model Texture Atlas"),
+            size: wgpu::Extent3d {
+                width: atlas_width,
+                height: atlas_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
         let mut registry = std::collections::HashMap::new();
         let mut material_bind_groups = std::collections::HashMap::new();
         let mut all_triangles = Vec::new();
 
-        for item in manifest.models {
-            let file_path = format!("cremModel/{}", item.file);
-            println!("正在预加载模型: {}", file_path);
+        for (idx, (item, mut tris, rgba_pixels, width, height, material_color)) in loaded_models.into_iter().enumerate() {
+            let (ax, ay) = model_positions[idx];
+            for y in 0..height {
+                let dst_start = ((((ay + y) * atlas_width) + ax) * 4) as usize;
+                let src_start = (y * width * 4) as usize;
+                let len = (width * 4) as usize;
+                atlas_pixels[dst_start..dst_start + len].copy_from_slice(&rgba_pixels[src_start..src_start + len]);
+            }
+
+            let u0 = ax as f32 / atlas_width as f32;
+            let v0 = ay as f32 / atlas_height as f32;
+            let us = width as f32 / atlas_width as f32;
+            let vs = height as f32 / atlas_height as f32;
+            for tri in &mut tris {
+                tri.uv01 = [
+                    u0 + tri.uv01[0] * us,
+                    v0 + tri.uv01[1] * vs,
+                    u0 + tri.uv01[2] * us,
+                    v0 + tri.uv01[3] * vs,
+                ];
+                tri.uv2 = [u0 + tri.uv2[0] * us, v0 + tri.uv2[1] * vs, 0.0, 0.0];
+            }
 
             let tri_start = all_triangles.len() as u32;
-            let (tris, texture_view) = Self::load_glb_with_texture(device, queue, &file_path);
             let tri_count = tris.len() as u32;
-            all_triangles.append(&mut tris.clone());
+            all_triangles.extend(tris);
 
             let material_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(&format!("Material Bind Group {}", item.id)),
@@ -154,7 +477,7 @@ impl<'a> App<'a> {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&texture_view),
+                        resource: wgpu::BindingResource::TextureView(&atlas_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -162,7 +485,6 @@ impl<'a> App<'a> {
                     },
                 ],
             });
-
             material_bind_groups.insert(item.id, material_bind_group);
 
             registry.insert(item.id, math::ModelRegistryItem {
@@ -170,116 +492,127 @@ impl<'a> App<'a> {
                 tri_start,
                 tri_count,
                 material_id: item.id,
+                material_color,
             });
         }
 
-        (registry, material_bind_groups, all_triangles)
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &atlas_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &atlas_pixels,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(atlas_width * 4),
+                rows_per_image: Some(atlas_height),
+            },
+            wgpu::Extent3d {
+                width: atlas_width,
+                height: atlas_height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        (registry, material_bind_groups, all_triangles, atlas_texture, atlas_view, atlas_width, atlas_height, atlas_cursor_x, atlas_cursor_y, atlas_row_height)
     }
 
-    fn load_glb_with_texture(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        path: &str,
-    ) -> (Vec<math::Triangle>, wgpu::TextureView) {
+    fn load_glb_for_atlas(path: &str) -> (Vec<math::Triangle>, Vec<u8>, u32, u32, [f32; 3]) {
         let (document, buffers, images) = gltf::import(path).expect("加载 GLB 失败");
         let mut triangles = Vec::new();
 
         for mesh in document.meshes() {
             for prim in mesh.primitives() {
                 let reader = prim.reader(|b| Some(&buffers[b.index()]));
-                let pos_iter: Vec<[f32;3]> = reader.read_positions().unwrap().collect();
+                let positions: Vec<[f32; 3]> = reader.read_positions().unwrap().collect();
                 let indices: Vec<u32> = reader.read_indices().unwrap().into_u32().collect();
-                let uv_iter: Vec<[f32; 2]> = reader.read_tex_coords(0)
+                let uvs: Vec<[f32; 2]> = reader.read_tex_coords(0)
                     .map(|it| it.into_f32().collect())
-                    .unwrap_or_else(|| vec![[0.0, 0.0]; pos_iter.len()]);
+                    .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
 
-                for chunk in indices.chunks_exact(3) {
-                    let p0 = pos_iter[chunk[0] as usize];
-                    let p1 = pos_iter[chunk[1] as usize];
-                    let p2 = pos_iter[chunk[2] as usize];
-                    let uv0 = uv_iter[chunk[0] as usize];
-                    let uv1 = uv_iter[chunk[1] as usize];
-                    let uv2 = uv_iter[chunk[2] as usize];
-
-                    triangles.push(math::Triangle {
-                        v0: [p0[0], p0[1], p0[2], 1.0],
-                        v1: [p1[0], p1[1], p1[2], 1.0],
-                        v2: [p2[0], p2[1], p2[2], 1.0],
-                        uv01: [uv0[0], uv0[1], uv1[0], uv1[1]],
-                        uv2: [uv2[0], uv2[1], 0.0, 0.0],
-                    });
-                }
+                let (mut smoothed_tris, _) = compute_smoothed_triangles(&positions, &indices, &uvs, 45.0);
+                triangles.append(&mut smoothed_tris);
             }
         }
 
-        let texture_view = if let Some(image) = images.first() {
-            let width = image.width;
-            let height = image.height;
-            let pixels = image.pixels.clone();
-            let bytes_per_pixel = pixels.len() / (width * height) as usize;
-
-            let rgba_pixels: Vec<u8> = if bytes_per_pixel == 3 {
-                pixels.chunks(3)
-                    .flat_map(|rgb| vec![rgb[0], rgb[1], rgb[2], 255u8])
-                    .collect()
-            } else {
-                pixels.to_vec()
-            };
-
-            let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Model Texture"),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-
-            queue.write_texture(
-                wgpu::ImageCopyTexture {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &rgba_pixels,
-                wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(width * 4),
-                    rows_per_image: Some(height),
-                },
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
-
-            texture.create_view(&wgpu::TextureViewDescriptor::default())
-        } else {
-            device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Fallback Texture"),
-                size: wgpu::Extent3d {
-                    width: 1,
-                    height: 1,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            }).create_view(&wgpu::TextureViewDescriptor::default())
+        let Some(image) = images.first() else {
+            return (triangles, vec![255, 255, 255, 255], 1, 1, [1.0, 1.0, 1.0]);
+        };
+        let width = image.width.max(1);
+        let height = image.height.max(1);
+        let pixels = image.pixels.clone();
+        let bytes_per_pixel = pixels.len() / (width * height) as usize;
+        let rgba_pixels: Vec<u8> = match bytes_per_pixel {
+            3 => pixels.chunks(3).flat_map(|rgb| vec![rgb[0], rgb[1], rgb[2], 255u8]).collect(),
+            4 => pixels,
+            _ => vec![255, 255, 255, 255],
         };
 
-        (triangles, texture_view)
+        let mut sum = [0u64; 3];
+        for px in rgba_pixels.chunks_exact(4) {
+            sum[0] += px[0] as u64;
+            sum[1] += px[1] as u64;
+            sum[2] += px[2] as u64;
+        }
+        let count = (rgba_pixels.len() / 4).max(1) as f32;
+        let material_color = [
+            sum[0] as f32 / (255.0 * count),
+            sum[1] as f32 / (255.0 * count),
+            sum[2] as f32 / (255.0 * count),
+        ];
+
+        (triangles, rgba_pixels, width, height, material_color)
+    }
+
+    fn make_instance(&self, model_id: u32, instance_id: u32, transform: glam::Mat4) -> Option<math::InstanceData> {
+        let model = self.model_registry.get(&model_id)?;
+        Some(math::InstanceData {
+            model_matrix: transform.to_cols_array_2d(),
+            model_id,
+            instance_id,
+            tri_start: model.tri_start,
+            bvh_start: 0,
+            material_color: [model.material_color[0], model.material_color[1], model.material_color[2], 1.0],
+            _pad: [0; 8],
+        })
+    }
+
+    fn spawn_preview_instance(&self, model_id: u32, pos: glam::Vec3) -> Option<math::InstanceData> {
+        let model = self.model_registry.get(&model_id)?;
+        let transform = glam::Mat4::from_scale_rotation_translation(
+            glam::Vec3::from_slice(&model.info.default_scale),
+            glam::Quat::IDENTITY,
+            pos,
+        );
+        self.make_instance(model_id, 9999, transform)
+    }
+
+    fn build_instances_to_draw(&self) -> Vec<math::InstanceData> {
+        let mut instances = self.instances.clone();
+        if let Some(model_id) = self.active_spawn_id {
+            let (ray_o, ray_dir) = self.camera.get_ray(
+                self.last_mouse_pos[0],
+                self.last_mouse_pos[1],
+                self.config.width,
+                self.config.height,
+            );
+            if ray_dir.y.abs() > 0.001 {
+                let t = -ray_o.y / ray_dir.y;
+                if t > 0.0 {
+                    if let Some(preview) = self.spawn_preview_instance(model_id, ray_o + ray_dir * t) {
+                        instances.push(preview);
+                    }
+                }
+            }
+        }
+        if instances.is_empty() {
+            if let Some(instance) = self.make_instance(0, 0, glam::Mat4::IDENTITY) {
+                instances.push(instance);
+            }
+        }
+        instances
     }
 
     fn load_glb_triangles_only(path: &str) -> Vec<math::Triangle> {
@@ -288,28 +621,14 @@ impl<'a> App<'a> {
         for mesh in document.meshes() {
             for prim in mesh.primitives() {
                 let reader = prim.reader(|b| Some(&buffers[b.index()]));
-                let pos_iter: Vec<[f32;3]> = reader.read_positions().unwrap().collect();
+                let positions: Vec<[f32; 3]> = reader.read_positions().unwrap().collect();
                 let indices: Vec<u32> = reader.read_indices().unwrap().into_u32().collect();
-                let uv_iter: Vec<[f32; 2]> = reader.read_tex_coords(0)
+                let uvs: Vec<[f32; 2]> = reader.read_tex_coords(0)
                     .map(|it| it.into_f32().collect())
-                    .unwrap_or_else(|| vec![[0.0, 0.0]; pos_iter.len()]);
+                    .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
 
-                for chunk in indices.chunks_exact(3) {
-                    let p0 = pos_iter[chunk[0] as usize];
-                    let p1 = pos_iter[chunk[1] as usize];
-                    let p2 = pos_iter[chunk[2] as usize];
-                    let uv0 = uv_iter[chunk[0] as usize];
-                    let uv1 = uv_iter[chunk[1] as usize];
-                    let uv2 = uv_iter[chunk[2] as usize];
-
-                    triangles.push(math::Triangle {
-                        v0: [p0[0], p0[1], p0[2], 1.0],
-                        v1: [p1[0], p1[1], p1[2], 1.0],
-                        v2: [p2[0], p2[1], p2[2], 1.0],
-                        uv01: [uv0[0], uv0[1], uv1[0], uv1[1]],
-                        uv2: [uv2[0], uv2[1], 0.0, 0.0],
-                    });
-                }
+                let (mut smoothed_tris, _) = compute_smoothed_triangles(&positions, &indices, &uvs, 45.0);
+                triangles.append(&mut smoothed_tris);
             }
         }
         triangles
@@ -333,7 +652,7 @@ impl<'a> App<'a> {
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
-                    required_features: wgpu::Features::empty(),
+                    required_features: wgpu::Features::TIMESTAMP_QUERY,
                     required_limits: wgpu::Limits::default(),
                     label: None,
                 },
@@ -401,8 +720,8 @@ impl<'a> App<'a> {
             mapped_at_creation: false,
         });
 
-        // 三角形缓冲区 (最多 10 万个三角形 * 80 字节，包含 UV 数据)（初始值，会动态扩容）
-        let triangle_max_size = (100_000 * 80) as u64;
+        // 三角形缓冲区 (最多 10 万个三角形，包含视觉法线、扭曲法线和 UV 数据)（初始值，会动态扩容）
+        let triangle_max_size = (100_000 * std::mem::size_of::<math::Triangle>()) as u64;
         let triangle_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Triangle Buffer"),
             size: triangle_max_size,
@@ -537,6 +856,59 @@ impl<'a> App<'a> {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // 模型 UV 纹理 (binding 12)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                // 世界法线纹理 (binding 13)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 13,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                // 扭曲法线纹理 (binding 15)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 15,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -569,6 +941,16 @@ impl<'a> App<'a> {
                     visibility: wgpu::ShaderStages::VERTEX_FRAGMENT, // 增加 FRAGMENT 可见性
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -611,7 +993,23 @@ impl<'a> App<'a> {
         let tri_id_texture_view = tri_id_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let tri_id_texture_view_for_render = tri_id_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // UV G-Buffer 纹理
+        let warp_buffer_size = pixel_buffer_size::<math::WarpPixel>(size.width, size.height);
+        let warp_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Warp Buffer"),
+            size: warp_buffer_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let sdf_buffer_size = (size.width * size.height * 4) as u64;
+        let sdf_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("SDF Buffer"),
+            size: sdf_buffer_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // UV G-Buffer 纹理 (存世界坐标)
         let uv_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("UV G-Buffer"),
             size: wgpu::Extent3d {
@@ -628,6 +1026,60 @@ impl<'a> App<'a> {
         });
         let uv_texture_view = uv_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let uv_texture_view_for_render = uv_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // 模型 UV 纹理 (存模型的 UV 坐标)
+        let model_uv_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Model UV Texture"),
+            size: wgpu::Extent3d {
+                width: size.width,
+                height: size.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rg16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let model_uv_texture_view = model_uv_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let model_uv_texture_view_for_render = model_uv_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // 世界法线纹理 (存世界空间法线)
+        let normal_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Normal Texture"),
+            size: wgpu::Extent3d {
+                width: size.width,
+                height: size.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let normal_texture_view = normal_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let normal_texture_view_for_render = normal_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // 扭曲后世界位置纹理 (存扭曲后的世界坐标)
+        let warped_pos_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Warped Position Texture"),
+            size: wgpu::Extent3d {
+                width: size.width,
+                height: size.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let warped_pos_texture_view = warped_pos_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let warped_pos_texture_view_for_render = warped_pos_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // 默认 Albedo 纹理（棋盘格）
         let albedo_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -665,7 +1117,7 @@ impl<'a> App<'a> {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         
@@ -697,7 +1149,7 @@ impl<'a> App<'a> {
             label: Some("Render Bind Group Layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
-                    binding: 0,
+                    binding: 14,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: false },
@@ -720,6 +1172,20 @@ impl<'a> App<'a> {
             layout: Some(&compute_pipeline_layout),
             module: &shader,
             entry_point: "cs_main",
+        });
+
+        let ap2_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("AP2 Pipeline"),
+            layout: Some(&compute_pipeline_layout),
+            module: &shader,
+            entry_point: "cs_ap2",
+        });
+
+        let ap3_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("AP3 Pipeline"),
+            layout: Some(&compute_pipeline_layout),
+            module: &shader,
+            entry_point: "cs_ap3",
         });
 
         let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -806,17 +1272,32 @@ impl<'a> App<'a> {
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rg16Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
                 ],
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: Some(wgpu::Face::Back),
+                cull_mode: None,
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
@@ -938,7 +1419,7 @@ impl<'a> App<'a> {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
                 depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_compare: wgpu::CompareFunction::Always,
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
@@ -947,7 +1428,7 @@ impl<'a> App<'a> {
         });
 
         // === 加载所有模型到模型库 ===
-        let (model_registry, material_bind_groups, all_triangles) = Self::load_all_models(
+        let (model_registry, material_bind_groups, all_triangles, albedo_texture, albedo_texture_view, atlas_width, atlas_height, atlas_cursor_x, atlas_cursor_y, atlas_row_height) = Self::load_all_models(
             &device,
             &queue,
             &material_bind_group_layout,
@@ -998,9 +1479,14 @@ impl<'a> App<'a> {
             &depth_texture_view,
             &tri_id_texture_view,
             &uv_texture_view,
+            &model_uv_texture_view,
+            &normal_texture_view,
+            &warped_pos_texture_view,
             &albedo_texture_view,
             &albedo_sampler,
             &instance_buffer,
+            &warp_buffer,
+            &sdf_buffer,
         );
 
         // 1. 先在外部创建 Context
@@ -1027,6 +1513,25 @@ impl<'a> App<'a> {
 
         // 1. 在 device 还没被移交进 Self 之前，先用它初始化 egui_renderer
         let egui_renderer = egui_wgpu::Renderer::new(&device, surface_format, None, 1);
+
+        // GPU Timestamp Query (在 device move 之前创建)
+        let ts_query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("Timestamp Query Set"),
+            count: 8,
+            ty: wgpu::QueryType::Timestamp,
+        });
+        let ts_resolve_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Timestamp Resolve Buffer"),
+            size: 8 * 8,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let ts_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Timestamp Staging Buffer"),
+            size: 8 * 8,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         // 2. 最后再统一构造 Self
         Self {
@@ -1080,6 +1585,10 @@ impl<'a> App<'a> {
             tri_id_texture,
             tri_id_texture_view,
             tri_id_texture_view_for_render,
+            warp_buffer,
+            sdf_buffer,
+            ap2_pipeline,
+            ap3_pipeline,
             depth_bind_group_layout,
             depth_bind_group,
             depth_render_pipeline,
@@ -1087,12 +1596,32 @@ impl<'a> App<'a> {
             depth_blit_bind_group,
             show_depth_debug: false,
             show_normal_debug: false,
+            show_perf_monitor: false,
+            perf_stats: PerfStats::new(),
+            debug_mode: 0u32,
             uv_texture,
             uv_texture_view,
             uv_texture_view_for_render,
+            model_uv_texture,
+            model_uv_texture_view,
+            model_uv_texture_view_for_render,
+            normal_texture,
+            normal_texture_view,
+            normal_texture_view_for_render,
+            warped_pos_texture,
+            warped_pos_texture_view,
+            warped_pos_texture_view_for_render,
             albedo_texture,
             albedo_texture_view,
             albedo_sampler,
+            atlas_width,
+            atlas_height,
+            atlas_cursor_x,
+            atlas_cursor_y,
+            atlas_row_height,
+            ts_query_set,
+            ts_resolve_buffer,
+            ts_staging_buffer,
             model_registry,
             material_bind_group_layout,
             material_bind_groups,
@@ -1126,9 +1655,14 @@ impl<'a> App<'a> {
         depth_view: &wgpu::TextureView,
         tri_id_view: &wgpu::TextureView,
         uv_view: &wgpu::TextureView,
+        model_uv_view: &wgpu::TextureView,
+        normal_view: &wgpu::TextureView,
+        warp_normal_view: &wgpu::TextureView,
         albedo_view: &wgpu::TextureView,
         albedo_sampler: &wgpu::Sampler,
         instance_buffer: &wgpu::Buffer,
+        warp_buffer: &wgpu::Buffer,
+        sdf_buffer: &wgpu::Buffer,
     ) -> (wgpu::BindGroup, wgpu::BindGroup, wgpu::BindGroup, wgpu::BindGroup) {
         let compute = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Compute Bind Group"),
@@ -1144,6 +1678,11 @@ impl<'a> App<'a> {
                 wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(albedo_view) },
                 wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::Sampler(albedo_sampler) },
                 wgpu::BindGroupEntry { binding: 9, resource: instance_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: warp_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: sdf_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(model_uv_view) },
+                wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(normal_view) },
+                wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::TextureView(warp_normal_view) },
             ],
         });
 
@@ -1151,7 +1690,7 @@ impl<'a> App<'a> {
             label: Some("Render Bind Group"),
             layout: render_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(output_view) },
+                wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::TextureView(output_view) },
             ],
         });
 
@@ -1162,6 +1701,7 @@ impl<'a> App<'a> {
                 wgpu::BindGroupEntry { binding: 1, resource: params_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: triangle_buffer.as_entire_binding() }, // 从 3 改成 2
                 wgpu::BindGroupEntry { binding: 9, resource: instance_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: warp_buffer.as_entire_binding() },
             ],
         });
 
@@ -1185,7 +1725,8 @@ impl<'a> App<'a> {
         usage: wgpu::BufferUsages,
     ) -> bool {
         if buffer.size() < required_size {
-            let new_size = (required_size as f32 * 1.5) as u64;
+            let max_buffer_size = 128 * 1024 * 1024; // 128MB - wgpu 绑定限制
+            let new_size = std::cmp::min((required_size as f32 * 1.5) as u64, max_buffer_size);
             *buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
                 size: new_size,
@@ -1200,72 +1741,51 @@ impl<'a> App<'a> {
 
     // 从深度图中拾取实例
     fn pick_instance(&mut self, mouse_pos: [f32; 2]) {
-        let x = mouse_pos[0] as u32;
-        let y = mouse_pos[1] as u32;
+        let x = mouse_pos[0].clamp(0.0, (self.config.width.saturating_sub(1)) as f32) as u32;
+        let y = mouse_pos[1].clamp(0.0, (self.config.height.saturating_sub(1)) as f32) as u32;
+        let pixel_size = std::mem::size_of::<math::WarpPixel>() as u64;
+        let pixel_offset = ((y as u64 * self.config.width as u64) + x as u64) * pixel_size;
 
-        // 创建 4 字节的暂存 Buffer
         let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: 4,
+            label: Some("Pick WarpPixel Staging Buffer"),
+            size: pixel_size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        // 拷贝点击位置的那 1 个像素
-        encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
-                texture: &self.tri_id_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x, y, z: 0 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::ImageCopyBuffer {
-                buffer: &staging_buffer,
-                layout: wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: None,
-                    rows_per_image: None,
-                },
-            },
-            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-        );
+        encoder.copy_buffer_to_buffer(&self.warp_buffer, pixel_offset, &staging_buffer, 0, pixel_size);
         self.queue.submit(Some(encoder.finish()));
 
-        // 读取数据
         let buffer_slice = staging_buffer.slice(..);
         buffer_slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.device.poll(wgpu::Maintain::Wait); // 等待 GPU 完成
+        self.device.poll(wgpu::Maintain::Wait);
 
         let data = buffer_slice.get_mapped_range();
-        let result = u32::from_ne_bytes(data[0..4].try_into().unwrap());
-        
-        if result > 0 {
-            // 解码：直接存储 instance_id + 1
-            let instance_idx = (result - 1) as usize;
-            if instance_idx < self.instances.len() {
-                self.selected_instance = Some(instance_idx);
-                self.params.selected_instance_id = instance_idx as u32;
-                println!("选中了实例: {}", instance_idx);
-                
-                // 保存当前变换状态
-                if let Some(inst) = self.instances.get(instance_idx) {
-                    let mat = glam::Mat4::from_cols_array_2d(&inst.model_matrix);
-                    let (scale, rot, pos) = mat.to_scale_rotation_translation();
-                    self.initial_pos = pos;
-                    self.initial_rot = rot;
-                    self.initial_scale = scale;
-                }
-            } else {
-                self.selected_instance = None;
-                self.params.selected_instance_id = u32::MAX;
+        let picked = bytemuck::from_bytes::<math::WarpPixel>(&data[..pixel_size as usize]);
+        let instance_idx = if picked.flags > 0 && picked.tri_id > 0 {
+            Some(((picked.tri_id >> 24) - 1) as usize)
+        } else {
+            None
+        };
+
+        if let Some(instance_idx) = instance_idx.filter(|idx| *idx < self.instances.len()) {
+            self.selected_instance = Some(instance_idx);
+            self.params.selected_instance_id = instance_idx as u32;
+            println!("选中了实例: {}", instance_idx);
+
+            if let Some(inst) = self.instances.get(instance_idx) {
+                let mat = glam::Mat4::from_cols_array_2d(&inst.model_matrix);
+                let (scale, rot, pos) = mat.to_scale_rotation_translation();
+                self.initial_pos = pos;
+                self.initial_rot = rot;
+                self.initial_scale = scale;
             }
         } else {
             self.selected_instance = None;
             self.params.selected_instance_id = u32::MAX;
         }
-        
-        // 同步 params 到 GPU
+
         self.queue.write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&[self.params]));
     }
 
@@ -1360,6 +1880,30 @@ impl<'a> App<'a> {
                         store: wgpu::StoreOp::Store,
                     },
                 }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &self.model_uv_texture_view_for_render,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &self.normal_texture_view_for_render,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &self.warped_pos_texture_view_for_render,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                }),
             ],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &self.depth_texture_view_for_render,
@@ -1378,9 +1922,8 @@ impl<'a> App<'a> {
         if !instances_to_draw.is_empty() {
             for (i, instance) in instances_to_draw.iter().enumerate() {
                 if let Some(reg) = self.model_registry.get(&instance.model_id) {
-                    let vertex_start = reg.tri_start * 3;
-                    let vertex_end = (reg.tri_start + reg.tri_count) * 3;
-                    dpass.draw(vertex_start..vertex_end, (i as u32)..(i as u32 + 1));
+                    // vs_depth 内部已使用 instance.tri_start 偏移，draw call 从 0 开始
+                    dpass.draw(0..(reg.tri_count * 3), (i as u32)..(i as u32 + 1));
                 }
             }
         } else if self.params.anchor_count > 0 {
@@ -1436,6 +1979,30 @@ impl<'a> App<'a> {
             timestamp_writes: None,
         });
         cpass.set_pipeline(&self.compute_pipeline);
+        cpass.set_bind_group(0, &self.compute_bind_group, &[]);
+        cpass.dispatch_workgroups((self.config.width + 7) / 8, (self.config.height + 7) / 8, 1);
+    }
+
+    fn clear_warp_buffer(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.clear_buffer(&self.warp_buffer, 0, None);
+    }
+
+    fn run_ap2_pass(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("AP2 Pass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&self.ap2_pipeline);
+        cpass.set_bind_group(0, &self.compute_bind_group, &[]);
+        cpass.dispatch_workgroups((self.config.width + 7) / 8, (self.config.height + 7) / 8, 1);
+    }
+
+    fn run_ap3_pass(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("AP3 Pass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&self.ap3_pipeline);
         cpass.set_bind_group(0, &self.compute_bind_group, &[]);
         cpass.dispatch_workgroups((self.config.width + 7) / 8, (self.config.height + 7) / 8, 1);
     }
@@ -1546,6 +2113,7 @@ impl<'a> App<'a> {
         // 使用新的相机类生成矩阵
         self.params.update_matrices(&self.camera, self.config.width, self.config.height);
         self.params.time += delta_time;
+        self.params.debug_mode = self.debug_mode;
         
         // 计算 FPS
         let now = std::time::Instant::now();
@@ -1556,51 +2124,6 @@ impl<'a> App<'a> {
         self.last_frame_time = now;
         
         self.queue.write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&[self.params]));
-
-        // 放置预览逻辑：只有在放置模式下才运行
-        if let Some(model_id) = self.active_spawn_id {
-            let (ray_o, ray_dir) = self.camera.get_ray(
-                self.last_mouse_pos[0],
-                self.last_mouse_pos[1],
-                self.config.width,
-                self.config.height
-            );
-
-            if ray_dir.y.abs() > 0.001 {
-                let t = -ray_o.y / ray_dir.y;
-                if t > 0.0 {
-                    let intersect_pos = ray_o + ray_dir * t;
-
-                    // --- 虚影逻辑 ---
-                    // 获取模型的默认缩放
-                    let (scale, tri_start) = if let Some(model_info) = self.model_registry.get(&model_id) {
-                        (glam::Vec3::from_slice(&model_info.info.default_scale), model_info.tri_start)
-                    } else {
-                        (glam::Vec3::ONE, 0)
-                    };
-
-                    // 创建预览实例
-                    let preview_instance = math::InstanceData {
-                        model_matrix: glam::Mat4::from_scale_rotation_translation(
-                            scale,
-                            glam::Quat::IDENTITY,
-                            intersect_pos
-                        ).to_cols_array_2d(),
-                        model_id,
-                        instance_id: 9999, // 标记为预览
-                        tri_start,
-                        _pad_inner: 0,
-                        extra_data: [0.0, 0.0],
-                        _pad: [0; 10],
-                    };
-
-                    // 临时推入显示，下一帧会被 update 覆盖
-                    let mut display_instances = self.instances.clone();
-                    display_instances.push(preview_instance);
-                    self.queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&display_instances));
-                }
-            }
-        }
 
         // G/R/S 编辑模式处理
         if let Some(idx) = self.selected_instance {
@@ -1724,6 +2247,22 @@ impl<'a> App<'a> {
             ui.checkbox(&mut self.show_scaffold, "显示点云 (调试用)");
             ui.checkbox(&mut self.show_depth_debug, "显示深度图 (Depth Map)");
             ui.checkbox(&mut self.show_normal_debug, "显示法线调试 (Normal Debug)");
+            ui.checkbox(&mut self.show_perf_monitor, "性能监控 (Profiler)");
+            ui.separator();
+            ui.label("调试模式 (Ap 可视化):");
+            ui.add(egui::Slider::new(&mut self.debug_mode, 0..=3).text("debug_mode"));
+            let mode_label = match self.debug_mode {
+                0 => "0: 正常渲染",
+                1 => "1: Ap1 - ID 图 (绿色=有三角面)",
+                2 => "2: Ap2 - 位移点 (红色=已映射)",
+                3 => "3: Ap3 - 补洞 (蓝色=补出来的)",
+                _ => "未知模式",
+            };
+            ui.label(mode_label);
+            ui.separator();
+            ui.label("扭曲参数:");
+            ui.add(egui::Slider::new(&mut self.params.distort_strength, 0.0..=2.0).text("扭曲强度"));
+            ui.add(egui::Slider::new(&mut self.params.distort_frequency, 0.1..=5.0).text("扭曲频率"));
             ui.separator();
             if ui.button("📂 导入 GLB").clicked() { import_clicked = true; }
 
@@ -1753,92 +2292,315 @@ impl<'a> App<'a> {
             }
         });
 
+        // === 性能监控面板 ===
+        if self.show_perf_monitor {
+            egui::Window::new("性能监控 (Profiler)")
+                .collapsible(true)
+                .resizable(true)
+                .default_width(320.0)
+                .show(&self.egui_ctx, |ui| {
+                    let s = &self.perf_stats;
+                    
+                    // ---- 帧率 ----
+                    ui.heading("帧率");
+                    ui.horizontal(|ui| {
+                        ui.label(format!("FPS: {:.1}", s.fps));
+                        ui.label(format!("| 帧时间: {:.2} ms", s.frame_time_ms));
+                    });
+                    if s.frame_time_ms > 16.67 {
+                        ui.colored_label(egui::Color32::RED, format!("⚠ 超过 60 FPS 预算 ({:.1}ms)", s.frame_time_ms - 16.67));
+                    }
+                    
+                    // ---- 帧时间曲线 ----
+                    if !s.frame_history.is_empty() {
+                        let min_t = s.frame_history.iter().cloned().fold(f32::MAX, f32::min);
+                        let max_t = s.frame_history.iter().cloned().fold(0.0, f32::max);
+                        let range = (max_t - min_t).max(1.0);
+                        let target = 16.67; // 60 FPS 目标线
+                        
+                        let graph_rect = egui::Rect::from_min_size(
+                            ui.cursor().min,
+                            egui::Vec2::new(ui.available_width(), 60.0),
+                        );
+                        let painter = ui.painter_at(graph_rect);
+                        
+                        // 背景
+                        painter.rect_filled(graph_rect, 0.0, egui::Color32::from_gray(20));
+                        
+                        // 目标线 (16.67ms)
+                        let target_y = graph_rect.bottom() - (target - min_t) / range * graph_rect.height();
+                        painter.line_segment(
+                            [egui::Pos2::new(graph_rect.left(), target_y), egui::Pos2::new(graph_rect.right(), target_y)],
+                            egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+                        );
+                        painter.text(
+                            egui::Pos2::new(graph_rect.right() - 60.0, target_y - 10.0),
+                            egui::Align2::LEFT_TOP,
+                            "16.6ms",
+                            egui::FontId::monospace(10.0),
+                            egui::Color32::from_gray(120),
+                        );
+                        
+                        // 帧时间曲线
+                        let n = s.frame_history.len();
+                        let w = graph_rect.width() / (n as f32).max(1.0);
+                        let mut points: Vec<egui::Pos2> = Vec::new();
+                        for (i, &t) in s.frame_history.iter().enumerate() {
+                            let x = graph_rect.left() + i as f32 * w;
+                            let y = graph_rect.bottom() - (t - min_t) / range * graph_rect.height();
+                            points.push(egui::Pos2::new(x, y));
+                        }
+                        if points.len() >= 2 {
+                            painter.add(egui::Shape::line(points, egui::Stroke::new(1.5, egui::Color32::GREEN)));
+                        }
+                        
+                        ui.allocate_rect(graph_rect, egui::Sense::hover());
+                    }
+                    
+                    ui.separator();
+                    
+                    // ---- Pass 耗时分解 (GPU 实际时间) ----
+                    ui.heading("Pass 耗时 (GPU ms)");
+                    ui.label(egui::RichText::new(format!("GPU 总计: {:.2} ms", s.gpu_total_ms)).color(egui::Color32::from_rgb(100, 255, 150)));
+                    
+                    let bar_w = ui.available_width() - 110.0;
+                    fn pass_bar(ui: &mut egui::Ui, label: &str, ms: f32, total: f32, color: egui::Color32, bar_w: f32) {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{:<12}", label));
+                            let frac = if total > 0.0 { (ms / total).min(1.0) } else { 0.0 };
+                            let bar = egui::ProgressBar::new(frac)
+                                .desired_width(bar_w)
+                                .fill(color);
+                            ui.add(bar);
+                            if ms > 10.0 { ui.colored_label(egui::Color32::RED, format!("{:.1} ms", ms)); }
+                            else if ms > 5.0 { ui.colored_label(egui::Color32::from_rgb(255, 165, 0), format!("{:.1} ms", ms)); }
+                            else { ui.label(format!("{:.1} ms", ms)); }
+                        });
+                    }
+                    let total = s.gpu_total_ms.max(1.0);
+                    pass_bar(ui, "Depth", s.depth_pass_ms, total, egui::Color32::from_rgb(100, 149, 237), bar_w);
+                    pass_bar(ui, "Compute", s.compute_pass_ms, total, egui::Color32::from_rgb(255, 165, 0), bar_w);
+                    pass_bar(ui, "AP3", s.ap3_pass_ms, total, egui::Color32::from_rgb(186, 85, 211), bar_w);
+                    pass_bar(ui, "Draw", s.draw_pass_ms, total, egui::Color32::from_rgb(60, 179, 113), bar_w);
+                    pass_bar(ui, "Scaffold", s.scaffold_pass_ms, total, egui::Color32::from_rgb(255, 215, 0), bar_w);
+                    pass_bar(ui, "UI", s.ui_pass_ms, total, egui::Color32::from_rgb(220, 220, 220), bar_w);
+                    
+                    ui.separator();
+                    
+                    // ---- 非渲染开销 ----
+                    ui.heading("非渲染开销 (ms)");
+                    let overhead_total = s.egui_build_ms + s.buffer_upload_ms + s.surface_acquire_ms + s.submit_present_ms;
+                    let frame_overhead = (s.frame_time_ms - s.gpu_total_ms - overhead_total).max(0.0);
+                    fn overhead_bar(ui: &mut egui::Ui, label: &str, ms: f32, color: egui::Color32) {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{:<16}", label));
+                            if ms > 10.0 {
+                                ui.colored_label(egui::Color32::RED, format!("{:.2} ms", ms));
+                            } else if ms > 5.0 {
+                                ui.colored_label(egui::Color32::from_rgb(255, 165, 0), format!("{:.2} ms", ms));
+                            } else {
+                                ui.label(format!("{:.2} ms", ms));
+                            }
+                        });
+                    }
+                    overhead_bar(ui, "Egui 构建", s.egui_build_ms, egui::Color32::from_rgb(100, 200, 100));
+                    overhead_bar(ui, "Buffer 上传", s.buffer_upload_ms, egui::Color32::from_rgb(150, 150, 200));
+                    overhead_bar(ui, "Surface 获取", s.surface_acquire_ms, egui::Color32::from_rgb(255, 100, 100)); // vsync 等待
+                    overhead_bar(ui, "Submit+Present", s.submit_present_ms, egui::Color32::from_rgb(200, 150, 100));
+                    overhead_bar(ui, "其他 (update等)", frame_overhead, egui::Color32::GRAY);
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{:<16}", "非渲染总计"));
+                        ui.strong(format!("{:.2} ms", overhead_total + frame_overhead));
+                        ui.label(format!("({:.1}%)", (overhead_total + frame_overhead) / s.frame_time_ms.max(1.0) * 100.0));
+                    });
+                    
+                    ui.separator();
+                    
+                    // ---- Draw Calls ----
+                    ui.heading("Draw Calls");
+                    ui.label(format!("Depth:     {}", s.depth_draw_calls));
+                    ui.label(format!("Draw:      {}", s.draw_draw_calls));
+                    ui.label(format!("Scaffold:  {}", s.scaffold_draw_calls));
+                    let total_dc = s.depth_draw_calls + s.draw_draw_calls + s.scaffold_draw_calls;
+                    ui.label(format!("总计:      {}", total_dc));
+                    
+                    ui.separator();
+                    
+                    // ---- 几何体 ----
+                    ui.heading("几何体");
+                    ui.label(format!("总三角形:   {}", s.total_triangles));
+                    ui.label(format!("渲染三角形: {}", s.rendered_triangles));
+                    ui.label(format!("实例数:     {}", s.instance_count));
+                    
+                    ui.separator();
+                    
+                    // ---- 内存 ----
+                    ui.heading("GPU 内存");
+                    fn format_bytes(bytes: u64) -> String {
+                        if bytes >= 1024 * 1024 { format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0)) }
+                        else if bytes >= 1024 { format!("{:.1} KB", bytes as f64 / 1024.0) }
+                        else { format!("{} B", bytes) }
+                    }
+                    ui.label(format!("三角形缓冲: {}", format_bytes(s.triangle_buffer_size)));
+                    ui.label(format!("实例缓冲:   {}", format_bytes(s.instance_buffer_size)));
+                });
+        }
+
         // 处理按钮点击事件
         if import_clicked {
             self.import_scaffold();
         }
 
+        // === 计时：Egui 构建 ===
+        let te0 = std::time::Instant::now();
         let full_output = self.egui_ctx.end_frame();
         let paint_jobs = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        let egui_build_ms = te0.elapsed().as_secs_f32() * 1000.0;
 
         // 核心修复 1：处理 UI 纹理更新 (字体、图标)
         for (id, image_delta) in &full_output.textures_delta.set {
             self.egui_renderer.update_texture(&self.device, &self.queue, *id, image_delta);
         }
 
-        // 构建待渲染的实例列表（包含预览物体）
-        let mut instances_to_draw = self.instances.clone();
+        let instances_to_draw = self.build_instances_to_draw();
+        self.params.instance_count = instances_to_draw.len() as u32;
 
-        if let Some(model_id) = self.active_spawn_id {
-            let (ray_o, ray_dir) = self.camera.get_ray(
-                self.last_mouse_pos[0],
-                self.last_mouse_pos[1],
-                self.config.width,
-                self.config.height,
-            );
-            if ray_dir.y.abs() > 0.001 {
-                let t = -ray_o.y / ray_dir.y;
-                if t > 0.0 {
-                    let pos = ray_o + ray_dir * t;
-                    let tri_start = self.model_registry.get(&model_id).map(|m| m.tri_start).unwrap_or(0);
-                    let preview = math::InstanceData {
-                        model_matrix: glam::Mat4::from_translation(pos).to_cols_array_2d(),
-                        model_id,
-                        instance_id: 9999,
-                        tri_start,
-                        _pad_inner: 0,
-                        extra_data: [0.0, 0.0],
-                        _pad: [0; 10],
-                    };
-                    instances_to_draw.push(preview);
-                }
-            }
-        }
-
-        // 核心修复：强制确保有实例数据，并写入 GPU
-        if instances_to_draw.is_empty() {
-            instances_to_draw.push(math::InstanceData {
-                model_matrix: glam::Mat4::IDENTITY.to_cols_array_2d(),
-                model_id: 0,
-                instance_id: 0,
-                tri_start: 0,
-                _pad_inner: 0,
-                extra_data: [0.0, 0.0],
-                _pad: [0; 10],
-            });
-        }
+        // === 计时：Buffer 上传 ===
+        let tb = std::time::Instant::now();
         self.queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&instances_to_draw));
+        self.queue.write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&[self.params]));
+        let buffer_upload_ms = tb.elapsed().as_secs_f32() * 1000.0;
 
+        // === 计时：Surface 获取 (含 vsync 等待) ===
+        let ts = std::time::Instant::now();
         let output = self.surface.get_current_texture().unwrap();
+        let surface_acquire_ms = ts.elapsed().as_secs_f32() * 1000.0;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Command Encoder"),
         });
 
+        // === GPU Timestamp: 帧开始 ===
+        encoder.write_timestamp(&self.ts_query_set, 0);
+
         // 执行各个渲染 Pass
-        // 新流程：深度 Pass -> 计算 Pass（画背景）-> 向前渲染 Pass（画物体）-> 绘制 Pass -> 点云调试 Pass
+        self.clear_warp_buffer(&mut encoder);
+        
         self.run_depth_pass(&mut encoder, &instances_to_draw);
+        encoder.write_timestamp(&self.ts_query_set, 1); // depth 结束
+        
         self.run_compute_pass(&mut encoder);
-        self.run_forward_pass(&mut encoder, &self.output_texture_view, &instances_to_draw);
+        encoder.write_timestamp(&self.ts_query_set, 2); // compute 结束
+        
+        self.run_ap3_pass(&mut encoder);
+        encoder.write_timestamp(&self.ts_query_set, 3); // ap3 结束
+        
+        // self.run_forward_pass(&mut encoder, &self.output_texture_view, &instances_to_draw);
+        
         self.run_draw_pass(&mut encoder, &view);
+        encoder.write_timestamp(&self.ts_query_set, 4); // draw 结束
+        
         self.run_scaffold_pass(&mut encoder, &view);
+        encoder.write_timestamp(&self.ts_query_set, 5); // scaffold 结束
 
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [self.config.width, self.config.height],
             pixels_per_point: self.window.scale_factor() as f32,
         };
-        // 更新 egui 缓冲区
         self.egui_renderer.update_buffers(&self.device, &self.queue, &mut encoder, &paint_jobs, &screen_descriptor);
         self.run_ui_pass(&mut encoder, &view, &paint_jobs, &screen_descriptor);
+        encoder.write_timestamp(&self.ts_query_set, 6); // ui 结束
 
         // 处理纹理释放
         for id in &full_output.textures_delta.free {
             self.egui_renderer.free_texture(id);
         }
 
+        // === Resolve Timestamps ===
+        encoder.resolve_query_set(&self.ts_query_set, 0..7, &self.ts_resolve_buffer, 0);
+        encoder.copy_buffer_to_buffer(
+            &self.ts_resolve_buffer,
+            0,
+            &self.ts_staging_buffer,
+            0,
+            8 * 7, // 7 intervals * 8 bytes
+        );
+
+        let tsp = std::time::Instant::now();
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
+        let submit_present_ms = tsp.elapsed().as_secs_f32() * 1000.0;
+
+        // === 异步读取 Timestamp 结果 ===
+        let (gpu_depth_ms, gpu_compute_ms, gpu_ap3_ms, gpu_draw_ms, gpu_scaffold_ms, gpu_total_ms) = {
+            let buffer_slice = self.ts_staging_buffer.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            buffer_slice.map_async(wgpu::MapMode::Read, move |result| { tx.send(result).unwrap(); });
+            self.device.poll(wgpu::Maintain::Wait);
+            if rx.recv().is_ok() && buffer_slice.get_mapped_range().len() >= 56 {
+                let data = buffer_slice.get_mapped_range();
+                let timestamps: &[u64] = bytemuck::cast_slice(&data);
+                let period_ns = self.queue.get_timestamp_period() as f64; // 纳秒/计数
+                
+                fn ts_diff(a: u64, b: u64, period: f64) -> f32 {
+                    if a > b || period <= 0.0 { return 0.0; }
+                    ((b - a) as f64 * period / 1_000_000.0) as f32 // 转换为 ms
+                }
+                
+                let p = period_ns;
+                (
+                    ts_diff(timestamps[0], timestamps[1], p),
+                    ts_diff(timestamps[1], timestamps[2], p),
+                    ts_diff(timestamps[2], timestamps[3], p),
+                    ts_diff(timestamps[3], timestamps[4], p),
+                    ts_diff(timestamps[4], timestamps[5], p),
+                    ts_diff(timestamps[0], timestamps[6], p),
+                )
+            } else {
+                (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            }
+        };
+        self.ts_staging_buffer.unmap();
+
+        // === 收集性能统计 ===
+        let rendered_tris: u32 = instances_to_draw.iter()
+            .filter_map(|inst| self.model_registry.get(&inst.model_id))
+            .map(|reg| reg.tri_count)
+            .sum();
+        
+        self.perf_stats = PerfStats {
+            frame_time_ms: if self.fps > 0.0 { 1000.0 / self.fps } else { 0.0 },
+            fps: self.fps,
+            depth_pass_ms: gpu_depth_ms,
+            compute_pass_ms: gpu_compute_ms,
+            ap3_pass_ms: gpu_ap3_ms,
+            draw_pass_ms: gpu_draw_ms,
+            scaffold_pass_ms: gpu_scaffold_ms,
+            ui_pass_ms: (gpu_total_ms - gpu_depth_ms - gpu_compute_ms - gpu_ap3_ms - gpu_draw_ms - gpu_scaffold_ms).max(0.0),
+            egui_build_ms,
+            buffer_upload_ms,
+            surface_acquire_ms,
+            submit_present_ms,
+            gpu_depth_ms,
+            gpu_compute_ms,
+            gpu_ap3_ms,
+            gpu_draw_ms,
+            gpu_scaffold_ms,
+            gpu_total_ms,
+            depth_draw_calls: instances_to_draw.len() as u32,
+            forward_draw_calls: 0,
+            draw_draw_calls: 1,
+            scaffold_draw_calls: if self.show_scaffold { 1 } else { 0 },
+            total_triangles: self.triangles.len() as u32,
+            rendered_triangles: rendered_tris,
+            instance_count: instances_to_draw.len() as u32,
+            triangle_buffer_size: (self.triangles.len() * std::mem::size_of::<math::Triangle>()) as u64,
+            instance_buffer_size: (instances_to_draw.len() * std::mem::size_of::<math::InstanceData>()) as u64,
+            frame_history: self.perf_stats.frame_history.clone(),
+            max_history: self.perf_stats.max_history,
+        };
+        self.perf_stats.push_frame(if self.fps > 0.0 { 1000.0 / self.fps } else { 0.0 });
     }
 
     fn resize(&mut self, new_size: PhysicalSize<u32>) {
@@ -1916,6 +2678,20 @@ impl<'a> App<'a> {
             self.tri_id_texture_view = self.tri_id_texture.create_view(&wgpu::TextureViewDescriptor::default());
             self.tri_id_texture_view_for_render = self.tri_id_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+            self.warp_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Warp Buffer"),
+                size: pixel_buffer_size::<math::WarpPixel>(new_size.width, new_size.height),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            self.sdf_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("SDF Buffer"),
+                size: (new_size.width * new_size.height * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
             // 重新创建 UV G-Buffer 纹理
             self.uv_texture = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("UV G-Buffer"),
@@ -1934,6 +2710,60 @@ impl<'a> App<'a> {
             self.uv_texture_view = self.uv_texture.create_view(&wgpu::TextureViewDescriptor::default());
             self.uv_texture_view_for_render = self.uv_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+            // 重新创建模型 UV 纹理
+            self.model_uv_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Model UV Texture"),
+                size: wgpu::Extent3d {
+                    width: new_size.width,
+                    height: new_size.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rg16Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            self.model_uv_texture_view = self.model_uv_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.model_uv_texture_view_for_render = self.model_uv_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+            // 重新创建世界法线纹理
+            self.normal_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Normal Texture"),
+                size: wgpu::Extent3d {
+                    width: new_size.width,
+                    height: new_size.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            self.normal_texture_view = self.normal_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.normal_texture_view_for_render = self.normal_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+            // 重新创建扭曲后世界位置纹理
+            self.warped_pos_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Warped Position Texture"),
+                size: wgpu::Extent3d {
+                    width: new_size.width,
+                    height: new_size.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            self.warped_pos_texture_view = self.warped_pos_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.warped_pos_texture_view_for_render = self.warped_pos_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
             // 4. 关键修复：重新创建 BindGroup，否则它们引用的还是旧视图
             let (compute, render, depth, depth_blit) = Self::create_all_bind_groups(
                 &self.device,
@@ -1948,9 +2778,14 @@ impl<'a> App<'a> {
                 &self.depth_texture_view,
                 &self.tri_id_texture_view,
                 &self.uv_texture_view,
+                &self.model_uv_texture_view,
+                &self.normal_texture_view,
+                &self.warped_pos_texture_view,
                 &self.albedo_texture_view,
                 &self.albedo_sampler,
                 &self.instance_buffer,
+                &self.warp_buffer,
+                &self.sdf_buffer,
             );
             self.compute_bind_group = compute;
             self.render_bind_group = render;
@@ -1960,213 +2795,256 @@ impl<'a> App<'a> {
     }
 
     // 在 Rust 里实现和 Shader 完全一致的 smin 基座采样
-    // 打开文件对话框并导入 GLB
+    // 打开文件对话框并导入 GLB（追加到现有模型库，不覆盖）
     fn import_scaffold(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("GLB Files", &["glb"])
             .add_filter("GLTF Files", &["gltf"])
             .pick_file() {
             
-            // 保存路径供后续烘焙使用
+            // 保存路径
             self.scaffold_path = Some(path.to_str().unwrap().to_string());
+            let path_str = self.scaffold_path.clone().unwrap();
+
+            // === 使用 load_glb_for_atlas 加载模型（与 manifest 模型一致的处理） ===
+            let (mut new_triangles, new_rgba_pixels, new_tex_w, new_tex_h, material_color) = Self::load_glb_for_atlas(&path_str);
             
-            // 加载三角形、顶点和贴图
-            let (document, buffers, images) = gltf::import(&path).unwrap();
-            
-            let mut triangles = Vec::new();
-            let mut scaffold_vertices = Vec::new(); // 存储顶点位置和法线
-            
-            for mesh in document.meshes() {
-                for prim in mesh.primitives() {
-                    let reader = prim.reader(|b| Some(&buffers[b.index()]));
-                    
-                    let pos_iter: Vec<[f32;3]> = reader.read_positions().unwrap().collect();
-                    let indices: Vec<u32> = reader.read_indices().unwrap().into_u32().collect();
-                    
-                    // 读取 UV 坐标（如果存在）
-                    let uv_iter: Vec<[f32; 2]> = reader.read_tex_coords(0)
-                        .map(|it| it.into_f32().collect())
-                        .unwrap_or_else(|| vec![[0.0, 0.0]; pos_iter.len()]);
-                    
-                    // 读取法线（如果存在，不存在则计算）
-                    let normal_iter: Vec<[f32; 3]> = reader.read_normals()
-                        .map(|it| it.collect())
-                        .unwrap_or_else(|| vec![[0.0, 1.0, 0.0]; pos_iter.len()]);
-                    
-                    for chunk in indices.chunks_exact(3) {
-                        let i0 = chunk[0] as usize;
-                        let i1 = chunk[1] as usize;
-                        let i2 = chunk[2] as usize;
-                        
-                        let p0 = pos_iter[i0];
-                        let p1 = pos_iter[i1];
-                        let p2 = pos_iter[i2];
-                        
-                        let uv0 = uv_iter[i0];
-                        let uv1 = uv_iter[i1];
-                        let uv2 = uv_iter[i2];
-                        
-                        triangles.push(math::Triangle {
-                            v0: [p0[0], p0[1], p0[2], 1.0],
-                            v1: [p1[0], p1[1], p1[2], 1.0],
-                            v2: [p2[0], p2[1], p2[2], 1.0],
-                            uv01: [uv0[0], uv0[1], uv1[0], uv1[1]],
-                            uv2: [uv2[0], uv2[1], 0.0, 0.0],
-                        });
-                    }
-                    
-                    // 收集所有顶点（位置 + 法线）用于点云显示
-                    // 格式：[pos.x, pos.y, pos.z, packed_normal]
-                    for (i, p) in pos_iter.iter().enumerate() {
-                        let n = normal_iter[i];
-                        // 将法线打包到 w 分量：将 [-1,1] 映射到 [0,1] 然后乘以 255 转为整数
-                        let packed_normal = ((n[0] * 0.5 + 0.5) * 65535.0).round() as u16;
-                        let packed_normal_high = ((n[1] * 0.5 + 0.5) * 65535.0).round() as u16;
-                        // 简单处理：只存储 x 分量用于背面剔除判断
-                        let packed = ((n[0] * 0.5 + 0.5) * 255.0).round() as f32 / 255.0;
-                        scaffold_vertices.push(glam::Vec4::new(p[0], p[1], p[2], packed));
-                    }
-                }
+            let new_tri_count = new_triangles.len() as u32;
+            if new_tri_count == 0 {
+                println!("导入的模型没有三角形，跳过");
+                return;
             }
-            
-            self.scaffold_vertices.clear(); // 保持向后兼容，不再使用
-            self.triangles = triangles;
-            
-            println!("三角形: {}, 顶点数: {}", 
-                self.triangles.len(),
-                scaffold_vertices.len());
-            
-            // ========== 动态缓冲区扩容检查 ==========
-            let triangle_size = (self.triangles.len() * std::mem::size_of::<math::Triangle>()) as u64;
-            let scaffold_size = (scaffold_vertices.len() * std::mem::size_of::<glam::Vec4>()) as u64;
-            
-            let triangle_resized = Self::ensure_buffer_size(
-                &self.device,
-                &mut self.triangle_buffer, 
-                triangle_size, 
-                "Triangle Buffer", 
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST
-            );
-            
-            let scaffold_resized = Self::ensure_buffer_size(
-                &self.device,
-                &mut self.scaffold_buffer, 
-                scaffold_size, 
-                "Scaffold Buffer", 
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST
-            );
-            
-            // ========== 更新模型参数 ==========
-            // 1. 计算所有顶点的中心点
-            let mut center = glam::Vec3::ZERO;
-            for tri in &self.triangles {
-                center += Vec3::new(tri.v0[0], tri.v0[1], tri.v0[2]);
-                center += Vec3::new(tri.v1[0], tri.v1[1], tri.v1[2]);
-                center += Vec3::new(tri.v2[0], tri.v2[1], tri.v2[2]);
-            }
-            center /= (self.triangles.len() * 3) as f32;
-            
-            // 更新模型中心参数
-            self.params.model_center = center.extend(1.0).to_array();
-            // 设置默认基础颜色为灰色
-            self.params.base_color = [0.8, 0.8, 0.8, 1.0];
-            
-            // 计算包围球半径
-            let mut max_radius: f32 = 0.0;
-            for tri in &self.triangles {
-                let p0 = Vec3::new(tri.v0[0], tri.v0[1], tri.v0[2]);
-                let p1 = Vec3::new(tri.v1[0], tri.v1[1], tri.v1[2]);
-                let p2 = Vec3::new(tri.v2[0], tri.v2[1], tri.v2[2]);
-                let dist0 = (p0 - center).length();
-                let dist1 = (p1 - center).length();
-                let dist2 = (p2 - center).length();
-                max_radius = max_radius.max(dist0).max(dist1).max(dist2);
-            }
-            self.params.base_radius = max_radius * 1.1; // 增加 10% 余量
-            
-            println!("模型中心: {:?}, 包围球半径: {}", center, self.params.base_radius);
-            
-            // 上传到 GPU
-            self.queue.write_buffer(&self.triangle_buffer, 0, bytemuck::cast_slice(&self.triangles));
-            
-            // 上传顶点数据（包含法线信息）到 GPU
-            // 格式：[pos.x, pos.y, pos.z, packed_normal]
-            self.queue.write_buffer(&self.scaffold_buffer, 0, bytemuck::cast_slice(&scaffold_vertices));
-            
-            // 更新参数 - 使用 anchor_count 存储三角形数量
-            self.params.scaffold_count = scaffold_vertices.len() as u32;
-            self.params.anchor_count = self.triangles.len() as u32;
-            
-            // 【关键修复】：立即将更新后的参数写入 GPU
-            self.queue.write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&[self.params]));
-            
-            println!("脚手架上传成功：{} 个点，{} 个三角形", self.params.scaffold_count, self.params.anchor_count);
-            
-            // ========== 加载 GLB 贴图并更新 BindGroup ==========
-            for image in images {
-                // 获取贴图数据
-                let width = image.width;
-                let height = image.height;
-                let pixels = image.pixels;
-                
-                // 检查通道数：GLB 贴图可能是 RGB 或 RGBA
-                let bytes_per_pixel = pixels.len() / (width * height) as usize;
-                println!("贴图原始格式：{}x{}，通道数：{}", width, height, bytes_per_pixel);
-                
-                // 如果是 RGB（3 通道），转换为 RGBA（4 通道）
-                let rgba_pixels: Vec<u8> = if bytes_per_pixel == 3 {
-                    pixels.chunks(3)
-                        .flat_map(|rgb| vec![rgb[0], rgb[1], rgb[2], 255u8])
-                        .collect()
-                } else {
-                    pixels
-                };
-                
-                // 创建新的 albedo 纹理
-                let albedo_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("Loaded Albedo Texture"),
+
+            // === 分配唯一 ID（不与 manifest 模型冲突） ===
+            let max_existing_id = self.model_registry.keys().max().copied().unwrap_or(0);
+            let new_model_id = (max_existing_id + 1).max(1000);
+
+            // === Shelf-packing：确定新纹理在 atlas 中的位置 ===
+            const MAX_ATLAS_WIDTH: u32 = 8192;
+            let tex_w = new_tex_w.max(1);
+            let tex_h = new_tex_h.max(1);
+            let old_atlas_w = self.atlas_width.max(1);
+            let old_atlas_h = self.atlas_height.max(1);
+
+            // 如果当前行放不下，换行
+            let (place_x, place_y) = if self.atlas_cursor_x + tex_w > MAX_ATLAS_WIDTH {
+                (0, self.atlas_cursor_y + self.atlas_row_height)
+            } else {
+                (self.atlas_cursor_x, self.atlas_cursor_y)
+            };
+
+            // 计算新的 atlas 尺寸
+            let new_atlas_w = old_atlas_w.max(place_x + tex_w);
+            let new_atlas_h = old_atlas_h.max(place_y + tex_h);
+            let need_expand = new_atlas_w > old_atlas_w || new_atlas_h > old_atlas_h;
+
+            if need_expand {
+                // 创建新的 atlas 纹理
+                let new_atlas_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("Extended Model Texture Atlas"),
                     size: wgpu::Extent3d {
-                        width,
-                        height,
+                        width: new_atlas_w,
+                        height: new_atlas_h,
                         depth_or_array_layers: 1,
                     },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8UnormSrgb, // GLB 贴图通常是 sRGB
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
                     view_formats: &[],
                 });
-                
-                // 写入纹理数据
-                self.queue.write_texture(
+
+                // 复制旧 atlas 到新 atlas（保持在左上角，旧 UV 无需修改）
+                let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Copy Atlas Encoder"),
+                });
+                encoder.copy_texture_to_texture(
                     wgpu::ImageCopyTexture {
-                        texture: &albedo_texture,
+                        texture: &self.albedo_texture,
                         mip_level: 0,
                         origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
                     },
-                    &rgba_pixels,
-                    wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: Some(width * 4),
-                        rows_per_image: Some(height),
+                    wgpu::ImageCopyTexture {
+                        texture: &new_atlas_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
                     },
                     wgpu::Extent3d {
-                        width,
-                        height,
+                        width: old_atlas_w,
+                        height: old_atlas_h,
                         depth_or_array_layers: 1,
                     },
                 );
-                
-                self.albedo_texture = albedo_texture;
-                self.albedo_texture_view = self.albedo_texture.create_view(&wgpu::TextureViewDescriptor::default());
-                
-                println!("加载贴图成功：{}x{} (已转换为 RGBA)", width, height);
-                break; // 只加载第一个贴图
+                self.queue.submit(Some(encoder.finish()));
+
+                // 写入新模型的纹理到 atlas
+                self.queue.write_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &new_atlas_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: place_x,
+                            y: place_y,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &new_rgba_pixels,
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(tex_w * 4),
+                        rows_per_image: Some(tex_h),
+                    },
+                    wgpu::Extent3d {
+                        width: tex_w,
+                        height: tex_h,
+                        depth_or_array_layers: 1,
+                    },
+                );
+
+                // 【核心修复】当图集发生扩容时，将当前显存/内存中已经存在的全部旧三角形的 UV 坐标，
+                // 按照画布扩容的比例进行等比缩放，确保旧 UV 指向正确的像素区域。
+                // 公式: U_新 = U_旧 × (W_旧 / W_新), V_新 = V_旧 × (H_旧 / H_新)
+                let scale_u = old_atlas_w as f32 / new_atlas_w as f32;
+                let scale_v = old_atlas_h as f32 / new_atlas_h as f32;
+                for tri in &mut self.triangles {
+                    tri.uv01[0] *= scale_u;
+                    tri.uv01[1] *= scale_v;
+                    tri.uv01[2] *= scale_u;
+                    tri.uv01[3] *= scale_v;
+                    tri.uv2[0] *= scale_u;
+                    tri.uv2[1] *= scale_v;
+                }
+
+                self.albedo_texture = new_atlas_texture;
+                self.atlas_width = new_atlas_w;
+                self.atlas_height = new_atlas_h;
+            } else {
+                // 不需要扩展，直接写入现有 atlas
+                self.queue.write_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &self.albedo_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: place_x,
+                            y: place_y,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &new_rgba_pixels,
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(tex_w * 4),
+                        rows_per_image: Some(tex_h),
+                    },
+                    wgpu::Extent3d {
+                        width: tex_w,
+                        height: tex_h,
+                        depth_or_array_layers: 1,
+                    },
+                );
             }
-            
-            // ========== 使用统一方法重新创建 BindGroup ==========
+
+            // === 为新模型的三角形重映射 UV 到 atlas ===
+            let u0 = place_x as f32 / new_atlas_w as f32;
+            let v0 = place_y as f32 / new_atlas_h as f32;
+            let us = tex_w as f32 / new_atlas_w as f32;
+            let vs = tex_h as f32 / new_atlas_h as f32;
+            for tri in &mut new_triangles {
+                tri.uv01 = [
+                    u0 + tri.uv01[0] * us,
+                    v0 + tri.uv01[1] * vs,
+                    u0 + tri.uv01[2] * us,
+                    v0 + tri.uv01[3] * vs,
+                ];
+                tri.uv2 = [u0 + tri.uv2[0] * us, v0 + tri.uv2[1] * vs, 0.0, 0.0];
+            }
+
+            // === 追加三角形到全局列表 ===
+            let tri_start = self.triangles.len() as u32;
+            self.triangles.extend(new_triangles);
+
+            // === 更新 GPU 三角形缓冲区 ===
+            let total_tri_size = (self.triangles.len() * std::mem::size_of::<math::Triangle>()) as u64;
+            Self::ensure_buffer_size(
+                &self.device,
+                &mut self.triangle_buffer,
+                total_tri_size,
+                "Triangle Buffer",
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            );
+            self.queue.write_buffer(&self.triangle_buffer, 0, bytemuck::cast_slice(&self.triangles));
+
+            // === 更新 atlas cursor 位置 ===
+            self.atlas_cursor_x = place_x + tex_w;
+            self.atlas_cursor_y = place_y;
+            self.atlas_row_height = self.atlas_row_height.max(tex_h);
+
+            // === 更新 albedo_texture_view 和 material bind groups（仅当 atlas 扩展时） ===
+            if need_expand {
+                self.albedo_texture_view = self.albedo_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                // 所有旧模型的 material bind group 需要更新（指向新的 atlas texture view）
+                let old_model_ids: Vec<u32> = self.model_registry.keys().copied().collect();
+                for model_id in old_model_ids {
+                    let new_mat_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(&format!("Material Bind Group {}", model_id)),
+                        layout: &self.material_bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&self.albedo_texture_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&self.albedo_sampler),
+                            },
+                        ],
+                    });
+                    self.material_bind_groups.insert(model_id, new_mat_bg);
+                }
+            }
+
+            // 注册新模型
+            self.model_registry.insert(new_model_id, math::ModelRegistryItem {
+                info: math::ModelManifestItem {
+                    id: new_model_id,
+                    name: format!("Imported_{}", new_model_id),
+                    file: path_str,
+                    default_scale: [1.0, 1.0, 1.0],
+                },
+                tri_start,
+                tri_count: new_tri_count,
+                material_id: new_model_id,
+                material_color,
+            });
+
+            // 为新模型创建 material bind group
+            let new_mat_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("Imported Material Bind Group {}", new_model_id)),
+                layout: &self.material_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&self.albedo_texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.albedo_sampler),
+                    },
+                ],
+            });
+            self.material_bind_groups.insert(new_model_id, new_mat_bg);
+
+            // === 更新全局参数 ===
+            // 不覆盖 model_center / base_radius / base_color（这些按模型实例独立计算）
+            self.params.anchor_count = self.triangles.len() as u32;
+            self.queue.write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&[self.params]));
+
+            // === 重新创建所有 BindGroup（因为 atlas 纹理变了） ===
             let (compute, render, depth, depth_blit) = Self::create_all_bind_groups(
                 &self.device,
                 &self.compute_bind_group_layout,
@@ -2180,64 +3058,28 @@ impl<'a> App<'a> {
                 &self.depth_texture_view,
                 &self.tri_id_texture_view,
                 &self.uv_texture_view,
+                &self.model_uv_texture_view,
+                &self.normal_texture_view,
+                &self.warped_pos_texture_view,
                 &self.albedo_texture_view,
                 &self.albedo_sampler,
                 &self.instance_buffer,
+                &self.warp_buffer,
+                &self.sdf_buffer,
             );
             self.compute_bind_group = compute;
             self.render_bind_group = render;
             self.depth_bind_group = depth;
             self.depth_blit_bind_group = depth_blit;
 
-            // ========== 【关键修复】：更新模型注册表 ==========
-            // 当手动导入 GLB 时，必须同步更新 model_registry 和 material_bind_groups
-            let imported_tri_count = self.triangles.len() as u32;
-            
-            // 更新或插入模型注册表条目（使用 ID 0 作为导入模型的 ID）
-            self.model_registry.insert(0, math::ModelRegistryItem {
-                info: math::ModelManifestItem {
-                    id: 0,
-                    name: "Imported".to_string(),
-                    file: self.scaffold_path.clone().unwrap_or_default(),
-                    default_scale: [1.0, 1.0, 1.0],
-                },
-                tri_start: 0,
-                tri_count: imported_tri_count,
-                material_id: 0,
-            });
-            
-            // 更新材质绑定组（使用刚创建的 albedo_texture_view）
-            let imported_mat_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Imported Material Bind Group"),
-                layout: &self.material_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&self.albedo_texture_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.albedo_sampler),
-                    },
-                ],
-            });
-            self.material_bind_groups.insert(0, imported_mat_bg);
-
-            // 【关键修复】：导入模型后自动创建一个实例
-            let tri_start = self.model_registry.get(&0).map(|m| m.tri_start).unwrap_or(0);
-            let first_instance = math::InstanceData {
-                model_matrix: glam::Mat4::IDENTITY.to_cols_array_2d(),
-                model_id: 0,
-                instance_id: 0,
-                tri_start,
-                _pad_inner: 0,
-                extra_data: [0.0, 0.0],
-                _pad: [0; 10],
-            };
-            self.instances.clear();
-            self.instances.push(first_instance);
+            // === 为导入的模型创建默认实例 ===
+            if let Some(instance) = self.make_instance(new_model_id, 0, glam::Mat4::IDENTITY) {
+                self.instances.push(instance);
+            }
             self.queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&self.instances));
-            println!("已创建默认实例，实例数量：{}", self.instances.len());
+
+            println!("导入模型成功: ID={}, 三角形={}, 总三角形={}, Atlas={}x{}",
+                new_model_id, new_tri_count, self.triangles.len(), new_atlas_w, new_atlas_h);
         }
     }
 }
@@ -2254,8 +3096,11 @@ fn main() {
     event_loop.run(move |event, elwt| {
         match event {
             Event::WindowEvent { ref event, window_id } if window_id == app.window.id() => {
-                // 让 egui 优先处理（如果点在 UI 上，不触发相机操作）
-                if app.egui_state.on_window_event(&app.window, event).consumed { return; }
+                // 让 egui 优先处理 UI，但保留全局键盘快捷键。
+                let egui_consumed = app.egui_state.on_window_event(&app.window, event).consumed;
+                if egui_consumed && !matches!(event, WindowEvent::KeyboardInput { .. }) {
+                    return;
+                }
 
                 match event {
                     WindowEvent::CloseRequested => elwt.exit(),
@@ -2263,53 +3108,46 @@ fn main() {
                     
                     // --- 键盘监听：Shift 和 WASD ---
                     WindowEvent::KeyboardInput { event: kb_event, .. } => {
-                        match &kb_event.logical_key {
-                            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Shift) => {
-                                app.is_shift_pressed = kb_event.state == winit::event::ElementState::Pressed;
+                        let pressed = kb_event.state == winit::event::ElementState::Pressed;
+                        match kb_event.physical_key {
+                            PhysicalKey::Code(KeyCode::ShiftLeft) | PhysicalKey::Code(KeyCode::ShiftRight) => {
+                                app.is_shift_pressed = pressed;
                             }
-                            winit::keyboard::Key::Character(c) if c == "w" => {
-                                app.is_w_pressed = kb_event.state == winit::event::ElementState::Pressed;
+                            PhysicalKey::Code(KeyCode::KeyW) => {
+                                app.is_w_pressed = pressed;
                             }
-                            winit::keyboard::Key::Character(c) if c == "a" => {
-                                app.is_a_pressed = kb_event.state == winit::event::ElementState::Pressed;
+                            PhysicalKey::Code(KeyCode::KeyA) => {
+                                app.is_a_pressed = pressed;
                             }
-                            winit::keyboard::Key::Character(c) if c == "d" => {
-                                app.is_d_pressed = kb_event.state == winit::event::ElementState::Pressed;
+                            PhysicalKey::Code(KeyCode::KeyD) => {
+                                app.is_d_pressed = pressed;
                             }
-                            // S 键：优先检查编辑模式
-                            winit::keyboard::Key::Character(c) if c == "s" => {
-                                if kb_event.state == winit::event::ElementState::Pressed {
-                                    // 如果有物体选中，S 键触发缩放模式
+                            PhysicalKey::Code(KeyCode::KeyS) => {
+                                if pressed {
                                     if app.selected_instance.is_some() {
                                         app.edit_mode = EditMode::Scale;
                                         app.initial_mouse_pos = glam::Vec2::new(app.last_mouse_pos[0], app.last_mouse_pos[1]);
                                     } else {
-                                        // 否则触发相机后退
                                         app.is_s_pressed = true;
                                     }
-                                } else {
-                                    // 松开 S 键时，关闭相机后退
-                                    if app.edit_mode == EditMode::None {
-                                        app.is_s_pressed = false;
-                                    }
+                                } else if app.edit_mode == EditMode::None {
+                                    app.is_s_pressed = false;
                                 }
                             }
-                            // G/R 编辑模式快捷键
-                            winit::keyboard::Key::Character(c) if c == "g" => {
-                                if kb_event.state == winit::event::ElementState::Pressed {
+                            PhysicalKey::Code(KeyCode::KeyG) => {
+                                if pressed && app.selected_instance.is_some() {
                                     app.edit_mode = EditMode::Grab;
                                     app.initial_mouse_pos = glam::Vec2::new(app.last_mouse_pos[0], app.last_mouse_pos[1]);
                                 }
                             }
-                            winit::keyboard::Key::Character(c) if c == "r" => {
-                                if kb_event.state == winit::event::ElementState::Pressed {
+                            PhysicalKey::Code(KeyCode::KeyR) => {
+                                if pressed && app.selected_instance.is_some() {
                                     app.edit_mode = EditMode::Rotate;
                                     app.initial_mouse_pos = glam::Vec2::new(app.last_mouse_pos[0], app.last_mouse_pos[1]);
                                 }
                             }
-                            // Esc 退出编辑模式
-                            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape) => {
-                                if kb_event.state == winit::event::ElementState::Pressed {
+                            PhysicalKey::Code(KeyCode::Escape) => {
+                                if pressed {
                                     app.edit_mode = EditMode::None;
                                 }
                             }
@@ -2353,26 +3191,17 @@ fn main() {
                                         let intersect_pos = ray_o + ray_dir * t;
                                         
                                         if let Some(model_info) = app.model_registry.get(&model_id) {
-                                            let scale = model_info.info.default_scale;
-                                            
-                                            let new_instance = math::InstanceData {
-                                                model_matrix: glam::Mat4::from_scale_rotation_translation(
-                                                    glam::Vec3::from_slice(&scale),
-                                                    glam::Quat::IDENTITY,
-                                                    intersect_pos
-                                                ).to_cols_array_2d(),
-                                                model_id,
-                                                instance_id: app.instances.len() as u32,
-                                                tri_start: model_info.tri_start,
-                                                _pad_inner: 0,
-                                                extra_data: [0.0, 0.0],
-                                                _pad: [0; 10],
-                                            };
-                                            
-                                            app.instances.push(new_instance);
-                                            app.queue.write_buffer(&app.instance_buffer, 0, bytemuck::cast_slice(&app.instances));
-                                            println!("放置实例: 模型 ID {} 在位置 {:?}", model_id, intersect_pos);
-                                            app.active_spawn_id = None; // 退出放置模式
+                                            let transform = glam::Mat4::from_scale_rotation_translation(
+                                                glam::Vec3::from_slice(&model_info.info.default_scale),
+                                                glam::Quat::IDENTITY,
+                                                intersect_pos,
+                                            );
+                                            if let Some(new_instance) = app.make_instance(model_id, app.instances.len() as u32, transform) {
+                                                app.instances.push(new_instance);
+                                                app.queue.write_buffer(&app.instance_buffer, 0, bytemuck::cast_slice(&app.instances));
+                                                println!("放置实例: 模型 ID {} 在位置 {:?}", model_id, intersect_pos);
+                                                app.active_spawn_id = None; // 退出放置模式
+                                            }
                                         }
                                     }
                                 }

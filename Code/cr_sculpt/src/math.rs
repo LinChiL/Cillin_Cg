@@ -16,6 +16,12 @@ pub struct Triangle {
     pub v0: [f32; 4], // xyz = 顶点0, w = 属性
     pub v1: [f32; 4], // xyz = 顶点1, w = 属性
     pub v2: [f32; 4], // xyz = 顶点2, w = 属性
+    pub n0: [f32; 4], // xyz = 视觉法线0, w = 填充
+    pub n1: [f32; 4], // xyz = 视觉法线1, w = 填充
+    pub n2: [f32; 4], // xyz = 视觉法线2, w = 填充
+    pub warp_n0: [f32; 4], // xyz = 扭曲法线0, w = 填充
+    pub warp_n1: [f32; 4], // xyz = 扭曲法线1, w = 填充
+    pub warp_n2: [f32; 4], // xyz = 扭曲法线2, w = 填充
     pub uv01: [f32; 4], // [u0, v0, u1, v1]
     pub uv2: [f32; 4],  // [u2, v2, 0.0, 0.0] - 补齐到 vec4 保证对齐
 }
@@ -42,8 +48,18 @@ pub struct Params {
     pub screen_width: u32,              // 4
     pub screen_height: u32,             // 4
 
-    pub _pad: [u32; 4],                // 16 (对齐填充)
-} // 总计 320 字节
+    // Ap1 包络字段
+    pub envelope_displacement: f32,     // 4 — 滑条控制偏移量
+    pub show_envelope: u32,             // 4 — 1 显示, 0 关闭
+    pub envelope_vertex_count: u32,     // 4 — envelope 顶点数 (3 × 三角形数)
+    pub _pad: u32,                      // 4 (对齐填充)
+
+    // Ap2 扭曲字段
+    pub distort_strength: f32,          // 4 — 扭曲强度
+    pub distort_frequency: f32,         // 4 — 扭曲频率
+    pub ap2_iteration: u32,             // 4 — 反向传播迭代次数
+    pub instance_count: u32,            // 4 — 当前帧实例数量
+} // 总计 320 + 16 = 336 字节
 
 impl Default for Params {
     fn default() -> Self {
@@ -63,7 +79,15 @@ impl Default for Params {
             debug_mode: 0u32,
             screen_width: 0u32,
             screen_height: 0u32,
-            _pad: [0u32; 4],
+            envelope_displacement: 0.5,
+            show_envelope: 0,
+            envelope_vertex_count: 0,
+            _pad: 0u32,
+            // Ap2 默认值
+            distort_strength: 0.3,
+            distort_frequency: 1.0,
+            ap2_iteration: 4,
+            instance_count: 1u32,
         }
     }
 }
@@ -178,6 +202,7 @@ pub struct ModelRegistryItem {
     pub tri_start: u32,
     pub tri_count: u32,
     pub material_id: u32,
+    pub material_color: [f32; 3],
 }
 
 #[repr(C)]
@@ -187,7 +212,33 @@ pub struct InstanceData {
     pub model_id: u32,               // 4 字节
     pub instance_id: u32,            // 4 字节
     pub tri_start: u32,              // 4 字节 【新增：模型三角形起始位置】
-    pub _pad_inner: u32,              // 4 字节 (对齐)
-    pub extra_data: [f32; 2],        // 8 字节
-    pub _pad: [u32; 10],             // 40 字节填充。总计 64 + 20 + 8 + 40 = 128 字节
+    pub bvh_start: u32,              // 4 字节 【新增：模型 BVH 起始位置】
+    pub material_color: [f32; 4],    // 16 字节，xyz = 近似材质色
+    pub _pad: [u32; 8],              // 32 字节填充。总计 128 字节
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct WarpPixel {
+    pub src_x: u32,
+    pub src_y: u32,
+    pub tri_id: u32,
+    pub flags: u32,
+    pub barycentric: [f32; 4],
+}
+
+/// Ap1 包络顶点：每个三角形顶点展开为 position + normal
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct EnvelopeVertex {
+    pub pos: [f32; 4],   // xyz = 位置, w = padding
+    pub normal: [f32; 4], // xyz = 法线, w = padding
+}
+
+/// BVH 节点结构
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BVHNode {
+    pub aabb_min: [f32; 4], // xyz = min bounds, w = left_child (internal) or tri_start (leaf)
+    pub aabb_max: [f32; 4], // xyz = max bounds, w = right_child (internal) or negative tri_count (leaf)
 }

@@ -26,3 +26,6 @@ Cargo.lock
 Document/
 
 Code/cr_sculpt/pr.md
+
+debug-pixel-warp-holes.md
+debug-warp-layer-holes.md
