@@ -80,7 +80,7 @@ struct WarpPixel {
 @group(0) @binding(17) var pixel_shadow_out: texture_storage_2d<rgba8unorm, write>;
 
 // 太阳空间网格分箱（阴影加速）
-const GRID_RES = 256u;
+const GRID_RES = 1024u;
 const GRID_HALF_SIZE = 400.0;
 const MAX_SHADOW_LIST_STEPS = 4096u;
 
