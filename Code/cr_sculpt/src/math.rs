@@ -1,6 +1,6 @@
 
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use glam::Vec4Swizzles;
 
 #[repr(C)]
@@ -197,6 +197,7 @@ pub struct ModelManifest {
     pub models: Vec<ModelManifestItem>,
 }
 
+#[derive(Clone)]
 pub struct ModelRegistryItem {
     pub info: ModelManifestItem,
     pub tri_start: u32,
@@ -241,4 +242,18 @@ pub struct EnvelopeVertex {
 pub struct BVHNode {
     pub aabb_min: [f32; 4], // xyz = min bounds, w = left_child (internal) or tri_start (leaf)
     pub aabb_max: [f32; 4], // xyz = max bounds, w = right_child (internal) or negative tri_count (leaf)
+}
+
+/// 场景序列化：一个实例
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SceneInstance {
+    pub model_id: u32,
+    pub instance_id: u32,
+    pub model_matrix: [[f32; 4]; 4],
+}
+
+/// 场景序列化：整个场景
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SceneData {
+    pub instances: Vec<SceneInstance>,
 }

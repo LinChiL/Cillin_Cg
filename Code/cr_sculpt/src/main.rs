@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use glam::{Vec3, Vec4, Vec3Swizzles, Vec4Swizzles};
+use glam::{FloatExt, Vec3, Vec4, Vec3Swizzles, Vec4Swizzles};
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 use winit::event::{Event, WindowEvent};
@@ -12,6 +12,10 @@ use winit::window::Window;
 
 use gltf;
 use rfd;
+
+mod physics;
+mod shadow;
+use physics::InstancePhysics;
 
 #[derive(Hash, Copy, Clone, PartialEq, Eq)]
 struct VertexKey {
@@ -111,6 +115,21 @@ impl PerfStats {
         if self.frame_history.len() > self.max_history {
             self.frame_history.remove(0);
         }
+    }
+}
+
+fn apply_imported_visual_normals(
+    triangles: &mut [math::Triangle],
+    normals: &[[f32; 3]],
+    indices: &[u32],
+) {
+    for (tri, chunk) in triangles.iter_mut().zip(indices.chunks_exact(3)) {
+        let n0 = normals[chunk[0] as usize];
+        let n1 = normals[chunk[1] as usize];
+        let n2 = normals[chunk[2] as usize];
+        tri.n0 = [n0[0], n0[1], n0[2], 0.0];
+        tri.n1 = [n1[0], n1[1], n1[2], 0.0];
+        tri.n2 = [n2[0], n2[1], n2[2], 0.0];
     }
 }
 
@@ -221,6 +240,18 @@ enum EditMode {
     Scale,
 }
 
+// Blender 风格轴约束
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AxisConstraint {
+    None,
+    X,
+    Y,
+    Z,
+    YZ, // Shift+X: 排除 X，只在 YZ 平面移动（效果同锁定 X 轴）
+    XZ, // Shift+Y: 排除 Y
+    XY, // Shift+Z: 排除 Z
+}
+
 struct App<'a> {
     window: Arc<winit::window::Window>,
     surface: wgpu::Surface<'a>,
@@ -281,6 +312,7 @@ struct App<'a> {
     sdf_buffer: wgpu::Buffer,
     ap2_pipeline: wgpu::ComputePipeline,
     ap3_pipeline: wgpu::ComputePipeline,
+    shadow_system: shadow::ShadowSystem,
     depth_bind_group_layout: wgpu::BindGroupLayout,
     depth_bind_group: wgpu::BindGroup,
     depth_render_pipeline: wgpu::RenderPipeline,
@@ -328,21 +360,26 @@ struct App<'a> {
 
     // 模型库管理
     model_registry: std::collections::HashMap<u32, math::ModelRegistryItem>,
+    model_colliders: std::collections::HashMap<u32, physics::ModelCollider>,
     material_bind_group_layout: wgpu::BindGroupLayout,
     material_bind_groups: std::collections::HashMap<u32, wgpu::BindGroup>,
     mesh_render_pipeline: wgpu::RenderPipeline,
 
     // 场景中的实例列表
     instances: Vec<math::InstanceData>,
+    instance_physics: Vec<InstancePhysics>,
     instance_buffer: wgpu::Buffer,
 
     // 交互控制
     command_input: String,
     active_spawn_id: Option<u32>,
+    rebuild_colliders_requested: bool,
     
     // 编辑模式相关
     selected_instance: Option<usize>,
     edit_mode: EditMode,
+    axis_constraint: AxisConstraint,
+    last_axis_key: Option<KeyCode>,
     initial_pos: glam::Vec3,           // 变换开始时物体的位置
     initial_rot: glam::Quat,           // 变换开始时物体的旋转
     initial_scale: glam::Vec3,         // 变换开始时物体的缩放
@@ -528,12 +565,16 @@ impl<'a> App<'a> {
                 let reader = prim.reader(|b| Some(&buffers[b.index()]));
                 let positions: Vec<[f32; 3]> = reader.read_positions().unwrap().collect();
                 let indices: Vec<u32> = reader.read_indices().unwrap().into_u32().collect();
+                let normals: Option<Vec<[f32; 3]>> = reader.read_normals().map(|it| it.collect());
                 let uvs: Vec<[f32; 2]> = reader.read_tex_coords(0)
                     .map(|it| it.into_f32().collect())
                     .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
 
-                let (mut smoothed_tris, _) = compute_smoothed_triangles(&positions, &indices, &uvs, 45.0);
-                triangles.append(&mut smoothed_tris);
+                let mut tris = compute_smoothed_triangles(&positions, &indices, &uvs, 45.0).0;
+                if let Some(normals) = normals.filter(|n| n.len() == positions.len()) {
+                    apply_imported_visual_normals(&mut tris, &normals, &indices);
+                }
+                triangles.append(&mut tris);
             }
         }
 
@@ -566,6 +607,251 @@ impl<'a> App<'a> {
         (triangles, rgba_pixels, width, height, material_color)
     }
 
+    fn build_model_colliders(
+        model_registry: &std::collections::HashMap<u32, math::ModelRegistryItem>,
+        triangles: &[math::Triangle],
+    ) -> std::collections::HashMap<u32, physics::ModelCollider> {
+        // #region debug-point window-freeze-collider
+        let collider_total_t0 = std::time::Instant::now();
+        eprintln!("[debug-window-freeze] build_model_colliders start models={} triangles={}", model_registry.len(), triangles.len());
+        // #endregion debug-point window-freeze-collider
+        let mut colliders = std::collections::HashMap::new();
+        for (&model_id, reg) in model_registry {
+            // #region debug-point window-freeze-collider
+            let collider_model_t0 = std::time::Instant::now();
+            eprintln!("[debug-window-freeze] collider model start id={} tri_count={}", model_id, reg.tri_count);
+            // #endregion debug-point window-freeze-collider
+            let tris = &triangles[reg.tri_start as usize..(reg.tri_start + reg.tri_count) as usize];
+            let mut sample_points = Vec::with_capacity(tris.len() * 7);
+            let mut bounds_min = glam::Vec3::splat(f32::INFINITY);
+            let mut bounds_max = glam::Vec3::splat(f32::NEG_INFINITY);
+            for tri in tris {
+                let v0 = glam::Vec4::from(tri.v0).truncate();
+                let v1 = glam::Vec4::from(tri.v1).truncate();
+                let v2 = glam::Vec4::from(tri.v2).truncate();
+                for v in [v0, v1, v2] {
+                    bounds_min = bounds_min.min(v);
+                    bounds_max = bounds_max.max(v);
+                }
+                sample_points.push(v0);
+                sample_points.push(v1);
+                sample_points.push(v2);
+                sample_points.push((v0 + v1) * 0.5);
+                sample_points.push((v1 + v2) * 0.5);
+                sample_points.push((v2 + v0) * 0.5);
+                sample_points.push((v0 + v1 + v2) / 3.0);
+            }
+            let extent = bounds_max - bounds_min;
+            let pad = extent.max_element().max(1.0) * 0.08;
+            bounds_min -= glam::Vec3::splat(pad);
+            bounds_max += glam::Vec3::splat(pad);
+            let resolution = if tris.len() > 4000 {
+                12
+            } else if tris.len() > 1500 {
+                16
+            } else {
+                24
+            };
+            // #region debug-point window-freeze-collider
+            eprintln!("[debug-window-freeze] collider model sdf_resolution id={} resolution={}", model_id, resolution);
+            // #endregion debug-point window-freeze-collider
+            let mut sdf = Vec::with_capacity((resolution * resolution * resolution) as usize);
+            for z in 0..resolution {
+                // #region debug-point window-freeze-collider
+                if z % 8 == 0 {
+                    eprintln!("[debug-window-freeze] collider model progress id={} z={}/{} elapsed_ms={:.1}", model_id, z, resolution, collider_model_t0.elapsed().as_secs_f64() * 1000.0);
+                }
+                // #endregion debug-point window-freeze-collider
+                for y in 0..resolution {
+                    for x in 0..resolution {
+                        let uvw = glam::Vec3::new(x as f32, y as f32, z as f32) / (resolution - 1) as f32;
+                        let p = bounds_min + (bounds_max - bounds_min) * uvw;
+                        let (distance, _) = Self::signed_distance_to_tris(tris, p);
+                        sdf.push(distance);
+                    }
+                }
+            }
+            colliders.insert(model_id, physics::ModelCollider { sample_points, bounds_min, bounds_max, resolution, sdf });
+            // #region debug-point window-freeze-collider
+            eprintln!("[debug-window-freeze] collider model done id={} samples={} elapsed_ms={:.1}", model_id, colliders.get(&model_id).map(|c| c.sample_points.len()).unwrap_or(0), collider_model_t0.elapsed().as_secs_f64() * 1000.0);
+            // #endregion debug-point window-freeze-collider
+        }
+        // #region debug-point window-freeze-collider
+        eprintln!("[debug-window-freeze] build_model_colliders done elapsed_ms={:.1}", collider_total_t0.elapsed().as_secs_f64() * 1000.0);
+        // #endregion debug-point window-freeze-collider
+        colliders
+    }
+
+    fn closest_point_on_triangle(p: glam::Vec3, a: glam::Vec3, b: glam::Vec3, c: glam::Vec3) -> glam::Vec3 {
+        let ab = b - a;
+        let ac = c - a;
+        let ap = p - a;
+        let d1 = ab.dot(ap);
+        let d2 = ac.dot(ap);
+        if d1 <= 0.0 && d2 <= 0.0 { return a; }
+
+        let bp = p - b;
+        let d3 = ab.dot(bp);
+        let d4 = ac.dot(bp);
+        if d3 >= 0.0 && d4 <= d3 { return b; }
+
+        let vc = d1 * d4 - d3 * d2;
+        if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+            return a + ab * (d1 / (d1 - d3));
+        }
+
+        let cp = p - c;
+        let d5 = ab.dot(cp);
+        let d6 = ac.dot(cp);
+        if d6 >= 0.0 && d5 <= d6 { return c; }
+
+        let vb = d5 * d2 - d1 * d6;
+        if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+            return a + ac * (d2 / (d2 - d6));
+        }
+
+        let va = d3 * d6 - d5 * d4;
+        if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+            return b + (c - b) * ((d4 - d3) / ((d4 - d3) + (d5 - d6)));
+        }
+
+        let denom = 1.0 / (va + vb + vc);
+        a + ab * (vb * denom) + ac * (vc * denom)
+    }
+
+    fn ray_intersects_triangle(origin: glam::Vec3, dir: glam::Vec3, a: glam::Vec3, b: glam::Vec3, c: glam::Vec3) -> bool {
+        let eps = 1e-6;
+        let edge1 = b - a;
+        let edge2 = c - a;
+        let h = dir.cross(edge2);
+        let det = edge1.dot(h);
+        if det.abs() < eps { return false; }
+        let inv_det = 1.0 / det;
+        let s = origin - a;
+        let u = inv_det * s.dot(h);
+        if !(0.0..=1.0).contains(&u) { return false; }
+        let q = s.cross(edge1);
+        let v = inv_det * dir.dot(q);
+        if v < 0.0 || u + v > 1.0 { return false; }
+        inv_det * edge2.dot(q) > eps
+    }
+
+    fn signed_distance_to_tris(tris: &[math::Triangle], local_pos: glam::Vec3) -> (f32, glam::Vec3) {
+        let mut best_d2 = f32::INFINITY;
+        let mut best_point = glam::Vec3::ZERO;
+        let mut best_normal = glam::Vec3::Y;
+        let mut intersections = 0;
+        let ray_dir = glam::Vec3::X;
+
+        for tri in tris {
+            let a = glam::Vec4::from(tri.v0).truncate();
+            let b = glam::Vec4::from(tri.v1).truncate();
+            let c = glam::Vec4::from(tri.v2).truncate();
+            let closest = Self::closest_point_on_triangle(local_pos, a, b, c);
+            let d2 = local_pos.distance_squared(closest);
+            if d2 < best_d2 {
+                best_d2 = d2;
+                best_point = closest;
+                best_normal = (b - a).cross(c - a).normalize_or_zero();
+            }
+            if Self::ray_intersects_triangle(local_pos + ray_dir * 1e-4, ray_dir, a, b, c) {
+                intersections += 1;
+            }
+        }
+
+        let inside = intersections % 2 == 1;
+        let dist = best_d2.sqrt();
+        let mut dir = (local_pos - best_point).normalize_or_zero();
+        if dir.length_squared() < 1e-8 {
+            dir = best_normal;
+        }
+        let normal = if inside { -dir } else { dir };
+        (if inside { -dist } else { dist }, normal.normalize_or_zero())
+    }
+
+    fn push_instance(&mut self, instance: math::InstanceData) {
+        self.instances.push(instance);
+        self.instance_physics.push(InstancePhysics::default());
+    }
+
+    fn sync_instance_physics_len(&mut self) {
+        physics::sync_instance_physics_len(&self.instances, &mut self.instance_physics);
+    }
+
+    /// 计算射线到轴线的最近点（用于 Blender 风格轴约束）
+    fn ray_closest_to_axis(&self, ray_o: glam::Vec3, ray_dir: glam::Vec3, line_origin: glam::Vec3, axis_dir: glam::Vec3) -> glam::Vec3 {
+        let w = ray_o - line_origin;
+        let d2 = ray_dir.dot(ray_dir);
+        let da = ray_dir.dot(axis_dir);
+        let wa = w.dot(axis_dir);
+        let wd = w.dot(ray_dir);
+        let denom = d2 - da * da;
+        if denom.abs() < 1e-10 {
+            return line_origin + axis_dir * wa;
+        }
+        let t = -(wd - wa * da) / denom;
+        let p = ray_o + ray_dir * t;
+        line_origin + axis_dir * (p - line_origin).dot(axis_dir)
+    }
+
+    fn save_scene(&self) {
+        let scene_dir = "src/scene";
+        let _ = std::fs::create_dir_all(scene_dir);
+        let scene = math::SceneData {
+            instances: self.instances.iter().map(|inst| math::SceneInstance {
+                model_id: inst.model_id,
+                instance_id: inst.instance_id,
+                model_matrix: inst.model_matrix,
+            }).collect(),
+        };
+        let path = format!("{}/scene.json", scene_dir);
+        match serde_json::to_string_pretty(&scene) {
+            Ok(json) => {
+                match std::fs::write(&path, &json) {
+                    Ok(_) => println!("场景已保存到: {}", path),
+                    Err(e) => eprintln!("保存场景失败: {}", e),
+                }
+            }
+            Err(e) => eprintln!("序列化场景失败: {}", e),
+        }
+    }
+
+    fn load_scene(&mut self) -> bool {
+        let path = "src/scene/scene.json";
+        let json = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => {
+                println!("未找到存档文件: {}", path);
+                return false;
+            }
+        };
+        let scene: math::SceneData = match serde_json::from_str(&json) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("解析场景文件失败: {}", e);
+                return false;
+            }
+        };
+        for inst_data in &scene.instances {
+            if let Some(inst) = self.make_instance(inst_data.model_id, self.instances.len() as u32, glam::Mat4::from_cols_array_2d(&inst_data.model_matrix)) {
+                self.push_instance(inst);
+            }
+        }
+        if !self.instances.is_empty() {
+            self.queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&self.instances));
+        }
+        println!("已加载 {} 个实例", scene.instances.len());
+        true
+    }
+
+    fn rebuild_colliders(&mut self) {
+        let t0 = std::time::Instant::now();
+        println!("开始构建碰撞体 SDF...");
+        let temp_registry = self.model_registry.clone();
+        self.model_colliders = Self::build_model_colliders(&temp_registry, &self.triangles);
+        println!("碰撞体 SDF 构建完成，耗时 {:.1}ms ({} 个模型)", t0.elapsed().as_secs_f64() * 1000.0, self.model_colliders.len());
+    }
+
     fn make_instance(&self, model_id: u32, instance_id: u32, transform: glam::Mat4) -> Option<math::InstanceData> {
         let model = self.model_registry.get(&model_id)?;
         Some(math::InstanceData {
@@ -573,7 +859,7 @@ impl<'a> App<'a> {
             model_id,
             instance_id,
             tri_start: model.tri_start,
-            bvh_start: 0,
+            bvh_start: model.tri_count,
             material_color: [model.material_color[0], model.material_color[1], model.material_color[2], 1.0],
             _pad: [0; 8],
         })
@@ -623,12 +909,16 @@ impl<'a> App<'a> {
                 let reader = prim.reader(|b| Some(&buffers[b.index()]));
                 let positions: Vec<[f32; 3]> = reader.read_positions().unwrap().collect();
                 let indices: Vec<u32> = reader.read_indices().unwrap().into_u32().collect();
+                let normals: Option<Vec<[f32; 3]>> = reader.read_normals().map(|it| it.collect());
                 let uvs: Vec<[f32; 2]> = reader.read_tex_coords(0)
                     .map(|it| it.into_f32().collect())
                     .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
 
-                let (mut smoothed_tris, _) = compute_smoothed_triangles(&positions, &indices, &uvs, 45.0);
-                triangles.append(&mut smoothed_tris);
+                let mut tris = compute_smoothed_triangles(&positions, &indices, &uvs, 45.0).0;
+                if let Some(normals) = normals.filter(|n| n.len() == positions.len()) {
+                    apply_imported_visual_normals(&mut tris, &normals, &indices);
+                }
+                triangles.append(&mut tris);
             }
         }
         triangles
@@ -696,7 +986,7 @@ impl<'a> App<'a> {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Sculpt Shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("sculpt.wgsl"))),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("mainshader.wgsl"))),
         });
 
         let mut params = Params::default();
@@ -906,6 +1196,17 @@ impl<'a> App<'a> {
                         multisampled: false,
                         view_dimension: wgpu::TextureViewDimension::D2,
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                // 像素阴影纹理 (binding 16)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 16,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     },
                     count: None,
                 },
@@ -1435,6 +1736,8 @@ impl<'a> App<'a> {
             &albedo_sampler,
         );
 
+        let model_colliders = std::collections::HashMap::new();
+
         // 上传所有三角形到 GPU 缓冲区
         let tri_count = all_triangles.len();
         let tri_size = (tri_count * std::mem::size_of::<math::Triangle>()) as u64;
@@ -1465,6 +1768,22 @@ impl<'a> App<'a> {
             mapped_at_creation: false,
         });
 
+        let shadow_system = shadow::ShadowSystem::new(
+            &device,
+            &shader,
+            size.width,
+            size.height,
+            shadow::ShadowInputs {
+                params_buffer: &params_buffer,
+                triangle_buffer: &triangle_buffer_to_use,
+                instance_buffer: &instance_buffer,
+                warp_buffer: &warp_buffer,
+                tri_id_view: &tri_id_texture_view,
+                world_pos_view: &uv_texture_view,
+                normal_view: &normal_texture_view,
+            },
+        );
+
         // 使用统一的 BindGroup 创建方法
         let (compute_bind_group, render_bind_group, depth_bind_group, depth_blit_bind_group) = Self::create_all_bind_groups(
             &device,
@@ -1482,6 +1801,7 @@ impl<'a> App<'a> {
             &model_uv_texture_view,
             &normal_texture_view,
             &warped_pos_texture_view,
+            &shadow_system.view,
             &albedo_texture_view,
             &albedo_sampler,
             &instance_buffer,
@@ -1589,6 +1909,7 @@ impl<'a> App<'a> {
             sdf_buffer,
             ap2_pipeline,
             ap3_pipeline,
+            shadow_system,
             depth_bind_group_layout,
             depth_bind_group,
             depth_render_pipeline,
@@ -1623,17 +1944,22 @@ impl<'a> App<'a> {
             ts_resolve_buffer,
             ts_staging_buffer,
             model_registry,
+            model_colliders,
             material_bind_group_layout,
             material_bind_groups,
             mesh_render_pipeline,
             instances: Vec::new(),
+            instance_physics: Vec::new(),
             instance_buffer,
             command_input: String::new(),
             active_spawn_id: None,
+            rebuild_colliders_requested: false,
             
             // 编辑模式初始化
             selected_instance: None,
             edit_mode: EditMode::None,
+            axis_constraint: AxisConstraint::None,
+            last_axis_key: None,
             initial_pos: glam::Vec3::ZERO,
             initial_rot: glam::Quat::IDENTITY,
             initial_scale: glam::Vec3::ONE,
@@ -1658,6 +1984,7 @@ impl<'a> App<'a> {
         model_uv_view: &wgpu::TextureView,
         normal_view: &wgpu::TextureView,
         warp_normal_view: &wgpu::TextureView,
+        shadow_view: &wgpu::TextureView,
         albedo_view: &wgpu::TextureView,
         albedo_sampler: &wgpu::Sampler,
         instance_buffer: &wgpu::Buffer,
@@ -1683,6 +2010,7 @@ impl<'a> App<'a> {
                 wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(model_uv_view) },
                 wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(normal_view) },
                 wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::TextureView(warp_normal_view) },
+                wgpu::BindGroupEntry { binding: 16, resource: wgpu::BindingResource::TextureView(shadow_view) },
             ],
         });
 
@@ -1856,6 +2184,50 @@ impl<'a> App<'a> {
         self.params.scaffold_count = upload_data.len() as u32;
     }
 
+    fn update_collider_debug_points(&mut self) {
+        self.visible_vertices.clear();
+        let view_proj = {
+            let view_matrix = self.camera.get_view_matrix();
+            let aspect_ratio = self.config.width as f32 / self.config.height as f32;
+            let proj_matrix = glam::Mat4::perspective_rh(45.0f32.to_radians(), aspect_ratio, 0.1, 1000.0);
+            proj_matrix * view_matrix
+        };
+
+        for instance in &self.instances {
+            let Some(collider) = self.model_colliders.get(&instance.model_id) else { continue; };
+            let model_mat = glam::Mat4::from_cols_array_2d(&instance.model_matrix);
+            let (scale, _, _) = model_mat.to_scale_rotation_translation();
+            let marker_size = 0.015 * scale.abs().max_element().max(0.5);
+            let step = (collider.sample_points.len() / 1200).max(1);
+            for sample in collider.sample_points.iter().step_by(step) {
+                let world_pos = model_mat.transform_point3(*sample);
+                let clip = view_proj * world_pos.extend(1.0);
+                if clip.w <= 0.01 {
+                    continue;
+                }
+                let ndc = clip / clip.w;
+                if ndc.x.abs() > 1.1 || ndc.y.abs() > 1.1 || ndc.z < -0.1 || ndc.z > 1.1 {
+                    continue;
+                }
+                for offset in [
+                    glam::Vec3::ZERO,
+                    glam::Vec3::X * marker_size,
+                    -glam::Vec3::X * marker_size,
+                    glam::Vec3::Y * marker_size,
+                    -glam::Vec3::Y * marker_size,
+                ] {
+                    self.visible_vertices.push((world_pos + offset).extend(0.5));
+                }
+                if self.visible_vertices.len() >= 95_000 {
+                    break;
+                }
+            }
+        }
+
+        self.queue.write_buffer(&self.scaffold_buffer, 0, bytemuck::cast_slice(&self.visible_vertices));
+        self.params.scaffold_count = self.visible_vertices.len() as u32;
+    }
+
     fn run_depth_pass(&self, encoder: &mut wgpu::CommandEncoder, instances_to_draw: &[math::InstanceData]) {
         if instances_to_draw.is_empty() && (self.params.anchor_count == 0 || self.triangles.is_empty()) {
             return;
@@ -1973,6 +2345,10 @@ impl<'a> App<'a> {
         }
     }
 
+    fn run_shadow_pass(&self, encoder: &mut wgpu::CommandEncoder) {
+        self.shadow_system.run(encoder);
+    }
+
     fn run_compute_pass(&self, encoder: &mut wgpu::CommandEncoder) {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Compute"),
@@ -2054,7 +2430,11 @@ impl<'a> App<'a> {
                 view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
+                    load: if self.debug_mode == 6 {
+                        wgpu::LoadOp::Clear(wgpu::Color { r: 0.015, g: 0.015, b: 0.02, a: 1.0 })
+                    } else {
+                        wgpu::LoadOp::Load
+                    },
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -2064,7 +2444,7 @@ impl<'a> App<'a> {
         });
         rpass.set_pipeline(&self.scaffold_render_pipeline);
         rpass.set_bind_group(0, &self.compute_bind_group, &[]);
-        if self.show_scaffold && self.params.scaffold_count > 0 {
+        if (self.show_scaffold || self.debug_mode == 6) && self.params.scaffold_count > 0 {
             rpass.draw(0..self.params.scaffold_count, 0..1);
         }
     }
@@ -2095,6 +2475,11 @@ impl<'a> App<'a> {
     }
 
     fn update(&mut self, delta_time: f32) {
+        if self.rebuild_colliders_requested {
+            self.rebuild_colliders();
+            self.rebuild_colliders_requested = false;
+        }
+
         // WASD 移动逻辑
         let move_speed = 2.0 * delta_time;
         if self.is_w_pressed {
@@ -2125,6 +2510,8 @@ impl<'a> App<'a> {
         
         self.queue.write_buffer(&self.params_buffer, 0, bytemuck::cast_slice(&[self.params]));
 
+        physics::apply_physics(&mut self.instances, &mut self.instance_physics, &self.model_colliders, self.edit_mode != EditMode::None, delta_time);
+
         // G/R/S 编辑模式处理
         if let Some(idx) = self.selected_instance {
             match self.edit_mode {
@@ -2147,13 +2534,34 @@ impl<'a> App<'a> {
                         let t = (self.initial_pos.y - ray_o.y) / ray_dir.y;
                         let new_pos = ray_o + ray_dir * t;
 
+                        // 应用 Blender 风格轴约束
+                        let constrained_pos = match self.axis_constraint {
+                            AxisConstraint::None => new_pos,
+                            // 单轴约束：计算射线到轴线的最近点
+                            AxisConstraint::X => self.ray_closest_to_axis(ray_o, ray_dir, self.initial_pos, glam::Vec3::X),
+                            AxisConstraint::Y => self.ray_closest_to_axis(ray_o, ray_dir, self.initial_pos, glam::Vec3::Y),
+                            AxisConstraint::Z => self.ray_closest_to_axis(ray_o, ray_dir, self.initial_pos, glam::Vec3::Z),
+                            // 平面约束：投影到对应平面
+                            AxisConstraint::YZ => {
+                                let t_x = (self.initial_pos.x - ray_o.x) / ray_dir.x;
+                                ray_o + ray_dir * t_x
+                            }
+                            AxisConstraint::XZ => new_pos,
+                            AxisConstraint::XY => {
+                                let t_z = (self.initial_pos.z - ray_o.z) / ray_dir.z;
+                                ray_o + ray_dir * t_z
+                            }
+                        };
+
                         // 更新矩阵
                         let new_mat = glam::Mat4::from_scale_rotation_translation(
                             self.initial_scale,
                             self.initial_rot,
-                            new_pos
+                            constrained_pos
                         );
                         self.instances[idx].model_matrix = new_mat.to_cols_array_2d();
+                        self.instance_physics[idx].velocity = glam::Vec3::ZERO;
+                        self.instance_physics[idx].angular_velocity = glam::Vec3::ZERO;
                         
                         // 实时同步 GPU
                         self.queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&self.instances));
@@ -2166,18 +2574,16 @@ impl<'a> App<'a> {
                         self.last_mouse_pos[1] - self.initial_mouse_pos.y
                     );
 
-                    // 根据鼠标位移计算旋转角度
-                    let rotate_speed = 0.005;
-                    let rot_x = mouse_delta.y * rotate_speed;
-                    let rot_y = mouse_delta.x * rotate_speed;
-
-                    // 创建旋转四元数
-                    let new_rot = glam::Quat::from_euler(
-                        glam::EulerRot::XYZ,
-                        rot_x,
-                        rot_y,
-                        0.0
-                    ) * self.initial_rot;
+                    // Blender 风格旋转：无约束绕视线方向旋转，X/Y/Z 绕世界轴旋转
+                    let rotate_speed = 0.01;
+                    let angle = (mouse_delta.x - mouse_delta.y) * rotate_speed;
+                    let axis = match self.axis_constraint {
+                        AxisConstraint::X | AxisConstraint::YZ => glam::Vec3::X,
+                        AxisConstraint::Y | AxisConstraint::XZ => glam::Vec3::Y,
+                        AxisConstraint::Z | AxisConstraint::XY => glam::Vec3::Z,
+                        AxisConstraint::None => self.camera.get_forward(),
+                    };
+                    let new_rot = glam::Quat::from_axis_angle(axis.normalize(), angle) * self.initial_rot;
 
                     // 更新矩阵
                     let new_mat = glam::Mat4::from_scale_rotation_translation(
@@ -2186,6 +2592,8 @@ impl<'a> App<'a> {
                         self.initial_pos
                     );
                     self.instances[idx].model_matrix = new_mat.to_cols_array_2d();
+                    self.instance_physics[idx].velocity = glam::Vec3::ZERO;
+                    self.instance_physics[idx].angular_velocity = glam::Vec3::ZERO;
                     
                     // 实时同步 GPU
                     self.queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&self.instances));
@@ -2208,6 +2616,8 @@ impl<'a> App<'a> {
                         self.initial_pos
                     );
                     self.instances[idx].model_matrix = new_mat.to_cols_array_2d();
+                    self.instance_physics[idx].velocity = glam::Vec3::ZERO;
+                    self.instance_physics[idx].angular_velocity = glam::Vec3::ZERO;
                     
                     // 实时同步 GPU
                     self.queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&self.instances));
@@ -2222,6 +2632,7 @@ impl<'a> App<'a> {
         self.egui_ctx.begin_frame(raw_input);
 
         let mut import_clicked = false;
+        self.sync_instance_physics_len();
 
         // FPS 显示 (右上角)
         egui::Window::new("FPS")
@@ -2239,7 +2650,25 @@ impl<'a> App<'a> {
         egui::SidePanel::left("panel").show(&self.egui_ctx, |ui| {
             ui.heading("CrSculpt 创作台");
             ui.separator();
-
+            if self.edit_mode != EditMode::None {
+                let mode_name = match self.edit_mode {
+                    EditMode::Grab => "移动 (G)",
+                    EditMode::Rotate => "旋转 (R)",
+                    EditMode::Scale => "缩放 (S)",
+                    _ => "",
+                };
+                let axis_name = match self.axis_constraint {
+                    AxisConstraint::X => " | 锁定 X 轴",
+                    AxisConstraint::Y => " | 锁定 Y 轴",
+                    AxisConstraint::Z => " | 锁定 Z 轴",
+                    AxisConstraint::YZ => " | 锁定 YZ 平面",
+                    AxisConstraint::XZ => " | 锁定 XZ 平面",
+                    AxisConstraint::XY => " | 锁定 XY 平面",
+                    AxisConstraint::None => "",
+                };
+                ui.label(egui::RichText::new(format!("{}{}", mode_name, axis_name)).color(egui::Color32::from_rgb(100, 200, 255)));
+                ui.label("X/Y/Z 锁定轴 | Shift+X/Y/Z 锁定平面 | Esc/左键 退出");
+            }
             ui.separator();
             ui.label("几何体列表:");
 
@@ -2250,15 +2679,46 @@ impl<'a> App<'a> {
             ui.checkbox(&mut self.show_perf_monitor, "性能监控 (Profiler)");
             ui.separator();
             ui.label("调试模式 (Ap 可视化):");
-            ui.add(egui::Slider::new(&mut self.debug_mode, 0..=3).text("debug_mode"));
+            ui.add(egui::Slider::new(&mut self.debug_mode, 0..=6).text("debug_mode"));
             let mode_label = match self.debug_mode {
                 0 => "0: 正常渲染",
                 1 => "1: Ap1 - ID 图 (绿色=有三角面)",
                 2 => "2: Ap2 - 位移点 (红色=已映射)",
                 3 => "3: Ap3 - 补洞 (蓝色=补出来的)",
+                4 => "4: 隐性 SDF 距离场 (绿近红远)",
+                5 => "5: 融合 SDF 预览 (红=融合增强, 绿=距离近)",
+                6 => "6: 物理碰撞体采样点 (黄色=参与碰撞)",
                 _ => "未知模式",
             };
             ui.label(mode_label);
+            ui.separator();
+            ui.label("选中模型物理:");
+            ui.label("碰撞: SDF Grid + 子步进 CCD");
+            if ui.button("构建碰撞体 SDF").clicked() {
+                self.rebuild_colliders_requested = true;
+            }
+            if self.model_colliders.is_empty() {
+                ui.label("尚未构建碰撞体，请点击上方按钮");
+            } else if let Some(idx) = self.selected_instance.filter(|idx| *idx < self.instances.len()) {
+                ui.label(format!("当前实例: {}", idx));
+                ui.checkbox(&mut self.instance_physics[idx].gravity_enabled, "开启重力");
+                ui.label(format!("速度: {:.2}, {:.2}, {:.2}",
+                    self.instance_physics[idx].velocity.x,
+                    self.instance_physics[idx].velocity.y,
+                    self.instance_physics[idx].velocity.z,
+                ));
+                ui.label(format!("角速度: {:.2}, {:.2}, {:.2}",
+                    self.instance_physics[idx].angular_velocity.x,
+                    self.instance_physics[idx].angular_velocity.y,
+                    self.instance_physics[idx].angular_velocity.z,
+                ));
+                if ui.button("清零速度").clicked() {
+                    self.instance_physics[idx].velocity = glam::Vec3::ZERO;
+                    self.instance_physics[idx].angular_velocity = glam::Vec3::ZERO;
+                }
+            } else {
+                ui.label("未选中模型");
+            }
             ui.separator();
             ui.label("扭曲参数:");
             ui.add(egui::Slider::new(&mut self.params.distort_strength, 0.0..=2.0).text("扭曲强度"));
@@ -2464,6 +2924,11 @@ impl<'a> App<'a> {
 
         let instances_to_draw = self.build_instances_to_draw();
         self.params.instance_count = instances_to_draw.len() as u32;
+        if self.debug_mode == 6 {
+            self.update_collider_debug_points();
+        } else if !self.show_scaffold {
+            self.params.scaffold_count = 0;
+        }
 
         // === 计时：Buffer 上传 ===
         let tb = std::time::Instant::now();
@@ -2492,13 +2957,17 @@ impl<'a> App<'a> {
         
         self.run_compute_pass(&mut encoder);
         encoder.write_timestamp(&self.ts_query_set, 2); // compute 结束
+
+        self.run_shadow_pass(&mut encoder);
         
         self.run_ap3_pass(&mut encoder);
         encoder.write_timestamp(&self.ts_query_set, 3); // ap3 结束
         
         // self.run_forward_pass(&mut encoder, &self.output_texture_view, &instances_to_draw);
         
-        self.run_draw_pass(&mut encoder, &view);
+        if self.debug_mode != 6 {
+            self.run_draw_pass(&mut encoder, &view);
+        }
         encoder.write_timestamp(&self.ts_query_set, 4); // draw 结束
         
         self.run_scaffold_pass(&mut encoder, &view);
@@ -2591,7 +3060,7 @@ impl<'a> App<'a> {
             depth_draw_calls: instances_to_draw.len() as u32,
             forward_draw_calls: 0,
             draw_draw_calls: 1,
-            scaffold_draw_calls: if self.show_scaffold { 1 } else { 0 },
+            scaffold_draw_calls: if self.show_scaffold || self.debug_mode == 6 { 1 } else { 0 },
             total_triangles: self.triangles.len() as u32,
             rendered_triangles: rendered_tris,
             instance_count: instances_to_draw.len() as u32,
@@ -2764,6 +3233,21 @@ impl<'a> App<'a> {
             self.warped_pos_texture_view = self.warped_pos_texture.create_view(&wgpu::TextureViewDescriptor::default());
             self.warped_pos_texture_view_for_render = self.warped_pos_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+            self.shadow_system.resize(
+                &self.device,
+                new_size.width,
+                new_size.height,
+                shadow::ShadowInputs {
+                    params_buffer: &self.params_buffer,
+                    triangle_buffer: &self.triangle_buffer,
+                    instance_buffer: &self.instance_buffer,
+                    warp_buffer: &self.warp_buffer,
+                    tri_id_view: &self.tri_id_texture_view,
+                    world_pos_view: &self.uv_texture_view,
+                    normal_view: &self.normal_texture_view,
+                },
+            );
+
             // 4. 关键修复：重新创建 BindGroup，否则它们引用的还是旧视图
             let (compute, render, depth, depth_blit) = Self::create_all_bind_groups(
                 &self.device,
@@ -2781,6 +3265,7 @@ impl<'a> App<'a> {
                 &self.model_uv_texture_view,
                 &self.normal_texture_view,
                 &self.warped_pos_texture_view,
+                &self.shadow_system.view,
                 &self.albedo_texture_view,
                 &self.albedo_sampler,
                 &self.instance_buffer,
@@ -3021,6 +3506,10 @@ impl<'a> App<'a> {
                 material_id: new_model_id,
                 material_color,
             });
+            if let Some(reg) = self.model_registry.get(&new_model_id) {
+                let temp_registry = std::collections::HashMap::from([(new_model_id, reg.clone())]);
+                self.model_colliders.extend(Self::build_model_colliders(&temp_registry, &self.triangles));
+            }
 
             // 为新模型创建 material bind group
             let new_mat_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3061,6 +3550,7 @@ impl<'a> App<'a> {
                 &self.model_uv_texture_view,
                 &self.normal_texture_view,
                 &self.warped_pos_texture_view,
+                &self.shadow_system.view,
                 &self.albedo_texture_view,
                 &self.albedo_sampler,
                 &self.instance_buffer,
@@ -3074,7 +3564,7 @@ impl<'a> App<'a> {
 
             // === 为导入的模型创建默认实例 ===
             if let Some(instance) = self.make_instance(new_model_id, 0, glam::Mat4::IDENTITY) {
-                self.instances.push(instance);
+                self.push_instance(instance);
             }
             self.queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&self.instances));
 
@@ -3090,6 +3580,9 @@ fn main() {
     window.set_title("CrSculpt");
 
     let mut app = pollster::block_on(App::new(window.clone()));
+
+    // 自动加载上次保存的场景
+    app.load_scene();
 
     let mut last_time = std::time::Instant::now();
 
@@ -3137,18 +3630,71 @@ fn main() {
                             PhysicalKey::Code(KeyCode::KeyG) => {
                                 if pressed && app.selected_instance.is_some() {
                                     app.edit_mode = EditMode::Grab;
+                                    app.axis_constraint = AxisConstraint::None;
                                     app.initial_mouse_pos = glam::Vec2::new(app.last_mouse_pos[0], app.last_mouse_pos[1]);
                                 }
                             }
                             PhysicalKey::Code(KeyCode::KeyR) => {
                                 if pressed && app.selected_instance.is_some() {
                                     app.edit_mode = EditMode::Rotate;
+                                    app.axis_constraint = AxisConstraint::None;
                                     app.initial_mouse_pos = glam::Vec2::new(app.last_mouse_pos[0], app.last_mouse_pos[1]);
+                                }
+                            }
+                            PhysicalKey::Code(key @ (KeyCode::KeyX | KeyCode::KeyY | KeyCode::KeyZ)) => {
+                                if app.edit_mode == EditMode::Grab || app.edit_mode == EditMode::Rotate {
+                                    if pressed {
+                                        let axis = match key {
+                                            KeyCode::KeyX => AxisConstraint::X,
+                                            KeyCode::KeyY => AxisConstraint::Y,
+                                            _ => AxisConstraint::Z,
+                                        };
+                                        let plane = match key {
+                                            KeyCode::KeyX => AxisConstraint::YZ,
+                                            KeyCode::KeyY => AxisConstraint::XZ,
+                                            _ => AxisConstraint::XY,
+                                        };
+                                        if app.is_shift_pressed {
+                                            app.axis_constraint = plane;
+                                        } else {
+                                            if app.last_axis_key == Some(key) {
+                                                app.axis_constraint = AxisConstraint::None;
+                                            } else {
+                                                app.axis_constraint = axis;
+                                            }
+                                        }
+                                        app.last_axis_key = Some(key);
+                                    }
                                 }
                             }
                             PhysicalKey::Code(KeyCode::Escape) => {
                                 if pressed {
                                     app.edit_mode = EditMode::None;
+                                    app.axis_constraint = AxisConstraint::None;
+                                }
+                            }
+                            PhysicalKey::Code(KeyCode::KeyP) => {
+                                if pressed {
+                                    app.save_scene();
+                                }
+                            }
+                            PhysicalKey::Code(KeyCode::Delete) => {
+                                if pressed {
+                                    if let Some(idx) = app.selected_instance {
+                                        if idx < app.instances.len() {
+                                            app.instances.remove(idx);
+                                            app.instance_physics.remove(idx);
+                                            app.selected_instance = None;
+                                            app.params.selected_instance_id = u32::MAX;
+                                            app.queue.write_buffer(&app.params_buffer, 0, bytemuck::cast_slice(&[app.params]));
+                                            // 重新上传实例数据到 GPU
+                                            let instance_count = app.instances.len().max(1);
+                                            let buffer_size = (instance_count * std::mem::size_of::<math::InstanceData>()) as u64;
+                                            App::ensure_buffer_size(&app.device, &mut app.instance_buffer, buffer_size, "Instance Buffer", wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
+                                            app.queue.write_buffer(&app.instance_buffer, 0, bytemuck::cast_slice(&app.instances));
+                                            println!("已删除实例 {}", idx);
+                                        }
+                                    }
                                 }
                             }
                             _ => {}
@@ -3171,6 +3717,8 @@ fn main() {
                             // 编辑模式下，左键按下表示确认变换
                             if *state == winit::event::ElementState::Pressed && app.edit_mode != EditMode::None {
                                 app.edit_mode = EditMode::None;
+                                app.axis_constraint = AxisConstraint::None;
+                                app.last_axis_key = None;
                                 println!("编辑模式已退出");
                             }
                             
@@ -3197,7 +3745,7 @@ fn main() {
                                                 intersect_pos,
                                             );
                                             if let Some(new_instance) = app.make_instance(model_id, app.instances.len() as u32, transform) {
-                                                app.instances.push(new_instance);
+                                                app.push_instance(new_instance);
                                                 app.queue.write_buffer(&app.instance_buffer, 0, bytemuck::cast_slice(&app.instances));
                                                 println!("放置实例: 模型 ID {} 在位置 {:?}", model_id, intersect_pos);
                                                 app.active_spawn_id = None; // 退出放置模式

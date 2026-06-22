@@ -466,7 +466,7 @@ impl<'a> App<'a> {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Sculpt Shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("sculpt.wgsl"))),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("mainshader.wgsl"))),
         });
 
         let mut params = Params::default();

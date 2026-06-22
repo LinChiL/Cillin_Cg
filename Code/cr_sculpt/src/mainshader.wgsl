@@ -17,7 +17,7 @@ struct InstanceData {
     model_id: u32,
     instance_id: u32,
     tri_start: u32,
-    _pad_inner: u32,
+    tri_count: u32,
     material_color: vec4<f32>,
     _pad: array<vec4<u32>, 2>,
 };
@@ -76,6 +76,8 @@ struct WarpPixel {
 @group(0) @binding(12) var model_uv_tex: texture_2d<f32>;
 @group(0) @binding(13) var normal_tex: texture_2d<f32>;
 @group(0) @binding(15) var warp_normal_tex: texture_2d<f32>;
+@group(0) @binding(16) var pixel_shadow_tex: texture_2d<f32>;
+@group(0) @binding(17) var pixel_shadow_out: texture_storage_2d<rgba8unorm, write>;
 
 // 2. Render 阶段使用的声明
 @group(0) @binding(14) var t_read: texture_2d<f32>;
@@ -118,6 +120,18 @@ fn warp_displacement(world_pos: vec3<f32>) -> f32 {
     let frequency = max(params.distort_frequency, 0.001);
     let roughness = fbm(world_pos * 10.0 * frequency);
     return roughness * 0.5 * params.distort_strength;
+}
+
+fn transform_normal(model_matrix: mat4x4<f32>, local_normal: vec3<f32>) -> vec3<f32> {
+    let x = model_matrix[0].xyz;
+    let y = model_matrix[1].xyz;
+    let z = model_matrix[2].xyz;
+    let nx = cross(y, z);
+    let ny = cross(z, x);
+    let nz = cross(x, y);
+    let det = dot(x, nx);
+    let normal = nx * local_normal.x + ny * local_normal.y + nz * local_normal.z;
+    return normalize(select(normal, -normal, det < 0.0));
 }
 
 fn warp_world_pos(world_pos: vec3<f32>, world_normal: vec3<f32>) -> vec3<f32> {
@@ -223,54 +237,84 @@ fn cs_ap2(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
-fn compute_sdf(src_x: u32, src_y: u32, tri_id: u32) -> f32 {
-    if (tri_id >= params.anchor_count) {
-        return 1e9;
+fn point_segment_distance(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>) -> f32 {
+    let ab = b - a;
+    let h = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-8), 0.0, 1.0);
+    return distance(p, a + ab * h);
+}
+
+fn point_triangle_distance(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, c: vec3<f32>) -> f32 {
+    let ab = b - a;
+    let ac = c - a;
+    let n = normalize(cross(ab, ac));
+    let plane_p = p - n * dot(p - a, n);
+
+    let c0 = cross(b - a, plane_p - a);
+    let c1 = cross(c - b, plane_p - b);
+    let c2 = cross(a - c, plane_p - c);
+    let inside = dot(c0, n) >= 0.0 && dot(c1, n) >= 0.0 && dot(c2, n) >= 0.0;
+    if (inside) {
+        return abs(dot(p - a, n));
     }
 
-    let tri = triangles[tri_id];
-    let pixel_pos = vec3<f32>(f32(src_x), f32(src_y), 0.0);
+    return min(
+        point_segment_distance(p, a, b),
+        min(point_segment_distance(p, b, c), point_segment_distance(p, c, a)),
+    );
+}
 
-    let edge0 = tri.v1.xyz - tri.v0.xyz;
-    let edge1 = tri.v2.xyz - tri.v0.xyz;
-    let v0v0 = tri.v0.xyz - pixel_pos;
+fn smooth_min(a: f32, b: f32, k: f32) -> f32 {
+    let h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+    return mix(b, a, h) - k * h * (1.0 - h);
+}
 
-    let d00 = dot(edge0, edge0);
-    let d01 = dot(edge0, edge1);
-    let d11 = dot(edge1, edge1);
-    let d20 = dot(v0v0, edge0);
-    let d21 = dot(v0v0, edge1);
+fn compute_triangle_local_sdf_debug(tri: Triangle, barycentric: vec3<f32>) -> vec2<f32> {
+    let p = tri.v0.xyz * barycentric.x + tri.v1.xyz * barycentric.y + tri.v2.xyz * barycentric.z;
+    let face_n = normalize(cross(tri.v1.xyz - tri.v0.xyz, tri.v2.xyz - tri.v0.xyz));
+    let plane_dist = dot(p - tri.v0.xyz, face_n);
+    let edge_dist = min(
+        point_segment_distance(p, tri.v0.xyz, tri.v1.xyz),
+        min(
+            point_segment_distance(p, tri.v1.xyz, tri.v2.xyz),
+            point_segment_distance(p, tri.v2.xyz, tri.v0.xyz),
+        ),
+    );
+    let inside = all(barycentric >= vec3<f32>(0.0)) && dot(barycentric, vec3<f32>(1.0)) <= 1.0;
+    let surface_sdf = select(sqrt(plane_dist * plane_dist + edge_dist * edge_dist), abs(plane_dist), inside);
+    return vec2<f32>(surface_sdf, edge_dist);
+}
 
-    let denom = d00 * d11 - d01 * d01;
-    if (abs(denom) < 1e-10) {
-        return 1e9;
+fn compute_fusion_sdf(world_pos: vec3<f32>, source_instance_id: u32, source_tri_idx: u32) -> vec2<f32> {
+    var hard_min = 1e6;
+    var blended = 1e6;
+    var hits = 0u;
+    let max_instances = min(params.instance_count, 16u);
+
+    for (var inst_i = 0u; inst_i < max_instances; inst_i = inst_i + 1u) {
+        let instance = instances[inst_i];
+        let tri_base = instance.tri_start;
+
+        let tri_count = min(instance.tri_count, params.anchor_count - min(tri_base, params.anchor_count));
+        for (var local_tri = 0u; local_tri < tri_count; local_tri = local_tri + 1u) {
+            let tri_idx = tri_base + local_tri;
+            if (inst_i == source_instance_id && tri_idx == source_tri_idx) {
+                continue;
+            }
+            let tri = triangles[tri_idx];
+            let w0 = (instance.model_matrix * tri.v0).xyz;
+            let w1 = (instance.model_matrix * tri.v1).xyz;
+            let w2 = (instance.model_matrix * tri.v2).xyz;
+            let d = point_triangle_distance(world_pos, w0, w1, w2);
+            hard_min = min(hard_min, d);
+            blended = smooth_min(blended, d, 0.12);
+            hits = hits + 1u;
+        }
     }
 
-    let inv_denom = 1.0 / denom;
-    let alpha = (d11 * d20 - d01 * d21) * inv_denom;
-    let beta = (d00 * d21 - d01 * d20) * inv_denom;
-
-    if (alpha >= 0.0 && beta >= 0.0 && alpha + beta < 1.0) {
-        let p = tri.v0.xyz + alpha * edge0 + beta * edge1;
-        return distance(p, pixel_pos);
+    if (hits == 0u) {
+        return vec2<f32>(1e6, 1e6);
     }
-
-    let d1 = dot(edge0, v0v0);
-    let d2 = dot(edge1, v0v0);
-    let e2 = d00 * d11 - d01 * d01;
-
-    let s = clamp((d11 * d1 - d01 * d2) / e2, 0.0, 1.0);
-    let t = clamp((d00 * d2 - d01 * d1) / e2, 0.0, 1.0);
-    
-    let s_comp = 1.0 - s;
-    let t_comp = 1.0 - t;
-
-    if (s_comp + t_comp > 1.0) {
-        return 1e9;
-    }
-
-    let p = tri.v0.xyz + s * edge0 + t * edge1;
-    return distance(p, pixel_pos);
+    return vec2<f32>(hard_min, blended);
 }
 
 fn get_search_dir(d: u32) -> vec2<i32> {
@@ -295,6 +339,97 @@ fn get_search_step(s: u32) -> i32 {
         case 4u:  { return 12; }
         default:  { return 16; } 
     }
+}
+
+fn shadow_at_pixel(pixel: vec2<i32>) -> f32 {
+    return textureLoad(pixel_shadow_tex, pixel, 0).r;
+}
+
+fn ray_triangle_t(origin: vec3<f32>, dir: vec3<f32>, a: vec3<f32>, b: vec3<f32>, c: vec3<f32>) -> f32 {
+    let e1 = b - a;
+    let e2 = c - a;
+    let pvec = cross(dir, e2);
+    let det = dot(e1, pvec);
+    if (abs(det) < 1e-6) { return -1.0; }
+    let inv_det = 1.0 / det;
+    let tvec = origin - a;
+    let u = dot(tvec, pvec) * inv_det;
+    if (u < 0.0 || u > 1.0) { return -1.0; }
+    let qvec = cross(tvec, e1);
+    let v = dot(dir, qvec) * inv_det;
+    if (v < 0.0 || u + v > 1.0) { return -1.0; }
+    return dot(e2, qvec) * inv_det;
+}
+
+fn trace_pixel_shadow(world_pos: vec3<f32>, world_normal: vec3<f32>, source_tri_id: u32) -> f32 {
+    let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.5));
+    let n = normalize(world_normal);
+    let origin = world_pos + n * 0.015 + light_dir * 0.02;
+
+    if (light_dir.y < -0.001) {
+        let ground_t = -origin.y / light_dir.y;
+        if (ground_t > 0.02 && ground_t < 200.0) { return 0.35; }
+    }
+
+    let source_instance_id = select(0xffffffffu, (source_tri_id >> 24u) - 1u, source_tri_id != 0u);
+    let source_tri_idx = select(0xffffffffu, (source_tri_id & 0x00ffffffu) - 1u, source_tri_id != 0u);
+    let max_instances = min(params.instance_count, 32u);
+    for (var inst_i = 0u; inst_i < max_instances; inst_i = inst_i + 1u) {
+        let instance = instances[inst_i];
+        let tri_count = min(instance.tri_count, params.anchor_count - min(instance.tri_start, params.anchor_count));
+        for (var local_tri = 0u; local_tri < tri_count; local_tri = local_tri + 1u) {
+            let tri_idx = instance.tri_start + local_tri;
+            if (inst_i == source_instance_id && tri_idx == source_tri_idx) { continue; }
+            let tri = triangles[tri_idx];
+            let a = (instance.model_matrix * tri.v0).xyz;
+            let b = (instance.model_matrix * tri.v1).xyz;
+            let c = (instance.model_matrix * tri.v2).xyz;
+            let t = ray_triangle_t(origin, light_dir, a, b, c);
+            if (t > 0.02 && t < 200.0) { return 0.35; }
+        }
+    }
+    return 1.0;
+}
+
+@compute @workgroup_size(8, 8)
+fn cs_shadow_trace(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x >= params.screen_width || gid.y >= params.screen_height) { return; }
+    let pixel = vec2<i32>(i32(gid.x), i32(gid.y));
+    let warp_idx = gid.y * params.screen_width + gid.x;
+    let flags = atomicLoad(&warpBuffer[warp_idx].flags);
+    var tri_id = warpBuffer[warp_idx].tri_id;
+    var world_pos = vec3<f32>(0.0);
+    var world_normal = vec3<f32>(0.0, 1.0, 0.0);
+
+    if (flags != 0u && tri_id != 0u) {
+        let instance_id = (tri_id >> 24u) - 1u;
+        let tri_idx = (tri_id & 0x00ffffffu) - 1u;
+        let instance = instances[instance_id];
+        let tri = triangles[tri_idx];
+        let b = warpBuffer[warp_idx].barycentric.xyz;
+        let local_pos = tri.v0.xyz * b.x + tri.v1.xyz * b.y + tri.v2.xyz * b.z;
+        let world_pos_pre = instance.model_matrix * vec4<f32>(local_pos, 1.0);
+        world_pos = world_pos_pre.xyz / world_pos_pre.w;
+        let local_n = normalize(tri.warp_n0.xyz * b.x + tri.warp_n1.xyz * b.y + tri.warp_n2.xyz * b.z);
+        world_normal = transform_normal(instance.model_matrix, local_n);
+    } else {
+        let screen_pos = vec2<f32>(f32(gid.x), f32(gid.y));
+        let size_f = vec2<f32>(f32(params.screen_width), f32(params.screen_height));
+        let uv = (screen_pos / size_f) * 2.0 - 1.0;
+        let ray_target = params.proj_inv * vec4<f32>(uv.x, -uv.y, 1.0, 1.0);
+        let ray_dir = normalize((params.view_inv * vec4<f32>(normalize(ray_target.xyz / ray_target.w), 0.0)).xyz);
+        let ray_o = params.cam_pos.xyz;
+        let t_grid = -ray_o.y / (ray_dir.y + 0.00001);
+        if (t_grid <= 0.0 || t_grid >= 100.0) {
+            textureStore(pixel_shadow_out, pixel, vec4<f32>(1.0, 0.0, 0.0, 1.0));
+            return;
+        }
+        world_pos = ray_o + ray_dir * t_grid;
+        world_normal = vec3<f32>(0.0, 1.0, 0.0);
+    }
+
+    let shadow = trace_pixel_shadow(world_pos, world_normal, tri_id);
+    textureStore(pixel_shadow_out, pixel, vec4<f32>(shadow, 0.0, 0.0, 1.0));
 }
 
 
@@ -331,6 +466,51 @@ fn cs_ap3(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
+    // --- 调试模式 4: 查看隐性 SDF 距离场 ---
+    if (params.debug_mode == 4u) {
+        if (flags == 0u) {
+            textureStore(output_texture, screen_coord, vec4<f32>(0.02, 0.02, 0.04, 1.0));
+        } else {
+            let tri_id = warpBuffer[warp_idx].tri_id;
+            let tri_idx = (tri_id & 0x00FFFFFFu) - 1u;
+            let tri = triangles[tri_idx];
+            let b = warpBuffer[warp_idx].barycentric.xyz;
+            let sdf_debug = compute_triangle_local_sdf_debug(tri, b);
+            sdfOutput[warp_idx] = sdf_debug.x;
+            let edge_heat = clamp(sdf_debug.y * 40.0, 0.0, 1.0);
+            let contour = 1.0 - abs(fract(sdf_debug.y * 120.0) * 2.0 - 1.0);
+            textureStore(output_texture, screen_coord, vec4<f32>(edge_heat, 1.0 - edge_heat, contour * 0.8, 1.0));
+        }
+        return;
+    }
+
+    // --- 调试模式 5: 查看实例间融合 SDF 预览 ---
+    if (params.debug_mode == 5u) {
+        if (flags == 0u) {
+            textureStore(output_texture, screen_coord, vec4<f32>(0.02, 0.02, 0.04, 1.0));
+        } else {
+            let tri_id = warpBuffer[warp_idx].tri_id;
+            let instance_id = (tri_id >> 24u) - 1u;
+            let tri_idx = (tri_id & 0x00FFFFFFu) - 1u;
+            let instance = instances[instance_id];
+            let tri = triangles[tri_idx];
+            let b = warpBuffer[warp_idx].barycentric.xyz;
+            let local_pos = tri.v0.xyz * b.x + tri.v1.xyz * b.y + tri.v2.xyz * b.z;
+            let world_pos_pre = instance.model_matrix * vec4<f32>(local_pos, 1.0);
+            let world_pos = world_pos_pre.xyz / world_pos_pre.w;
+            let fusion = compute_fusion_sdf(world_pos, instance_id, tri_idx);
+            let blend_gain = clamp((fusion.x - fusion.y) * 18.0, 0.0, 1.0);
+            let near = 1.0 - clamp(fusion.x * 6.0, 0.0, 1.0);
+            sdfOutput[warp_idx] = fusion.y;
+            textureStore(output_texture, screen_coord, vec4<f32>(blend_gain, near, 1.0 - blend_gain, 1.0));
+        }
+        return;
+    }
+
+    if (flags == 0u) {
+        sdfOutput[warp_idx] = 1e6;
+    }
+
     // --- 最终着色 ---
     if (flags > 0u) {
         let tri_id = warpBuffer[warp_idx].tri_id;
@@ -339,6 +519,8 @@ fn cs_ap3(@builtin(global_invocation_id) gid: vec3<u32>) {
         let instance = instances[instance_id];
         let tri = triangles[tri_idx];
         let b = warpBuffer[warp_idx].barycentric.xyz;
+        let sdf_debug = compute_triangle_local_sdf_debug(tri, b);
+        sdfOutput[warp_idx] = sdf_debug.x;
 
         let local_pos = tri.v0.xyz * b.x + tri.v1.xyz * b.y + tri.v2.xyz * b.z;
         let world_pos_pre = instance.model_matrix * vec4<f32>(local_pos, 1.0);
@@ -348,7 +530,7 @@ fn cs_ap3(@builtin(global_invocation_id) gid: vec3<u32>) {
         let tex_color = textureSampleLevel(t_albedo, s_albedo, model_uv, 0.0).rgb;
 
         let local_n = normalize(tri.n0.xyz * b.x + tri.n1.xyz * b.y + tri.n2.xyz * b.z);
-        let macro_n = normalize((instance.model_matrix * vec4<f32>(local_n, 0.0)).xyz);
+        let macro_n = transform_normal(instance.model_matrix, local_n);
 
         let eps = 0.002;
         let freq = max(params.distort_frequency, 0.001);
@@ -361,8 +543,9 @@ fn cs_ap3(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let L = normalize(vec3<f32>(0.5, 1.0, 0.5));
         let diff = max(dot(final_n, L), 0.0) * 0.8 + 0.2;
+        let shadow = shadow_at_pixel(screen_coord);
 
-        var final_col = tex_color * diff;
+        var final_col = tex_color * diff * shadow;
         final_col = pow(final_col, vec3<f32>(1.0 / 2.2));
         textureStore(output_texture, screen_coord, vec4<f32>(final_col, 1.0));
     }
@@ -384,9 +567,17 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let t_grid = -ray_o.y / (ray_dir.y + 0.00001);
     if (t_grid > 0.0 && t_grid < 100.0) {
         let p = ray_o + ray_dir * t_grid;
+        let cell = floor(p.xz);
+        let checker = select(0.0, 1.0, (i32(cell.x + cell.y) & 1) == 0);
+        let base = mix(vec3<f32>(0.18, 0.18, 0.19), vec3<f32>(0.28, 0.28, 0.30), checker);
         let grid_uv = abs(fract(p.xz - 0.5) - 0.5);
-        let grid = smoothstep(0.02, 0.0, grid_uv.x) + smoothstep(0.02, 0.0, grid_uv.y);
-        bg_col = mix(bg_col, vec3<f32>(0.2, 0.2, 0.25), grid * 0.5);
+        let grid = min(1.0, smoothstep(0.025, 0.0, grid_uv.x) + smoothstep(0.025, 0.0, grid_uv.y));
+        let axis_x = smoothstep(0.035, 0.0, abs(p.z));
+        let axis_z = smoothstep(0.035, 0.0, abs(p.x));
+        bg_col = mix(base, vec3<f32>(0.05, 0.05, 0.06), grid * 0.45);
+        bg_col = mix(bg_col, vec3<f32>(0.75, 0.18, 0.18), axis_x * 0.7);
+        bg_col = mix(bg_col, vec3<f32>(0.18, 0.35, 0.75), axis_z * 0.7);
+        bg_col *= shadow_at_pixel(screen_coord);
     }
     textureStore(output_texture, screen_coord, vec4<f32>(bg_col, 1.0));
 }
@@ -413,18 +604,20 @@ fn vs_scaffold(@builtin(vertex_index) idx: u32) -> ScaffoldVertexOutput {
     var out: ScaffoldVertexOutput;
     let vertex_data = scaffold[idx];
     let p_world = vertex_data.xyz;
-    let normal_x = vertex_data.w * 2.0 - 1.0;
-    let normal = vec3<f32>(normal_x, 0.0, 0.0);
-    let to_cam = normalize(params.cam_pos.xyz - p_world);
-    let dot_prod = dot(normal, to_cam);
-    if (dot_prod < -0.05) {
-        out.position = vec4<f32>(2.0, 2.0, 2.0, 1.0);
-        out.color = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-        return out;
+    if (params.debug_mode != 6u) {
+        let normal_x = vertex_data.w * 2.0 - 1.0;
+        let normal = vec3<f32>(normal_x, 0.0, 0.0);
+        let to_cam = normalize(params.cam_pos.xyz - p_world);
+        let dot_prod = dot(normal, to_cam);
+        if (dot_prod < -0.05) {
+            out.position = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+            out.color = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+            return out;
+        }
     }
     let p_clip = params.prev_view_proj * vec4<f32>(p_world, 1.0);
     out.position = p_clip;
-    out.color = vec4<f32>(0.0, 0.6, 1.0, 0.5);
+    out.color = select(vec4<f32>(0.0, 0.6, 1.0, 0.5), vec4<f32>(1.0, 0.85, 0.0, 0.9), params.debug_mode == 6u);
     return out;
 }
 
@@ -464,6 +657,22 @@ fn warped_screen_pos(world_pos: vec3<f32>, world_normal: vec3<f32>) -> vec2<f32>
     return warped_screen_clip(world_pos, world_normal).xy;
 }
 
+fn original_screen_clip(world_pos: vec3<f32>) -> vec4<f32> {
+    let clip = params.prev_view_proj * vec4<f32>(world_pos, 1.0);
+    let safe_w = max(clip.w, 0.00001);
+    let ndc = clip.xyz / safe_w;
+    return vec4<f32>(
+        (ndc.x * 0.5 + 0.5) * f32(params.screen_width),
+        (0.5 - ndc.y * 0.5) * f32(params.screen_height),
+        ndc.z,
+        clip.w,
+    );
+}
+
+fn original_screen_pos(world_pos: vec3<f32>) -> vec2<f32> {
+    return original_screen_clip(world_pos).xy;
+}
+
 fn unwrap_local_uv(tri: Triangle, local_pos: vec3<f32>) -> vec2<f32> {
     let e0 = tri.v1.xyz - tri.v0.xyz;
     let e1 = tri.v2.xyz - tri.v0.xyz;
@@ -492,13 +701,10 @@ fn unwrap_triangle_pos(tri: Triangle, local_pos: vec3<f32>, instance: InstanceDa
     let w0 = (instance.model_matrix * tri.v0).xyz;
     let w1 = (instance.model_matrix * tri.v1).xyz;
     let w2 = (instance.model_matrix * tri.v2).xyz;
-    let n0 = normalize((instance.model_matrix * vec4<f32>(tri.warp_n0.xyz, 0.0)).xyz);
-    let n1 = normalize((instance.model_matrix * vec4<f32>(tri.warp_n1.xyz, 0.0)).xyz);
-    let n2 = normalize((instance.model_matrix * vec4<f32>(tri.warp_n2.xyz, 0.0)).xyz);
 
-    let s0 = warped_screen_pos(w0, n0);
-    let s1 = warped_screen_pos(w1, n1);
-    let s2 = warped_screen_pos(w2, n2);
+    let s0 = original_screen_pos(w0);
+    let s1 = original_screen_pos(w1);
+    let s2 = original_screen_pos(w2);
     let min_s = floor(max(min(min(s0, s1), s2) - vec2<f32>(2.0), vec2<f32>(0.0)));
     let max_s = ceil(min(max(max(s0, s1), s2) + vec2<f32>(2.0), vec2<f32>(f32(params.screen_width - 1u), f32(params.screen_height - 1u))));
     let bbox_size = max(max_s - min_s, vec2<f32>(1.0));
@@ -538,8 +744,8 @@ fn vs_depth(
 
     let world_pos_pre = instance.model_matrix * vec4<f32>(p_local, 1.0);
     let world_pos_raw = world_pos_pre.xyz / world_pos_pre.w;
-    let world_normal = normalize((instance.model_matrix * vec4<f32>(n_local, 0.0)).xyz);
-    let warp_normal = normalize((instance.model_matrix * vec4<f32>(warp_n_local, 0.0)).xyz);
+    let world_normal = transform_normal(instance.model_matrix, n_local);
+    let warp_normal = transform_normal(instance.model_matrix, warp_n_local);
     var out: DepthVertexOutput;
     out.position = unwrap_triangle_pos(tri, p_local, instance);
     out.triangle_id = tri_idx;
@@ -569,8 +775,8 @@ fn fs_depth(in: DepthVertexOutput) -> DepthFragmentOutput {
         let source = vec2<i32>(i32(floor(in.position.x)), i32(floor(in.position.y)));
         let view_dir = normalize(params.cam_pos.xyz - in.world_pos);
         let facing = abs(dot(normalize(in.world_normal), view_dir));
-        let grazing_stability = smoothstep(0.08, 0.35, facing);
-        let radius = select(1i, 2i, grazing_stability > 0.5);
+        let grazing_coverage = 1.0 - smoothstep(0.08, 0.35, facing);
+        let radius = select(1i, 3i, grazing_coverage > 0.35);
         for (var oy = -radius; oy <= radius; oy = oy + 1) {
             for (var ox = -radius; ox <= radius; ox = ox + 1) {
                 let offset = vec2<f32>(f32(ox), f32(oy));
@@ -585,7 +791,7 @@ fn fs_depth(in: DepthVertexOutput) -> DepthFragmentOutput {
         let raw_bary_dx = dpdx(in.barycentric);
         let raw_bary_dy = dpdy(in.barycentric);
 
-        let max_axis = mix(3.0, 12.0, grazing_stability);
+        let max_axis = mix(5.0, 18.0, grazing_coverage);
         let dx_len = length(raw_proj_dx.xy);
         let dy_len = length(raw_proj_dy.xy);
         let dx_scale = min(1.0, max_axis / max(dx_len, 0.0001));
@@ -596,14 +802,14 @@ fn fs_depth(in: DepthVertexOutput) -> DepthFragmentOutput {
         let bary_dy = raw_bary_dy * dy_scale;
 
         let footprint_area = abs(proj_dx.x * proj_dy.y - proj_dx.y * proj_dy.x);
-        let area_scale = select(1.0, 0.5, footprint_area < 0.25 || footprint_area > 96.0);
+        let area_scale = select(1.0, mix(0.75, 1.0, grazing_coverage), footprint_area < 0.25 || footprint_area > 144.0);
         let stable_proj_dx = proj_dx * area_scale;
         let stable_proj_dy = proj_dy * area_scale;
         let stable_bary_dx = bary_dx * area_scale;
         let stable_bary_dy = bary_dy * area_scale;
 
-        let x_steps = min(max(i32(ceil(length(stable_proj_dx.xy))), 1), 12);
-        let y_steps = min(max(i32(ceil(length(stable_proj_dy.xy))), 1), 12);
+        let x_steps = min(max(i32(ceil(length(stable_proj_dx.xy))), 1), 18);
+        let y_steps = min(max(i32(ceil(length(stable_proj_dy.xy))), 1), 18);
         for (var sy = 0i; sy <= y_steps; sy = sy + 1) {
             let v = f32(sy) / f32(y_steps) - 0.5;
             for (var sx = 0i; sx <= x_steps; sx = sx + 1) {
@@ -661,7 +867,7 @@ fn vs_mesh(
     else { p = tri.v2.xyz; uv = tri.uv2.xy; n = tri.n2.xyz; }
 
     let world_pos = (instance.model_matrix * vec4<f32>(p, 1.0)).xyz;
-    let normal = normalize((instance.model_matrix * vec4<f32>(n, 0.0)).xyz);
+    let normal = transform_normal(instance.model_matrix, n);
 
     var out: MeshVertexOutput;
     out.position = params.prev_view_proj * vec4<f32>(world_pos, 1.0);
