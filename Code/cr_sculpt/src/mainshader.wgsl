@@ -471,6 +471,8 @@ fn ray_triangle_t(origin: vec3<f32>, dir: vec3<f32>, a: vec3<f32>, b: vec3<f32>,
 fn trace_pixel_shadow(world_pos: vec3<f32>, world_normal: vec3<f32>, source_tri_id: u32) -> f32 {
     let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.5));
     let n = normalize(world_normal);
+    let self_shadow_bias = 0.08;
+    let source_instance_id = source_tri_id >> 20u;
 
     // 【核心优化 1】背光面直接判定为阴影，跳过所有链表和求交计算
     let cos_theta = dot(n, light_dir);
@@ -510,7 +512,12 @@ fn trace_pixel_shadow(world_pos: vec3<f32>, world_normal: vec3<f32>, source_tri_
             let b = (instance.model_matrix * tri.v1).xyz;
             let c = (instance.model_matrix * tri.v2).xyz;
             let t = ray_triangle_t(origin, light_dir, a, b, c);
-            if (t > 0.02 && t < 10000.0) { return 0.35; }
+            if (t > self_shadow_bias && t < 10000.0) {
+                let blocker_instance_id = node.packed_tri_id >> 20u;
+                if (blocker_instance_id != source_instance_id || t > self_shadow_bias * 4.0) {
+                    return 0.35;
+                }
+            }
         }
         curr_node_idx = node.next;
         steps = steps + 1u;
@@ -612,7 +619,8 @@ fn cs_shadow_trace(@builtin(global_invocation_id) gid: vec3<u32>) {
         let ray_dir = normalize((params.view_inv * vec4<f32>(normalize(ray_target.xyz / ray_target.w), 0.0)).xyz);
         let ray_o = params.cam_pos.xyz;
         let t_grid = -ray_o.y / (ray_dir.y + 0.00001);
-        if (t_grid <= 0.0 || t_grid >= 10000.0) {
+        
+        if (t_grid <= 0.0 || t_grid >= GRID_HALF_SIZE) {
             textureStore(pixel_shadow_out, pixel, vec4<f32>(1.0, 0.0, 0.0, 1.0));
             return;
         }
@@ -934,6 +942,18 @@ fn vs_depth(
     let local_idx = vertex_index % 3u;
 
     let tri = triangles[tri_idx];
+
+    let view_proj = params.prev_view_proj;
+    let c0 = view_proj * (instance.model_matrix * tri.v0);
+    let c1 = view_proj * (instance.model_matrix * tri.v1);
+    let c2 = view_proj * (instance.model_matrix * tri.v2);
+
+    var out: DepthVertexOutput;
+    if (c0.w <= 0.0 || c1.w <= 0.0 || c2.w <= 0.0) {
+        out.position = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+        return out;
+    }
+
     var p_local: vec3<f32>;
     var n_local: vec3<f32>;
     var warp_n_local: vec3<f32>;
@@ -952,8 +972,12 @@ fn vs_depth(
     let world_pos_raw = world_pos_pre.xyz / world_pos_pre.w;
     let world_normal = transform_normal(instance.model_matrix, n_local);
     let warp_normal = transform_normal(instance.model_matrix, warp_n_local);
-    var out: DepthVertexOutput;
-    out.position = unwrap_triangle_pos(tri, p_local, instance);
+    
+    if (params.distort_strength <= 0.001) {
+        out.position = params.prev_view_proj * world_pos_pre;
+    } else {
+        out.position = unwrap_triangle_pos(tri, p_local, instance);
+    }
     out.triangle_id = tri_idx;
     out.uv = uv;
     out.instance_id = instance_index;
@@ -995,64 +1019,68 @@ fn fs_depth(in: DepthVertexOutput) -> DepthFragmentOutput {
         }
 
         let source = vec2<i32>(i32(floor(in.position.x)), i32(floor(in.position.y)));
-        let view_dir = normalize(params.cam_pos.xyz - in.world_pos);
-        let dist = distance(params.cam_pos.xyz, in.world_pos);
-
-        let facing = abs(dot(normalize(in.world_normal), view_dir));
-        let grazing_coverage = 1.0 - smoothstep(0.08, 0.35, facing);
-
-        var radius = select(1i, 3i, grazing_coverage > 0.35);
-        if (dist > 100.0) {
-            radius = 1i;
-        }
-
-        for (var oy = -radius; oy <= radius; oy = oy + 1) {
-            for (var ox = -radius; ox <= radius; ox = ox + 1) {
-                let offset = vec2<f32>(f32(ox), f32(oy));
-                if (dot(offset, offset) <= f32(radius * radius) + 0.25) {
-                    write_warp_pixel(base_target + vec2<i32>(ox, oy), source, packed_tri, projected.z, in.barycentric);
-                }
-            }
-        }
-
-        let raw_proj_dx = dpdx(projected);
-        let raw_proj_dy = dpdy(projected);
-        let raw_bary_dx = dpdx(in.barycentric);
-        let raw_bary_dy = dpdy(in.barycentric);
-
-        let max_axis = mix(5.0, 18.0, grazing_coverage);
-        let dx_len = length(raw_proj_dx.xy);
-        let dy_len = length(raw_proj_dy.xy);
-        let dx_scale = min(1.0, max_axis / max(dx_len, 0.0001));
-        let dy_scale = min(1.0, max_axis / max(dy_len, 0.0001));
-        let proj_dx = raw_proj_dx * dx_scale;
-        let proj_dy = raw_proj_dy * dy_scale;
-        let bary_dx = raw_bary_dx * dx_scale;
-        let bary_dy = raw_bary_dy * dy_scale;
-
-        let footprint_area = abs(proj_dx.x * proj_dy.y - proj_dx.y * proj_dy.x);
-        let area_scale = select(1.0, mix(0.75, 1.0, grazing_coverage), footprint_area < 0.25 || footprint_area > 144.0);
-        let stable_proj_dx = proj_dx * area_scale;
-        let stable_proj_dy = proj_dy * area_scale;
-        let stable_bary_dx = bary_dx * area_scale;
-        let stable_bary_dy = bary_dy * area_scale;
-
-        let fast_dx = length(stable_proj_dx.xy);
-        let fast_dy = length(stable_proj_dy.xy);
-
-        if (fast_dx <= 1.2 && fast_dy <= 1.2) {
+        if (params.distort_strength <= 0.001) {
             write_warp_pixel(base_target, source, packed_tri, projected.z, in.barycentric);
         } else {
-            let max_step = i32(clamp(8.0 - max(dist - 60.0, 0.0) / 20.0, 1.0, 8.0));
-            let x_steps = min(max(i32(ceil(fast_dx)), 1), max_step);
-            let y_steps = min(max(i32(ceil(fast_dy)), 1), max_step);
-            for (var sy = 0i; sy <= y_steps; sy = sy + 1) {
-                let v = f32(sy) / f32(y_steps) - 0.5;
-                for (var sx = 0i; sx <= x_steps; sx = sx + 1) {
-                    let u = f32(sx) / f32(x_steps) - 0.5;
-                    let p = projected + stable_proj_dx * u + stable_proj_dy * v;
-                    let b = in.barycentric + stable_bary_dx * u + stable_bary_dy * v;
-                    write_warp_pixel(vec2<i32>(i32(floor(p.x)), i32(floor(p.y))), source, packed_tri, p.z, b);
+            let view_dir = normalize(params.cam_pos.xyz - in.world_pos);
+            let dist = distance(params.cam_pos.xyz, in.world_pos);
+
+            let facing = abs(dot(normalize(in.world_normal), view_dir));
+            let grazing_coverage = 1.0 - smoothstep(0.08, 0.35, facing);
+
+            var radius = select(1i, 3i, grazing_coverage > 0.35);
+            if (dist > 100.0) {
+                radius = 1i;
+            }
+
+            for (var oy = -radius; oy <= radius; oy = oy + 1) {
+                for (var ox = -radius; ox <= radius; ox = ox + 1) {
+                    let offset = vec2<f32>(f32(ox), f32(oy));
+                    if (dot(offset, offset) <= f32(radius * radius) + 0.25) {
+                        write_warp_pixel(base_target + vec2<i32>(ox, oy), source, packed_tri, projected.z, in.barycentric);
+                    }
+                }
+            }
+
+            let raw_proj_dx = dpdx(projected);
+            let raw_proj_dy = dpdy(projected);
+            let raw_bary_dx = dpdx(in.barycentric);
+            let raw_bary_dy = dpdy(in.barycentric);
+
+            let max_axis = mix(5.0, 18.0, grazing_coverage);
+            let dx_len = length(raw_proj_dx.xy);
+            let dy_len = length(raw_proj_dy.xy);
+            let dx_scale = min(1.0, max_axis / max(dx_len, 0.0001));
+            let dy_scale = min(1.0, max_axis / max(dy_len, 0.0001));
+            let proj_dx = raw_proj_dx * dx_scale;
+            let proj_dy = raw_proj_dy * dy_scale;
+            let bary_dx = raw_bary_dx * dx_scale;
+            let bary_dy = raw_bary_dy * dy_scale;
+
+            let footprint_area = abs(proj_dx.x * proj_dy.y - proj_dx.y * proj_dy.x);
+            let area_scale = select(1.0, mix(0.75, 1.0, grazing_coverage), footprint_area < 0.25 || footprint_area > 144.0);
+            let stable_proj_dx = proj_dx * area_scale;
+            let stable_proj_dy = proj_dy * area_scale;
+            let stable_bary_dx = bary_dx * area_scale;
+            let stable_bary_dy = bary_dy * area_scale;
+
+            let fast_dx = length(stable_proj_dx.xy);
+            let fast_dy = length(stable_proj_dy.xy);
+
+            if (fast_dx <= 1.2 && fast_dy <= 1.2) {
+                write_warp_pixel(base_target, source, packed_tri, projected.z, in.barycentric);
+            } else {
+                let max_step = i32(clamp(8.0 - max(dist - 60.0, 0.0) / 20.0, 1.0, 8.0));
+                let x_steps = min(max(i32(ceil(fast_dx)), 1), max_step);
+                let y_steps = min(max(i32(ceil(fast_dy)), 1), max_step);
+                for (var sy = 0i; sy <= y_steps; sy = sy + 1) {
+                    let v = f32(sy) / f32(y_steps) - 0.5;
+                    for (var sx = 0i; sx <= x_steps; sx = sx + 1) {
+                        let u = f32(sx) / f32(x_steps) - 0.5;
+                        let p = projected + stable_proj_dx * u + stable_proj_dy * v;
+                        let b = in.barycentric + stable_bary_dx * u + stable_bary_dy * v;
+                        write_warp_pixel(vec2<i32>(i32(floor(p.x)), i32(floor(p.y))), source, packed_tri, p.z, b);
+                    }
                 }
             }
         }

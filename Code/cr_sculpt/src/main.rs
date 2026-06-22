@@ -2922,16 +2922,16 @@ impl<'a> App<'a> {
         self.run_depth_pass(&mut encoder, &instances_to_draw);
         encoder.write_timestamp(&self.ts_query_set, 2);
 
-        // T2→T3: Compute SDF BG
-        self.run_compute_pass(&mut encoder);
+        // T2→T3: Shadow Binning (clear + linked-list insert)
+        self.shadow_system.clear_and_bin(&mut encoder, instances_to_draw.len() as u32);
         encoder.write_timestamp(&self.ts_query_set, 3);
 
-        // T3→T4: Shadow Binning (clear + linked-list insert)
-        self.shadow_system.clear_and_bin(&mut encoder, instances_to_draw.len() as u32);
+        // T3→T4: Shadow Tracing (per-pixel ray traversal)
+        self.shadow_system.trace_shadow(&mut encoder);
         encoder.write_timestamp(&self.ts_query_set, 4);
 
-        // T4→T5: Shadow Tracing (per-pixel ray traversal)
-        self.shadow_system.trace_shadow(&mut encoder);
+        // T4→T5: Sky & Clouds (Compute BG)
+        self.run_compute_pass(&mut encoder);
         encoder.write_timestamp(&self.ts_query_set, 5);
 
         // T5→T6: AP3 Shading
@@ -2978,7 +2978,7 @@ impl<'a> App<'a> {
         let submit_present_ms = tsp.elapsed().as_secs_f32() * 1000.0;
 
         // === 异步读取 Timestamp 结果 (10 probes → 9 intervals) ===
-        let (gpu_clear_warp_ms, gpu_depth_ms, gpu_compute_ms, gpu_shadow_bin_ms, gpu_shadow_trace_ms, gpu_ap3_ms, gpu_draw_ms, gpu_scaffold_ms, gpu_ui_ms, gpu_total_ms) = {
+        let (gpu_clear_warp_ms, gpu_depth_ms, gpu_shadow_bin_ms, gpu_shadow_trace_ms, gpu_compute_ms, gpu_ap3_ms, gpu_draw_ms, gpu_scaffold_ms, gpu_ui_ms, gpu_total_ms) = {
             let buffer_slice = self.ts_staging_buffer.slice(..);
             let (tx, rx) = std::sync::mpsc::channel();
             buffer_slice.map_async(wgpu::MapMode::Read, move |result| { tx.send(result).unwrap(); });
@@ -3140,7 +3140,7 @@ impl<'a> App<'a> {
                         }
                         bar(ui, "Clear Warp", s.gpu_clear_warp_ms, total_gpu, egui::Color32::from_rgb(120, 120, 120));
                         bar(ui, "Depth MRT", s.depth_pass_ms, total_gpu, egui::Color32::from_rgb(100, 149, 237));
-                        bar(ui, "Compute SDF", s.compute_pass_ms, total_gpu, egui::Color32::from_rgb(0, 191, 255));
+                        bar(ui, "Sky & Clouds", s.compute_pass_ms, total_gpu, egui::Color32::from_rgb(0, 191, 255));
                         bar(ui, "Shadow Bin", s.gpu_shadow_bin_ms, total_gpu, egui::Color32::from_rgb(255, 127, 80));
                         bar(ui, "Shadow Trace", s.gpu_shadow_trace_ms, total_gpu, egui::Color32::from_rgb(255, 69, 0));
                         bar(ui, "AP3 Shading", s.ap3_pass_ms, total_gpu, egui::Color32::from_rgb(186, 85, 211));
