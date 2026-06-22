@@ -902,7 +902,18 @@ impl<'a> App<'a> {
     }
 
     fn build_instances_to_draw(&self) -> Vec<math::InstanceData> {
-        let mut instances = self.instances.clone();
+        let cam_pos = self.camera.eye;
+        let active_radius = 1350.0;
+
+        let mut instances = Vec::new();
+        for inst in &self.instances {
+            let pos_x = inst.model_matrix[3][0];
+            let pos_z = inst.model_matrix[3][2];
+            let dist_xz = ((pos_x - cam_pos.x).powi(2) + (pos_z - cam_pos.z).powi(2)).sqrt();
+            if dist_xz <= active_radius {
+                instances.push(inst.clone());
+            }
+        }
         if let Some(model_id) = self.active_spawn_id.or(self.continuous_spawn_id) {
             let (ray_o, ray_dir) = self.camera.get_ray(
                 self.last_mouse_pos[0],

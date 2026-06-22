@@ -81,7 +81,7 @@ struct WarpPixel {
 
 // 太阳空间网格分箱（阴影加速）
 const GRID_RES = 1024u;
-const GRID_HALF_SIZE = 1000.0;
+const GRID_HALF_SIZE = 1350.0;
 const MAX_SHADOW_LIST_STEPS = 4096u;
 
 struct GridNode {
@@ -953,11 +953,35 @@ fn fs_depth(in: DepthVertexOutput) -> DepthFragmentOutput {
     let projected = warped_screen_clip(in.world_pos, in.warp_normal);
     if (projected.w > 0.0) {
         let base_target = vec2<i32>(i32(floor(projected.x)), i32(floor(projected.y)));
+
+        // -----------------------------------------------------------
+        // 【方案三核心优化：粗糙 Early-Z 预判】
+        // -----------------------------------------------------------
+        if (base_target.x >= 0 && base_target.x < i32(params.screen_width) &&
+            base_target.y >= 0 && base_target.y < i32(params.screen_height)) {
+            let check_idx = u32(base_target.y) * params.screen_width + u32(base_target.x);
+            let current_depth = atomicLoad(&warpBuffer[check_idx].flags);
+            let my_depth = u32(clamp(((projected.z) + 1.0) * 0.5, 0.0, 1.0) * 4294967295.0);
+            if (current_depth != 0u && my_depth >= current_depth) {
+                discard;
+            }
+        }
+
         let source = vec2<i32>(i32(floor(in.position.x)), i32(floor(in.position.y)));
         let view_dir = normalize(params.cam_pos.xyz - in.world_pos);
+
+        // 【代码自适应 LOD】片元与相机的距离，用于后续动态降级
+        let dist = distance(params.cam_pos.xyz, in.world_pos);
+
         let facing = abs(dot(normalize(in.world_normal), view_dir));
         let grazing_coverage = 1.0 - smoothstep(0.08, 0.35, facing);
-        let radius = select(1i, 3i, grazing_coverage > 0.35);
+
+        // 【自适应 LOD】超过 100 米自动强制降为 1 像素半径，消除多余原子写入
+        var radius = select(1i, 3i, grazing_coverage > 0.35);
+        if (dist > 100.0) {
+            radius = 1i;
+        }
+
         for (var oy = -radius; oy <= radius; oy = oy + 1) {
             for (var ox = -radius; ox <= radius; ox = ox + 1) {
                 let offset = vec2<f32>(f32(ox), f32(oy));
@@ -989,8 +1013,10 @@ fn fs_depth(in: DepthVertexOutput) -> DepthFragmentOutput {
         let stable_bary_dx = bary_dx * area_scale;
         let stable_bary_dy = bary_dy * area_scale;
 
-        let x_steps = min(max(i32(ceil(length(stable_proj_dx.xy))), 1), 18);
-        let y_steps = min(max(i32(ceil(length(stable_proj_dy.xy))), 1), 18);
+        // 【自适应 LOD】0~60 米保持最大 8 步；60~220 米平滑衰减至 1 步
+        let max_step = i32(clamp(8.0 - max(dist - 60.0, 0.0) / 20.0, 1.0, 8.0));
+        let x_steps = min(max(i32(ceil(length(stable_proj_dx.xy))), 1), max_step);
+        let y_steps = min(max(i32(ceil(length(stable_proj_dy.xy))), 1), max_step);
         for (var sy = 0i; sy <= y_steps; sy = sy + 1) {
             let v = f32(sy) / f32(y_steps) - 0.5;
             for (var sx = 0i; sx <= x_steps; sx = sx + 1) {
