@@ -457,14 +457,28 @@ fn ray_triangle_t(origin: vec3<f32>, dir: vec3<f32>, a: vec3<f32>, b: vec3<f32>,
     let e2 = c - a;
     let pvec = cross(dir, e2);
     let det = dot(e1, pvec);
+
     if (abs(det) < 1e-6) { return -1.0; }
-    let inv_det = 1.0 / det;
+
     let tvec = origin - a;
-    let u = dot(tvec, pvec) * inv_det;
-    if (u < 0.0 || u > 1.0) { return -1.0; }
+    let u_unscaled = dot(tvec, pvec);
+
+    if (det > 0.0) {
+        if (u_unscaled < 0.0 || u_unscaled > det) { return -1.0; }
+    } else {
+        if (u_unscaled > 0.0 || u_unscaled < det) { return -1.0; }
+    }
+
     let qvec = cross(tvec, e1);
-    let v = dot(dir, qvec) * inv_det;
-    if (v < 0.0 || u + v > 1.0) { return -1.0; }
+    let v_unscaled = dot(dir, qvec);
+
+    if (det > 0.0) {
+        if (v_unscaled < 0.0 || u_unscaled + v_unscaled > det) { return -1.0; }
+    } else {
+        if (v_unscaled > 0.0 || u_unscaled + v_unscaled < det) { return -1.0; }
+    }
+
+    let inv_det = 1.0 / det;
     return dot(e2, qvec) * inv_det;
 }
 
@@ -1004,15 +1018,78 @@ fn fs_depth(in: DepthVertexOutput) -> DepthFragmentOutput {
 
     let packed_tri = ((in.instance_id + 1u) << 20u) | (in.triangle_id + 1u);
 
-    let projected = warped_screen_clip(in.world_pos, in.warp_normal);
-    if (projected.w > 0.0) {
-        let base_target = vec2<i32>(i32(floor(projected.x)), i32(floor(projected.y)));
+    var final_displacement = 0.0;
+
+    if (params.distort_strength > 0.001) {
+        let freq = max(params.distort_frequency, 0.001);
+        let p_base = in.world_pos * 10.0 * freq;
+
+        let shift = vec3<f32>(100.0);
+
+        var approx_disp = 0.5 * noise(p_base);
+        var p_mut = p_base * 2.0 + shift;
+        approx_disp = approx_disp + 0.25 * noise(p_mut);
+
+        let approx_warped_pos = in.world_pos - normalize(in.warp_normal) * approx_disp * 0.5 * params.distort_strength;
+        let approx_clip = params.prev_view_proj * vec4<f32>(approx_warped_pos, 1.0);
+
+        if (approx_clip.w > 0.0) {
+            let approx_ndc = approx_clip.xyz / approx_clip.w;
+            let approx_target = vec2<i32>(
+                i32(floor((approx_ndc.x * 0.5 + 0.5) * f32(params.screen_width))),
+                i32(floor((0.5 - approx_ndc.y * 0.5) * f32(params.screen_height)))
+            );
+
+            if (approx_target.x >= 0 && approx_target.x < i32(params.screen_width) &&
+                approx_target.y >= 0 && approx_target.y < i32(params.screen_height)) {
+
+                let check_idx = u32(approx_target.y) * params.screen_width + u32(approx_target.x);
+                let current_depth = atomicLoad(&warpBuffer[check_idx].flags);
+
+                if (current_depth != 0u) {
+                    let max_remaining_displacement = 0.234375 * 0.5 * params.distort_strength;
+                    let depth_margin = max_remaining_displacement / approx_clip.w;
+
+                    let current_depth_f = f32(current_depth) / 4294967295.0;
+                    let my_approx_depth_f = (approx_ndc.z + 1.0) * 0.5;
+
+                    if (my_approx_depth_f - depth_margin >= current_depth_f) {
+                        discard;
+                    }
+                }
+            }
+        }
+
+        var exact_disp = approx_disp;
+        var a = 0.125;
+        for (var i = 2; i < 6; i = i + 1) {
+            p_mut = p_mut * 2.0 + shift;
+            exact_disp = exact_disp + a * noise(p_mut);
+            a = a * 0.5;
+        }
+        final_displacement = exact_disp * 0.5 * params.distort_strength;
+    }
+
+    let final_warped_pos = in.world_pos - normalize(in.warp_normal) * final_displacement;
+    let projected = params.prev_view_proj * vec4<f32>(final_warped_pos, 1.0);
+    let safe_w = max(projected.w, 0.00001);
+    let projected_ndc = projected.xyz / safe_w;
+
+    let projected_screen = vec4<f32>(
+        (projected_ndc.x * 0.5 + 0.5) * f32(params.screen_width),
+        (0.5 - projected_ndc.y * 0.5) * f32(params.screen_height),
+        projected_ndc.z,
+        projected.w
+    );
+
+    if (projected_screen.w > 0.0) {
+        let base_target = vec2<i32>(i32(floor(projected_screen.x)), i32(floor(projected_screen.y)));
 
         if (base_target.x >= 0 && base_target.x < i32(params.screen_width) &&
             base_target.y >= 0 && base_target.y < i32(params.screen_height)) {
             let check_idx = u32(base_target.y) * params.screen_width + u32(base_target.x);
             let current_depth = atomicLoad(&warpBuffer[check_idx].flags);
-            let my_depth = u32(clamp(((projected.z) + 1.0) * 0.5, 0.0, 1.0) * 4294967295.0);
+            let my_depth = u32(clamp(((projected_screen.z) + 1.0) * 0.5, 0.0, 1.0) * 4294967295.0);
             if (current_depth != 0u && my_depth >= current_depth) {
                 discard;
             }
@@ -1020,7 +1097,7 @@ fn fs_depth(in: DepthVertexOutput) -> DepthFragmentOutput {
 
         let source = vec2<i32>(i32(floor(in.position.x)), i32(floor(in.position.y)));
         if (params.distort_strength <= 0.001) {
-            write_warp_pixel(base_target, source, packed_tri, projected.z, in.barycentric);
+            write_warp_pixel(base_target, source, packed_tri, projected_screen.z, in.barycentric);
         } else {
             let view_dir = normalize(params.cam_pos.xyz - in.world_pos);
             let dist = distance(params.cam_pos.xyz, in.world_pos);
@@ -1039,13 +1116,13 @@ fn fs_depth(in: DepthVertexOutput) -> DepthFragmentOutput {
                 for (var ox = -radius; ox <= radius; ox = ox + 1) {
                     let dist_sq = f32(ox * ox) + oy_sq;
                     if (dist_sq <= radius_sq_limit) {
-                        write_warp_pixel(base_target + vec2<i32>(ox, oy), source, packed_tri, projected.z, in.barycentric);
+                        write_warp_pixel(base_target + vec2<i32>(ox, oy), source, packed_tri, projected_screen.z, in.barycentric);
                     }
                 }
             }
 
-            let raw_proj_dx = dpdx(projected);
-            let raw_proj_dy = dpdy(projected);
+            let raw_proj_dx = dpdx(projected_screen);
+            let raw_proj_dy = dpdy(projected_screen);
             let raw_bary_dx = dpdx(in.barycentric);
             let raw_bary_dy = dpdy(in.barycentric);
 
@@ -1070,17 +1147,18 @@ fn fs_depth(in: DepthVertexOutput) -> DepthFragmentOutput {
             let fast_dy = length(stable_proj_dy.xy);
 
             if (fast_dx <= 1.2 && fast_dy <= 1.2) {
-                write_warp_pixel(base_target, source, packed_tri, projected.z, in.barycentric);
+                write_warp_pixel(base_target, source, packed_tri, projected_screen.z, in.barycentric);
             } else {
                 let max_step = i32(clamp(8.0 - max(dist - 60.0, 0.0) / 20.0, 1.0, 8.0));
                 let x_steps = min(max(i32(ceil(fast_dx)), 1), max_step);
                 let y_steps = min(max(i32(ceil(fast_dy)), 1), max_step);
+
                 let dx_p = stable_proj_dx / f32(x_steps);
                 let dx_b = stable_bary_dx / f32(x_steps);
                 let dy_p = stable_proj_dy / f32(y_steps);
                 let dy_b = stable_bary_dy / f32(y_steps);
 
-                let start_p = projected - stable_proj_dx * 0.5 - stable_proj_dy * 0.5;
+                let start_p = projected_screen - stable_proj_dx * 0.5 - stable_proj_dy * 0.5;
                 let start_b = in.barycentric - stable_bary_dx * 0.5 - stable_bary_dy * 0.5;
 
                 for (var sy = 0i; sy <= y_steps; sy = sy + 1) {
