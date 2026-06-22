@@ -373,6 +373,7 @@ struct App<'a> {
     // 交互控制
     command_input: String,
     active_spawn_id: Option<u32>,
+    continuous_spawn_id: Option<u32>,
     rebuild_colliders_requested: bool,
     
     // 编辑模式相关
@@ -794,9 +795,24 @@ impl<'a> App<'a> {
         line_origin + axis_dir * (p - line_origin).dot(axis_dir)
     }
 
+    fn scene_path(&self) -> std::path::PathBuf {
+        // 通过可执行文件路径推导项目根目录
+        let exe = std::env::current_exe().unwrap_or_default();
+        // debug:  .../target/debug/cr_sculpt.exe → 向上3级到项目根
+        // release: .../target/release/cr_sculpt.exe → 向上3级
+        let project_root = exe.parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        project_root.join("src/scene/scene.json")
+    }
+
     fn save_scene(&self) {
-        let scene_dir = "src/scene";
-        let _ = std::fs::create_dir_all(scene_dir);
+        let path = self.scene_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let scene = math::SceneData {
             instances: self.instances.iter().map(|inst| math::SceneInstance {
                 model_id: inst.model_id,
@@ -804,11 +820,10 @@ impl<'a> App<'a> {
                 model_matrix: inst.model_matrix,
             }).collect(),
         };
-        let path = format!("{}/scene.json", scene_dir);
         match serde_json::to_string_pretty(&scene) {
             Ok(json) => {
                 match std::fs::write(&path, &json) {
-                    Ok(_) => println!("场景已保存到: {}", path),
+                    Ok(_) => println!("场景已保存到: {}", path.display()),
                     Err(e) => eprintln!("保存场景失败: {}", e),
                 }
             }
@@ -817,11 +832,11 @@ impl<'a> App<'a> {
     }
 
     fn load_scene(&mut self) -> bool {
-        let path = "src/scene/scene.json";
-        let json = match std::fs::read_to_string(path) {
+        let path = self.scene_path();
+        let json = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(_) => {
-                println!("未找到存档文件: {}", path);
+                println!("未找到存档文件: {}", path.display());
                 return false;
             }
         };
@@ -877,7 +892,7 @@ impl<'a> App<'a> {
 
     fn build_instances_to_draw(&self) -> Vec<math::InstanceData> {
         let mut instances = self.instances.clone();
-        if let Some(model_id) = self.active_spawn_id {
+        if let Some(model_id) = self.active_spawn_id.or(self.continuous_spawn_id) {
             let (ray_o, ray_dir) = self.camera.get_ray(
                 self.last_mouse_pos[0],
                 self.last_mouse_pos[1],
@@ -1953,6 +1968,7 @@ impl<'a> App<'a> {
             instance_buffer,
             command_input: String::new(),
             active_spawn_id: None,
+            continuous_spawn_id: None,
             rebuild_colliders_requested: false,
             
             // 编辑模式初始化
@@ -2128,7 +2144,7 @@ impl<'a> App<'a> {
         let view_proj = {
             let view_matrix = self.camera.get_view_matrix();
             let aspect_ratio = self.config.width as f32 / self.config.height as f32;
-            let proj_matrix = glam::Mat4::perspective_rh(45.0f32.to_radians(), aspect_ratio, 0.1, 1000.0);
+            let proj_matrix = glam::Mat4::perspective_rh(45.0f32.to_radians(), aspect_ratio, 0.1, 10000.0);
             proj_matrix * view_matrix
         };
 
@@ -2189,7 +2205,7 @@ impl<'a> App<'a> {
         let view_proj = {
             let view_matrix = self.camera.get_view_matrix();
             let aspect_ratio = self.config.width as f32 / self.config.height as f32;
-            let proj_matrix = glam::Mat4::perspective_rh(45.0f32.to_radians(), aspect_ratio, 0.1, 1000.0);
+            let proj_matrix = glam::Mat4::perspective_rh(45.0f32.to_radians(), aspect_ratio, 0.1, 10000.0);
             proj_matrix * view_matrix
         };
 
@@ -2346,7 +2362,7 @@ impl<'a> App<'a> {
     }
 
     fn run_shadow_pass(&self, encoder: &mut wgpu::CommandEncoder) {
-        self.shadow_system.run(encoder);
+        self.shadow_system.run(encoder, self.instances.len() as u32);
     }
 
     fn run_compute_pass(&self, encoder: &mut wgpu::CommandEncoder) {
@@ -2727,7 +2743,7 @@ impl<'a> App<'a> {
             if ui.button("📂 导入 GLB").clicked() { import_clicked = true; }
 
             ui.separator();
-            ui.label("命令 (输入 spawn <id>):");
+            ui.label("命令 (输入 spawn <id> 或 cspawn <id>):");
             ui.text_edit_singleline(&mut self.command_input);
             if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 let parts: Vec<&str> = self.command_input.split_whitespace().collect();
@@ -2735,7 +2751,19 @@ impl<'a> App<'a> {
                     if let Ok(id) = parts[1].parse::<u32>() {
                         if self.model_registry.contains_key(&id) {
                             self.active_spawn_id = Some(id);
+                            self.continuous_spawn_id = None;
                             println!("进入放置模式，模型 ID: {}", id);
+                        } else {
+                            println!("模型 ID {} 不存在", id);
+                        }
+                    }
+                }
+                if parts.len() >= 2 && parts[0] == "cspawn" {
+                    if let Ok(id) = parts[1].parse::<u32>() {
+                        if self.model_registry.contains_key(&id) {
+                            self.continuous_spawn_id = Some(id);
+                            self.active_spawn_id = None;
+                            println!("进入连续生成模式，模型 ID: {}", id);
                         } else {
                             println!("模型 ID {} 不存在", id);
                         }
@@ -2748,6 +2776,13 @@ impl<'a> App<'a> {
                 ui.label(format!("🎯 正在放置模型 ID: {}", self.active_spawn_id.unwrap()));
                 if ui.button("取消放置").clicked() {
                     self.active_spawn_id = None;
+                }
+            }
+
+            if self.continuous_spawn_id.is_some() {
+                ui.label(format!("🔄 连续生成模式，模型 ID: {}", self.continuous_spawn_id.unwrap()));
+                if ui.button("退出连续模式").clicked() {
+                    self.continuous_spawn_id = None;
                 }
             }
         });
@@ -3710,7 +3745,7 @@ fn main() {
                             app.is_lmb_pressed = *state == winit::event::ElementState::Pressed;
                             
                             // 左键按下时，如果不是在放置模式且不在编辑模式，则尝试拾取实例
-                            if *state == winit::event::ElementState::Pressed && app.active_spawn_id.is_none() && app.edit_mode == EditMode::None {
+                            if *state == winit::event::ElementState::Pressed && app.active_spawn_id.is_none() && app.continuous_spawn_id.is_none() && app.edit_mode == EditMode::None {
                                 app.pick_instance(app.last_mouse_pos);
                             }
                             
@@ -3723,8 +3758,8 @@ fn main() {
                             }
                             
                             // 左键按下时处理实例放置
-                            if *state == winit::event::ElementState::Pressed && app.active_spawn_id.is_some() {
-                                let model_id = app.active_spawn_id.unwrap();
+                            if *state == winit::event::ElementState::Pressed && (app.active_spawn_id.is_some() || app.continuous_spawn_id.is_some()) {
+                                let model_id = app.active_spawn_id.or(app.continuous_spawn_id).unwrap();
                                 let (ray_o, ray_dir) = app.camera.get_ray(
                                     app.last_mouse_pos[0],
                                     app.last_mouse_pos[1],
@@ -3748,7 +3783,9 @@ fn main() {
                                                 app.push_instance(new_instance);
                                                 app.queue.write_buffer(&app.instance_buffer, 0, bytemuck::cast_slice(&app.instances));
                                                 println!("放置实例: 模型 ID {} 在位置 {:?}", model_id, intersect_pos);
-                                                app.active_spawn_id = None; // 退出放置模式
+                                                if app.active_spawn_id.is_some() {
+                                                    app.active_spawn_id = None;
+                                                }
                                             }
                                         }
                                     }

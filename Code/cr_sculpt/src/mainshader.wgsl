@@ -79,6 +79,21 @@ struct WarpPixel {
 @group(0) @binding(16) var pixel_shadow_tex: texture_2d<f32>;
 @group(0) @binding(17) var pixel_shadow_out: texture_storage_2d<rgba8unorm, write>;
 
+// 太阳空间网格分箱（阴影加速）
+const GRID_RES = 256u;
+const GRID_HALF_SIZE = 400.0;
+const MAX_SHADOW_LIST_STEPS = 4096u;
+
+struct GridNode {
+    next: u32,
+    packed_tri_id: u32,
+    cell_idx: u32,
+    _pad: u32,
+};
+@group(0) @binding(18) var<storage, read_write> grid_head: array<atomic<u32>>;
+@group(0) @binding(19) var<storage, read_write> grid_nodes: array<GridNode>;
+@group(0) @binding(20) var<storage, read_write> global_counter: atomic<u32>;
+
 // 2. Render 阶段使用的声明
 @group(0) @binding(14) var t_read: texture_2d<f32>;
 
@@ -120,6 +135,57 @@ fn warp_displacement(world_pos: vec3<f32>) -> f32 {
     let frequency = max(params.distort_frequency, 0.001);
     let roughness = fbm(world_pos * 10.0 * frequency);
     return roughness * 0.5 * params.distort_strength;
+}
+
+fn sky_color(ray_dir: vec3<f32>) -> vec3<f32> {
+    let sun_dir = normalize(vec3<f32>(0.5, 1.0, 0.5));
+    let horizon = pow(1.0 - max(ray_dir.y, 0.0), 2.0);
+    let zenith = vec3<f32>(0.12, 0.38, 0.85);
+    let horizon_col = vec3<f32>(0.68, 0.82, 1.0);
+    var col = mix(zenith, horizon_col, horizon);
+    let sun_amount = max(dot(ray_dir, sun_dir), 0.0);
+    col = col + vec3<f32>(1.0, 0.72, 0.38) * pow(sun_amount, 96.0);
+    col = col + vec3<f32>(0.55, 0.68, 0.95) * pow(sun_amount, 8.0) * 0.25;
+    return col;
+}
+
+fn cloud_density(p: vec3<f32>) -> f32 {
+    let wind = vec3<f32>(params.time * 0.015, 0.0, params.time * 0.006);
+    let shape = fbm((p + wind) * vec3<f32>(0.010, 0.045, 0.010));
+    let detail = fbm((p + wind * 2.7) * vec3<f32>(0.045, 0.12, 0.045));
+    let height_fade = smoothstep(35.0, 85.0, p.y) * (1.0 - smoothstep(150.0, 230.0, p.y));
+    return clamp((shape * 0.78 + detail * 0.22 - 0.50) * 3.2, 0.0, 1.0) * height_fade;
+}
+
+fn volumetric_clouds(ray_o: vec3<f32>, ray_dir: vec3<f32>, base_sky: vec3<f32>) -> vec3<f32> {
+    if (ray_dir.y <= 0.02) { return base_sky; }
+    let t0 = max((45.0 - ray_o.y) / ray_dir.y, 0.0);
+    let t1 = min((220.0 - ray_o.y) / ray_dir.y, 1200.0);
+    if (t1 <= t0) { return base_sky; }
+    var transmittance = 1.0;
+    var cloud_light = vec3<f32>(0.0);
+    let sun_dir = normalize(vec3<f32>(0.5, 1.0, 0.5));
+    let step_len = (t1 - t0) / 18.0;
+    for (var i = 0; i < 18; i = i + 1) {
+        let t = t0 + (f32(i) + 0.5) * step_len;
+        let p = ray_o + ray_dir * t;
+        let d = cloud_density(p);
+        let alpha = 1.0 - exp(-d * step_len * 0.018);
+        let lighting = 0.55 + 0.45 * max(dot(ray_dir, sun_dir), 0.0);
+        let cloud_col = mix(vec3<f32>(0.55, 0.58, 0.62), vec3<f32>(1.0, 0.96, 0.88), lighting);
+        cloud_light = cloud_light + transmittance * alpha * cloud_col;
+        transmittance = transmittance * (1.0 - alpha);
+        if (transmittance < 0.04) { break; }
+    }
+    return base_sky * transmittance + cloud_light;
+}
+
+fn apply_distance_fog(col: vec3<f32>, dist: f32, ray_dir: vec3<f32>) -> vec3<f32> {
+    let fog_col = sky_color(ray_dir);
+    let fog_dist = max(dist - 500.0, 0.0);
+    let fog_amount = 1.0 - exp(-fog_dist * 0.0008);
+    let height_fog = clamp(1.0 - ray_dir.y * 0.65, 0.25, 1.0);
+    return mix(col, fog_col, clamp(fog_amount * height_fog, 0.0, 0.92));
 }
 
 fn transform_normal(model_matrix: mat4x4<f32>, local_normal: vec3<f32>) -> vec3<f32> {
@@ -288,9 +354,7 @@ fn compute_fusion_sdf(world_pos: vec3<f32>, source_instance_id: u32, source_tri_
     var hard_min = 1e6;
     var blended = 1e6;
     var hits = 0u;
-    let max_instances = min(params.instance_count, 16u);
-
-    for (var inst_i = 0u; inst_i < max_instances; inst_i = inst_i + 1u) {
+    for (var inst_i = 0u; inst_i < params.instance_count; inst_i = inst_i + 1u) {
         let instance = instances[inst_i];
         let tri_base = instance.tri_start;
 
@@ -345,6 +409,29 @@ fn shadow_at_pixel(pixel: vec2<i32>) -> f32 {
     return textureLoad(pixel_shadow_tex, pixel, 0).r;
 }
 
+fn ground_occludes_world_pos(world_pos: vec3<f32>) -> bool {
+    let cam_y = params.cam_pos.y;
+    let frag_y = world_pos.y;
+    return (cam_y > 0.0 && frag_y < 0.0) || (cam_y < 0.0 && frag_y > 0.0);
+}
+
+fn world_to_sun_grid(w: vec3<f32>) -> vec2<i32> {
+    let L = normalize(vec3<f32>(0.5, 1.0, 0.5));
+    var Up = vec3<f32>(0.0, 1.0, 0.0);
+    if (abs(L.y) > 0.99) { Up = vec3<f32>(0.0, 0.0, 1.0); }
+    let U = normalize(cross(L, Up));
+    let V = cross(L, U);
+    let x_proj = dot(w, U);
+    let y_proj = dot(w, V);
+    let u = i32(((x_proj / GRID_HALF_SIZE) * 0.5 + 0.5) * f32(GRID_RES));
+    let v = i32(((y_proj / GRID_HALF_SIZE) * 0.5 + 0.5) * f32(GRID_RES));
+    return vec2<i32>(u, v);
+}
+
+fn sun_grid_inside(g: vec2<i32>) -> bool {
+    return g.x >= 0i && g.y >= 0i && g.x < i32(GRID_RES) && g.y < i32(GRID_RES);
+}
+
 fn ray_triangle_t(origin: vec3<f32>, dir: vec3<f32>, a: vec3<f32>, b: vec3<f32>, c: vec3<f32>) -> f32 {
     let e1 = b - a;
     let e2 = c - a;
@@ -364,31 +451,85 @@ fn ray_triangle_t(origin: vec3<f32>, dir: vec3<f32>, a: vec3<f32>, b: vec3<f32>,
 fn trace_pixel_shadow(world_pos: vec3<f32>, world_normal: vec3<f32>, source_tri_id: u32) -> f32 {
     let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.5));
     let n = normalize(world_normal);
+    let normal_shadow = mix(0.45, 1.0, smoothstep(0.0, 0.35, dot(n, light_dir)));
     let origin = world_pos + n * 0.015 + light_dir * 0.02;
 
     if (light_dir.y < -0.001) {
         let ground_t = -origin.y / light_dir.y;
-        if (ground_t > 0.02 && ground_t < 200.0) { return 0.35; }
+        if (ground_t > 0.02 && ground_t < 10000.0) { return 0.35; }
     }
 
-    let source_instance_id = select(0xffffffffu, (source_tri_id >> 24u) - 1u, source_tri_id != 0u);
-    let source_tri_idx = select(0xffffffffu, (source_tri_id & 0x00ffffffu) - 1u, source_tri_id != 0u);
-    let max_instances = min(params.instance_count, 32u);
-    for (var inst_i = 0u; inst_i < max_instances; inst_i = inst_i + 1u) {
-        let instance = instances[inst_i];
-        let tri_count = min(instance.tri_count, params.anchor_count - min(instance.tri_start, params.anchor_count));
-        for (var local_tri = 0u; local_tri < tri_count; local_tri = local_tri + 1u) {
-            let tri_idx = instance.tri_start + local_tri;
-            if (inst_i == source_instance_id && tri_idx == source_tri_idx) { continue; }
+    // 投影到太阳空间网格，遍历链表节点
+    let g = world_to_sun_grid(origin);
+    if (!sun_grid_inside(g)) {
+        return normal_shadow;
+    }
+    let cell_idx = u32(g.y) * GRID_RES + u32(g.x);
+    var curr_node_idx = atomicLoad(&grid_head[cell_idx]);
+    var steps = 0u;
+    while (curr_node_idx != 0u && steps < MAX_SHADOW_LIST_STEPS) {
+        let node = grid_nodes[curr_node_idx];
+        if (node.packed_tri_id != source_tri_id) {
+            let instance_id = (node.packed_tri_id >> 24u) - 1u;
+            let tri_idx = (node.packed_tri_id & 0x00ffffffu) - 1u;
+            let instance = instances[instance_id];
             let tri = triangles[tri_idx];
             let a = (instance.model_matrix * tri.v0).xyz;
             let b = (instance.model_matrix * tri.v1).xyz;
             let c = (instance.model_matrix * tri.v2).xyz;
             let t = ray_triangle_t(origin, light_dir, a, b, c);
-            if (t > 0.02 && t < 200.0) { return 0.35; }
+            if (t > 0.02 && t < 10000.0) { return 0.35; }
+        }
+        curr_node_idx = node.next;
+        steps = steps + 1u;
+    }
+    if (curr_node_idx != 0u) {
+        return 0.35;
+    }
+    return normal_shadow;
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn cs_binning(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>
+) {
+    let instance_idx = wid.y;
+    let local_tri_idx = gid.x;
+    if (instance_idx >= params.instance_count) { return; }
+    let instance = instances[instance_idx];
+    if (local_tri_idx >= instance.tri_count) { return; }
+    let global_tri_idx = instance.tri_start + local_tri_idx;
+    let tri = triangles[global_tri_idx];
+    let w0 = (instance.model_matrix * tri.v0).xyz;
+    let w1 = (instance.model_matrix * tri.v1).xyz;
+    let w2 = (instance.model_matrix * tri.v2).xyz;
+    let g0 = world_to_sun_grid(w0);
+    let g1 = world_to_sun_grid(w1);
+    let g2 = world_to_sun_grid(w2);
+    let x_min_raw = min(g0.x, min(g1.x, g2.x));
+    let x_max_raw = max(g0.x, max(g1.x, g2.x));
+    let y_min_raw = min(g0.y, min(g1.y, g2.y));
+    let y_max_raw = max(g0.y, max(g1.y, g2.y));
+    if (x_max_raw < 0i || y_max_raw < 0i || x_min_raw >= i32(GRID_RES) || y_min_raw >= i32(GRID_RES)) { return; }
+    let x_min = max(x_min_raw, 0i);
+    let x_max = min(x_max_raw, i32(GRID_RES - 1u));
+    let y_min = max(y_min_raw, 0i);
+    let y_max = min(y_max_raw, i32(GRID_RES - 1u));
+    let packed_tri_id = ((instance_idx + 1u) << 24u) | (global_tri_idx + 1u);
+    for (var y = y_min; y <= y_max; y = y + 1) {
+        for (var x = x_min; x <= x_max; x = x + 1) {
+            let cell_idx = u32(y) * GRID_RES + u32(x);
+            let node_idx = atomicAdd(&global_counter, 1u) + 1u;
+            if (node_idx < arrayLength(&grid_nodes)) {
+                let old_head = atomicExchange(&grid_head[cell_idx], node_idx);
+                grid_nodes[node_idx].next = old_head;
+                grid_nodes[node_idx].packed_tri_id = packed_tri_id;
+                grid_nodes[node_idx].cell_idx = cell_idx;
+                grid_nodes[node_idx]._pad = 0u;
+            }
         }
     }
-    return 1.0;
 }
 
 @compute @workgroup_size(8, 8)
@@ -397,21 +538,23 @@ fn cs_shadow_trace(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pixel = vec2<i32>(i32(gid.x), i32(gid.y));
     let warp_idx = gid.y * params.screen_width + gid.x;
     let flags = atomicLoad(&warpBuffer[warp_idx].flags);
-    var tri_id = warpBuffer[warp_idx].tri_id;
-    var world_pos = vec3<f32>(0.0);
+
+    var source_tri_id = 0u;
+    var world_pos: vec3<f32>;
     var world_normal = vec3<f32>(0.0, 1.0, 0.0);
 
-    if (flags != 0u && tri_id != 0u) {
-        let instance_id = (tri_id >> 24u) - 1u;
-        let tri_idx = (tri_id & 0x00ffffffu) - 1u;
+    if (flags > 0u) {
+        source_tri_id = warpBuffer[warp_idx].tri_id;
+        let instance_id = (source_tri_id >> 24u) - 1u;
+        let tri_idx = (source_tri_id & 0x00ffffffu) - 1u;
         let instance = instances[instance_id];
         let tri = triangles[tri_idx];
         let b = warpBuffer[warp_idx].barycentric.xyz;
         let local_pos = tri.v0.xyz * b.x + tri.v1.xyz * b.y + tri.v2.xyz * b.z;
         let world_pos_pre = instance.model_matrix * vec4<f32>(local_pos, 1.0);
         world_pos = world_pos_pre.xyz / world_pos_pre.w;
-        let local_n = normalize(tri.warp_n0.xyz * b.x + tri.warp_n1.xyz * b.y + tri.warp_n2.xyz * b.z);
-        world_normal = transform_normal(instance.model_matrix, local_n);
+        let local_normal = normalize(tri.n0.xyz * b.x + tri.n1.xyz * b.y + tri.n2.xyz * b.z);
+        world_normal = transform_normal(instance.model_matrix, local_normal);
     } else {
         let screen_pos = vec2<f32>(f32(gid.x), f32(gid.y));
         let size_f = vec2<f32>(f32(params.screen_width), f32(params.screen_height));
@@ -420,15 +563,14 @@ fn cs_shadow_trace(@builtin(global_invocation_id) gid: vec3<u32>) {
         let ray_dir = normalize((params.view_inv * vec4<f32>(normalize(ray_target.xyz / ray_target.w), 0.0)).xyz);
         let ray_o = params.cam_pos.xyz;
         let t_grid = -ray_o.y / (ray_dir.y + 0.00001);
-        if (t_grid <= 0.0 || t_grid >= 100.0) {
+        if (t_grid <= 0.0 || t_grid >= 10000.0) {
             textureStore(pixel_shadow_out, pixel, vec4<f32>(1.0, 0.0, 0.0, 1.0));
             return;
         }
         world_pos = ray_o + ray_dir * t_grid;
-        world_normal = vec3<f32>(0.0, 1.0, 0.0);
     }
 
-    let shadow = trace_pixel_shadow(world_pos, world_normal, tri_id);
+    let shadow = trace_pixel_shadow(world_pos, world_normal, source_tri_id);
     textureStore(pixel_shadow_out, pixel, vec4<f32>(shadow, 0.0, 0.0, 1.0));
 }
 
@@ -546,6 +688,9 @@ fn cs_ap3(@builtin(global_invocation_id) gid: vec3<u32>) {
         let shadow = shadow_at_pixel(screen_coord);
 
         var final_col = tex_color * diff * shadow;
+        let ray_dir = normalize(world_pos - params.cam_pos.xyz);
+        let view_dist = distance(params.cam_pos.xyz, world_pos);
+        final_col = apply_distance_fog(final_col, view_dist, ray_dir);
         final_col = pow(final_col, vec3<f32>(1.0 / 2.2));
         textureStore(output_texture, screen_coord, vec4<f32>(final_col, 1.0));
     }
@@ -563,9 +708,9 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let ray_dir = normalize((params.view_inv * vec4<f32>(normalize(ray_target.xyz / ray_target.w), 0.0)).xyz);
     let ray_o = params.cam_pos.xyz;
 
-    var bg_col = vec3<f32>(0.1, 0.1, 0.12);
+    var bg_col = volumetric_clouds(ray_o, ray_dir, sky_color(ray_dir));
     let t_grid = -ray_o.y / (ray_dir.y + 0.00001);
-    if (t_grid > 0.0 && t_grid < 100.0) {
+    if (t_grid > 0.0 && t_grid < 10000.0) {
         let p = ray_o + ray_dir * t_grid;
         let cell = floor(p.xz);
         let checker = select(0.0, 1.0, (i32(cell.x + cell.y) & 1) == 0);
@@ -578,7 +723,9 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
         bg_col = mix(bg_col, vec3<f32>(0.75, 0.18, 0.18), axis_x * 0.7);
         bg_col = mix(bg_col, vec3<f32>(0.18, 0.35, 0.75), axis_z * 0.7);
         bg_col *= shadow_at_pixel(screen_coord);
+        bg_col = apply_distance_fog(bg_col, t_grid, ray_dir);
     }
+    bg_col = pow(bg_col, vec3<f32>(1.0 / 2.2));
     textureStore(output_texture, screen_coord, vec4<f32>(bg_col, 1.0));
 }
 
@@ -768,6 +915,10 @@ struct DepthFragmentOutput {
 
 @fragment
 fn fs_depth(in: DepthVertexOutput) -> DepthFragmentOutput {
+    if (ground_occludes_world_pos(in.world_pos)) {
+        discard;
+    }
+
     let packed_tri = ((in.instance_id + 1u) << 24u) | (in.triangle_id + 1u);
     let projected = warped_screen_clip(in.world_pos, in.warp_normal);
     if (projected.w > 0.0) {
@@ -885,6 +1036,10 @@ fn vs_mesh(
 
 @fragment
 fn fs_mesh(in: MeshVertexOutput) -> @location(0) vec4<f32> {
+    if (ground_occludes_world_pos(in.world_pos)) {
+        discard;
+    }
+
     let tri = triangles[in.global_tri_idx];
     let instance = instances[in.instance_id];
     let v0 = (instance.model_matrix * tri.v0).xyz;

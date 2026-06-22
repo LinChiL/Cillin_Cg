@@ -95,7 +95,7 @@ impl Default for Params {
 impl Params {
     pub fn update_matrices(&mut self, camera: &Camera, width: u32, height: u32) {
         let view = camera.get_view_matrix();
-        let proj = glam::Mat4::perspective_rh(45.0f32.to_radians(), width as f32 / height as f32, 0.1, 1000.0);
+        let proj = glam::Mat4::perspective_rh(45.0f32.to_radians(), width as f32 / height as f32, 0.1, 10000.0);
         
         self.view_inv = view.inverse().to_cols_array_2d();
         self.proj_inv = proj.inverse().to_cols_array_2d();
@@ -165,7 +165,7 @@ impl Camera {
     // 根据鼠标屏幕坐标生成世界空间射线
     pub fn get_ray(&self, mouse_x: f32, mouse_y: f32, width: u32, height: u32) -> (glam::Vec3, glam::Vec3) {
         let aspect_ratio = width as f32 / height as f32;
-        let proj = glam::Mat4::perspective_rh(45.0f32.to_radians(), aspect_ratio, 0.1, 1000.0);
+        let proj = glam::Mat4::perspective_rh(45.0f32.to_radians(), aspect_ratio, 0.1, 10000.0);
         let view = self.get_view_matrix();
         let inv_vp = (proj * view).inverse();
 

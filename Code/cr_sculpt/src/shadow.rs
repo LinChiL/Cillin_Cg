@@ -4,6 +4,11 @@ pub struct ShadowSystem {
     bind_group_layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
     pipeline: wgpu::ComputePipeline,
+    binning_pipeline: wgpu::ComputePipeline,
+    pub grid_head_buffer: wgpu::Buffer,
+    pub grid_node_buffer: wgpu::Buffer,
+    pub global_counter_buffer: wgpu::Buffer,
+    max_nodes: u32,
     width: u32,
     height: u32,
 }
@@ -17,6 +22,10 @@ pub struct ShadowInputs<'a> {
     pub world_pos_view: &'a wgpu::TextureView,
     pub normal_view: &'a wgpu::TextureView,
 }
+
+const GRID_RES: u32 = 1024;
+const GRID_CELLS: u64 = (1024 * 1024) as u64;
+const MAX_NODES: u32 = 8_000_000;
 
 impl ShadowSystem {
     pub fn new(
@@ -41,6 +50,25 @@ impl ShadowSystem {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let grid_head_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Sun Grid Head Buffer"),
+            size: GRID_CELLS * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let grid_node_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Sun Grid Node Pool Buffer"),
+            size: MAX_NODES as u64 * 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let global_counter_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Sun Grid Global Counter Buffer"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Pixel Shadow Bind Group Layout"),
@@ -125,6 +153,36 @@ impl ShadowSystem {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 18,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 19,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 20,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -139,8 +197,22 @@ impl ShadowSystem {
             module: shader,
             entry_point: "cs_shadow_trace",
         });
+        let binning_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Sun Grid Binning Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: shader,
+            entry_point: "cs_binning",
+        });
 
-        let bind_group = Self::create_bind_group(device, &bind_group_layout, &view, inputs);
+        let bind_group = Self::create_bind_group(
+            device,
+            &bind_group_layout,
+            &view,
+            &grid_head_buffer,
+            &grid_node_buffer,
+            &global_counter_buffer,
+            inputs,
+        );
 
         Self {
             texture,
@@ -148,12 +220,23 @@ impl ShadowSystem {
             bind_group_layout,
             bind_group,
             pipeline,
+            binning_pipeline,
+            grid_head_buffer,
+            grid_node_buffer,
+            global_counter_buffer,
+            max_nodes: MAX_NODES,
             width,
             height,
         }
     }
 
-    pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32, inputs: ShadowInputs<'_>) {
+    pub fn resize(
+        &mut self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        inputs: ShadowInputs<'_>,
+    ) {
         self.width = width;
         self.height = height;
         self.texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -171,23 +254,52 @@ impl ShadowSystem {
             view_formats: &[],
         });
         self.view = self.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.bind_group = Self::create_bind_group(device, &self.bind_group_layout, &self.view, inputs);
+        self.bind_group = Self::create_bind_group(
+            device,
+            &self.bind_group_layout,
+            &self.view,
+            &self.grid_head_buffer,
+            &self.grid_node_buffer,
+            &self.global_counter_buffer,
+            inputs,
+        );
     }
 
-    pub fn run(&self, encoder: &mut wgpu::CommandEncoder) {
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("Pixel Shadow Trace"),
-            timestamp_writes: None,
-        });
-        cpass.set_pipeline(&self.pipeline);
-        cpass.set_bind_group(0, &self.bind_group, &[]);
-        cpass.dispatch_workgroups((self.width + 7) / 8, (self.height + 7) / 8, 1);
+    pub fn run(&self, encoder: &mut wgpu::CommandEncoder, instance_count: u32) {
+        // 每帧清零 head 指针和计数器（节点池本身无需清空）
+        encoder.clear_buffer(&self.grid_head_buffer, 0, None);
+        encoder.clear_buffer(&self.global_counter_buffer, 0, None);
+
+        // 第一阶段：几何分箱（GPU 链表插入）
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Sun Grid Binning Pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.binning_pipeline);
+            cpass.set_bind_group(0, &self.bind_group, &[]);
+            cpass.dispatch_workgroups(1562, instance_count.max(1), 1);
+        }
+
+        // 第二阶段：像素阴影追踪（链表遍历）
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Pixel Shadow Trace"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.pipeline);
+            cpass.set_bind_group(0, &self.bind_group, &[]);
+            cpass.dispatch_workgroups((self.width + 7) / 8, (self.height + 7) / 8, 1);
+        }
     }
 
     fn create_bind_group(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
         shadow_view: &wgpu::TextureView,
+        grid_head: &wgpu::Buffer,
+        grid_nodes: &wgpu::Buffer,
+        global_counter: &wgpu::Buffer,
         inputs: ShadowInputs<'_>,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -202,6 +314,9 @@ impl ShadowSystem {
                 wgpu::BindGroupEntry { binding: 10, resource: inputs.warp_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(inputs.normal_view) },
                 wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::TextureView(shadow_view) },
+                wgpu::BindGroupEntry { binding: 18, resource: grid_head.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 19, resource: grid_nodes.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 20, resource: global_counter.as_entire_binding() },
             ],
         })
     }
