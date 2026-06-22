@@ -252,9 +252,17 @@ pub struct SceneInstance {
     pub model_matrix: [[f32; 4]; 4],
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SceneCamera {
+    pub eye: [f32; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+}
+
 /// 场景序列化：整个场景
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SceneData {
     pub instances: Vec<SceneInstance>,
-
+    #[serde(default)]
+    pub camera: Option<SceneCamera>,
 }

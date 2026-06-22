@@ -838,6 +838,11 @@ impl<'a> App<'a> {
                 instance_id: inst.instance_id,
                 model_matrix: inst.model_matrix,
             }).collect(),
+            camera: Some(math::SceneCamera {
+                eye: self.camera.eye.into(),
+                yaw: self.camera.yaw,
+                pitch: self.camera.pitch,
+            }),
         };
         match serde_json::to_string_pretty(&scene) {
             Ok(json) => {
@@ -873,6 +878,11 @@ impl<'a> App<'a> {
         }
         if !self.instances.is_empty() {
             self.queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&self.instances));
+        }
+        if let Some(cam) = scene.camera {
+            self.camera = math::Camera::new(cam.eye.into(), cam.yaw, cam.pitch);
+            println!("已还原摄像机位置: eye=({:.1},{:.1},{:.1}) yaw={:.1} pitch={:.1}",
+                cam.eye[0], cam.eye[1], cam.eye[2], cam.yaw, cam.pitch);
         }
         println!("已加载 {} 个实例", scene.instances.len());
         true
