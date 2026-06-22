@@ -506,11 +506,11 @@ fn trace_pixel_shadow(world_pos: vec3<f32>, world_normal: vec3<f32>, source_tri_
         if (node.packed_tri_id != source_tri_id) {
             let instance_id = (node.packed_tri_id >> 20u) - 1u;
             let tri_idx = (node.packed_tri_id & 0x000fffffu) - 1u;
-            let instance = instances[instance_id];
+            let model_matrix = instances[instance_id].model_matrix;
             let tri = triangles[tri_idx];
-            let a = (instance.model_matrix * tri.v0).xyz;
-            let b = (instance.model_matrix * tri.v1).xyz;
-            let c = (instance.model_matrix * tri.v2).xyz;
+            let a = model_matrix[0].xyz * tri.v0.x + model_matrix[1].xyz * tri.v0.y + model_matrix[2].xyz * tri.v0.z + model_matrix[3].xyz;
+            let b = model_matrix[0].xyz * tri.v1.x + model_matrix[1].xyz * tri.v1.y + model_matrix[2].xyz * tri.v1.z + model_matrix[3].xyz;
+            let c = model_matrix[0].xyz * tri.v2.x + model_matrix[1].xyz * tri.v2.y + model_matrix[2].xyz * tri.v2.z + model_matrix[3].xyz;
             let t = ray_triangle_t(origin, light_dir, a, b, c);
             if (t > self_shadow_bias && t < 10000.0) {
                 let blocker_instance_id = node.packed_tri_id >> 20u;
@@ -1033,10 +1033,12 @@ fn fs_depth(in: DepthVertexOutput) -> DepthFragmentOutput {
                 radius = 1i;
             }
 
+            let radius_sq_limit = f32(radius * radius) + 0.25;
             for (var oy = -radius; oy <= radius; oy = oy + 1) {
+                let oy_sq = f32(oy * oy);
                 for (var ox = -radius; ox <= radius; ox = ox + 1) {
-                    let offset = vec2<f32>(f32(ox), f32(oy));
-                    if (dot(offset, offset) <= f32(radius * radius) + 0.25) {
+                    let dist_sq = f32(ox * ox) + oy_sq;
+                    if (dist_sq <= radius_sq_limit) {
                         write_warp_pixel(base_target + vec2<i32>(ox, oy), source, packed_tri, projected.z, in.barycentric);
                     }
                 }
@@ -1073,13 +1075,25 @@ fn fs_depth(in: DepthVertexOutput) -> DepthFragmentOutput {
                 let max_step = i32(clamp(8.0 - max(dist - 60.0, 0.0) / 20.0, 1.0, 8.0));
                 let x_steps = min(max(i32(ceil(fast_dx)), 1), max_step);
                 let y_steps = min(max(i32(ceil(fast_dy)), 1), max_step);
+                let dx_p = stable_proj_dx / f32(x_steps);
+                let dx_b = stable_bary_dx / f32(x_steps);
+                let dy_p = stable_proj_dy / f32(y_steps);
+                let dy_b = stable_bary_dy / f32(y_steps);
+
+                let start_p = projected - stable_proj_dx * 0.5 - stable_proj_dy * 0.5;
+                let start_b = in.barycentric - stable_bary_dx * 0.5 - stable_bary_dy * 0.5;
+
                 for (var sy = 0i; sy <= y_steps; sy = sy + 1) {
-                    let v = f32(sy) / f32(y_steps) - 0.5;
+                    let row_p = start_p + dy_p * f32(sy);
+                    let row_b = start_b + dy_b * f32(sy);
+
+                    var curr_p = row_p;
+                    var curr_b = row_b;
+
                     for (var sx = 0i; sx <= x_steps; sx = sx + 1) {
-                        let u = f32(sx) / f32(x_steps) - 0.5;
-                        let p = projected + stable_proj_dx * u + stable_proj_dy * v;
-                        let b = in.barycentric + stable_bary_dx * u + stable_bary_dy * v;
-                        write_warp_pixel(vec2<i32>(i32(floor(p.x)), i32(floor(p.y))), source, packed_tri, p.z, b);
+                        write_warp_pixel(vec2<i32>(i32(floor(curr_p.x)), i32(floor(curr_p.y))), source, packed_tri, curr_p.z, curr_b.xyz);
+                        curr_p = curr_p + dx_p;
+                        curr_b = curr_b + dx_b;
                     }
                 }
             }
