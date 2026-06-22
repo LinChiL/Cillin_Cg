@@ -704,14 +704,17 @@ fn cs_ap3(@builtin(global_invocation_id) gid: vec3<u32>) {
         let local_n = normalize(tri.n0.xyz * b.x + tri.n1.xyz * b.y + tri.n2.xyz * b.z);
         let macro_n = transform_normal(instance.model_matrix, local_n);
 
-        let eps = 0.002;
-        let freq = max(params.distort_frequency, 0.001);
-        let h_center = fbm(world_pos * 10.0 * freq);
-        let h_x = fbm((world_pos + vec3<f32>(eps, 0.0, 0.0)) * 10.0 * freq);
-        let h_y = fbm((world_pos + vec3<f32>(0.0, eps, 0.0)) * 10.0 * freq);
-        let h_z = fbm((world_pos + vec3<f32>(0.0, 0.0, eps)) * 10.0 * freq);
-        let grad = vec3<f32>(h_x - h_center, h_y - h_center, h_z - h_center) / eps;
-        let final_n = normalize(macro_n - grad * params.distort_strength);
+        var final_n = macro_n;
+        if (params.distort_strength > 0.001) {
+            let eps = 0.002;
+            let freq = max(params.distort_frequency, 0.001);
+            let h_center = fbm(world_pos * 10.0 * freq);
+            let h_x = fbm((world_pos + vec3<f32>(eps, 0.0, 0.0)) * 10.0 * freq);
+            let h_y = fbm((world_pos + vec3<f32>(0.0, eps, 0.0)) * 10.0 * freq);
+            let h_z = fbm((world_pos + vec3<f32>(0.0, 0.0, eps)) * 10.0 * freq);
+            let grad = vec3<f32>(h_x - h_center, h_y - h_center, h_z - h_center) / eps;
+            final_n = normalize(macro_n - grad * params.distort_strength);
+        }
 
         let L = normalize(vec3<f32>(0.5, 1.0, 0.5));
         let diff = max(dot(final_n, L), 0.0) * 0.8 + 0.2;
@@ -1013,17 +1016,23 @@ fn fs_depth(in: DepthVertexOutput) -> DepthFragmentOutput {
         let stable_bary_dx = bary_dx * area_scale;
         let stable_bary_dy = bary_dy * area_scale;
 
-        // 【自适应 LOD】0~60 米保持最大 8 步；60~220 米平滑衰减至 1 步
-        let max_step = i32(clamp(8.0 - max(dist - 60.0, 0.0) / 20.0, 1.0, 8.0));
-        let x_steps = min(max(i32(ceil(length(stable_proj_dx.xy))), 1), max_step);
-        let y_steps = min(max(i32(ceil(length(stable_proj_dy.xy))), 1), max_step);
-        for (var sy = 0i; sy <= y_steps; sy = sy + 1) {
-            let v = f32(sy) / f32(y_steps) - 0.5;
-            for (var sx = 0i; sx <= x_steps; sx = sx + 1) {
-                let u = f32(sx) / f32(x_steps) - 0.5;
-                let p = projected + stable_proj_dx * u + stable_proj_dy * v;
-                let b = in.barycentric + stable_bary_dx * u + stable_bary_dy * v;
-                write_warp_pixel(vec2<i32>(i32(floor(p.x)), i32(floor(p.y))), source, packed_tri, p.z, b);
+        let fast_dx = length(stable_proj_dx.xy);
+        let fast_dy = length(stable_proj_dy.xy);
+
+        if (fast_dx <= 1.2 && fast_dy <= 1.2) {
+            write_warp_pixel(base_target, source, packed_tri, projected.z, in.barycentric);
+        } else {
+            let max_step = i32(clamp(8.0 - max(dist - 60.0, 0.0) / 20.0, 1.0, 8.0));
+            let x_steps = min(max(i32(ceil(fast_dx)), 1), max_step);
+            let y_steps = min(max(i32(ceil(fast_dy)), 1), max_step);
+            for (var sy = 0i; sy <= y_steps; sy = sy + 1) {
+                let v = f32(sy) / f32(y_steps) - 0.5;
+                for (var sx = 0i; sx <= x_steps; sx = sx + 1) {
+                    let u = f32(sx) / f32(x_steps) - 0.5;
+                    let p = projected + stable_proj_dx * u + stable_proj_dy * v;
+                    let b = in.barycentric + stable_bary_dx * u + stable_bary_dy * v;
+                    write_warp_pixel(vec2<i32>(i32(floor(p.x)), i32(floor(p.y))), source, packed_tri, p.z, b);
+                }
             }
         }
     }
