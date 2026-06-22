@@ -131,6 +131,20 @@ fn fbm(p: vec3<f32>) -> f32 {
     return v;
 }
 
+fn fbm_lod(p: vec3<f32>, octaves: i32) -> f32 {
+    var v = 0.0;
+    var a = 0.5;
+    let shift = vec3<f32>(100.0);
+    var p_mut = p;
+    for (var i = 0; i < 6; i = i + 1) {
+        if (i >= octaves) { break; }
+        v = v + a * noise(p_mut);
+        p_mut = p_mut * 2.0 + shift;
+        a = a * 0.5;
+    }
+    return v;
+}
+
 fn warp_displacement(world_pos: vec3<f32>) -> f32 {
     let frequency = max(params.distort_frequency, 0.001);
     let roughness = fbm(world_pos * 10.0 * frequency);
@@ -706,12 +720,19 @@ fn cs_ap3(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         var final_n = macro_n;
         if (params.distort_strength > 0.001) {
+            let dist = distance(params.cam_pos.xyz, world_pos);
+            var octaves = 6;
+            if (dist > 120.0) {
+                octaves = 1;
+            } else if (dist > 40.0) {
+                octaves = 3;
+            }
             let eps = 0.002;
             let freq = max(params.distort_frequency, 0.001);
-            let h_center = fbm(world_pos * 10.0 * freq);
-            let h_x = fbm((world_pos + vec3<f32>(eps, 0.0, 0.0)) * 10.0 * freq);
-            let h_y = fbm((world_pos + vec3<f32>(0.0, eps, 0.0)) * 10.0 * freq);
-            let h_z = fbm((world_pos + vec3<f32>(0.0, 0.0, eps)) * 10.0 * freq);
+            let h_center = fbm_lod(world_pos * 10.0 * freq, octaves);
+            let h_x = fbm_lod((world_pos + vec3<f32>(eps, 0.0, 0.0)) * 10.0 * freq, octaves);
+            let h_y = fbm_lod((world_pos + vec3<f32>(0.0, eps, 0.0)) * 10.0 * freq, octaves);
+            let h_z = fbm_lod((world_pos + vec3<f32>(0.0, 0.0, eps)) * 10.0 * freq, octaves);
             let grad = vec3<f32>(h_x - h_center, h_y - h_center, h_z - h_center) / eps;
             final_n = normalize(macro_n - grad * params.distort_strength);
         }
@@ -953,13 +974,11 @@ fn fs_depth(in: DepthVertexOutput) -> DepthFragmentOutput {
     }
 
     let packed_tri = ((in.instance_id + 1u) << 20u) | (in.triangle_id + 1u);
+
     let projected = warped_screen_clip(in.world_pos, in.warp_normal);
     if (projected.w > 0.0) {
         let base_target = vec2<i32>(i32(floor(projected.x)), i32(floor(projected.y)));
 
-        // -----------------------------------------------------------
-        // 【方案三核心优化：粗糙 Early-Z 预判】
-        // -----------------------------------------------------------
         if (base_target.x >= 0 && base_target.x < i32(params.screen_width) &&
             base_target.y >= 0 && base_target.y < i32(params.screen_height)) {
             let check_idx = u32(base_target.y) * params.screen_width + u32(base_target.x);
@@ -972,14 +991,11 @@ fn fs_depth(in: DepthVertexOutput) -> DepthFragmentOutput {
 
         let source = vec2<i32>(i32(floor(in.position.x)), i32(floor(in.position.y)));
         let view_dir = normalize(params.cam_pos.xyz - in.world_pos);
-
-        // 【代码自适应 LOD】片元与相机的距离，用于后续动态降级
         let dist = distance(params.cam_pos.xyz, in.world_pos);
 
         let facing = abs(dot(normalize(in.world_normal), view_dir));
         let grazing_coverage = 1.0 - smoothstep(0.08, 0.35, facing);
 
-        // 【自适应 LOD】超过 100 米自动强制降为 1 像素半径，消除多余原子写入
         var radius = select(1i, 3i, grazing_coverage > 0.35);
         if (dist > 100.0) {
             radius = 1i;

@@ -265,32 +265,32 @@ impl ShadowSystem {
         );
     }
 
-    pub fn run(&self, encoder: &mut wgpu::CommandEncoder, instance_count: u32) {
-        // 每帧清零 head 指针和计数器（节点池本身无需清空）
+    pub fn clear_and_bin(&self, encoder: &mut wgpu::CommandEncoder, instance_count: u32) {
         encoder.clear_buffer(&self.grid_head_buffer, 0, None);
         encoder.clear_buffer(&self.global_counter_buffer, 0, None);
 
-        // 第一阶段：几何分箱（GPU 链表插入）
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Sun Grid Binning Pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.binning_pipeline);
-            cpass.set_bind_group(0, &self.bind_group, &[]);
-            cpass.dispatch_workgroups(1562, instance_count.max(1), 1);
-        }
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("Sun Grid Binning Pass"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&self.binning_pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch_workgroups(1562, instance_count.max(1), 1);
+    }
 
-        // 第二阶段：像素阴影追踪（链表遍历）
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Pixel Shadow Trace"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.pipeline);
-            cpass.set_bind_group(0, &self.bind_group, &[]);
-            cpass.dispatch_workgroups((self.width + 7) / 8, (self.height + 7) / 8, 1);
-        }
+    pub fn trace_shadow(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("Pixel Shadow Trace"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&self.pipeline);
+        cpass.set_bind_group(0, &self.bind_group, &[]);
+        cpass.dispatch_workgroups((self.width + 7) / 8, (self.height + 7) / 8, 1);
+    }
+
+    pub fn run(&self, encoder: &mut wgpu::CommandEncoder, instance_count: u32) {
+        self.clear_and_bin(encoder, instance_count);
+        self.trace_shadow(encoder);
     }
 
     fn create_bind_group(

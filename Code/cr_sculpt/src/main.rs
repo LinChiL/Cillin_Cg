@@ -52,11 +52,15 @@ struct PerfStats {
     surface_acquire_ms: f32,  // get_current_texture (含 vsync 等待)
     submit_present_ms: f32,   // submit + present
     // GPU 时间 (ms) - 来自 Timestamp Query
+    gpu_clear_warp_ms: f32,
     gpu_depth_ms: f32,
     gpu_compute_ms: f32,
+    gpu_shadow_bin_ms: f32,
+    gpu_shadow_trace_ms: f32,
     gpu_ap3_ms: f32,
     gpu_draw_ms: f32,
     gpu_scaffold_ms: f32,
+    gpu_ui_ms: f32,
     gpu_total_ms: f32,
     // Draw calls
     depth_draw_calls: u32,
@@ -90,11 +94,15 @@ impl PerfStats {
             buffer_upload_ms: 0.0,
             surface_acquire_ms: 0.0,
             submit_present_ms: 0.0,
+            gpu_clear_warp_ms: 0.0,
             gpu_depth_ms: 0.0,
             gpu_compute_ms: 0.0,
+            gpu_shadow_bin_ms: 0.0,
+            gpu_shadow_trace_ms: 0.0,
             gpu_ap3_ms: 0.0,
             gpu_draw_ms: 0.0,
             gpu_scaffold_ms: 0.0,
+            gpu_ui_ms: 0.0,
             gpu_total_ms: 0.0,
             depth_draw_calls: 0,
             forward_draw_calls: 0,
@@ -1908,18 +1916,18 @@ impl<'a> App<'a> {
         // GPU Timestamp Query (在 device move 之前创建)
         let ts_query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("Timestamp Query Set"),
-            count: 8,
+            count: 10,
             ty: wgpu::QueryType::Timestamp,
         });
         let ts_resolve_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Timestamp Resolve Buffer"),
-            size: 8 * 8,
+            size: 10 * 8,
             usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let ts_staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Timestamp Staging Buffer"),
-            size: 8 * 8,
+            size: 10 * 8,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -2896,29 +2904,39 @@ impl<'a> App<'a> {
         // === GPU Timestamp: 帧开始 ===
         encoder.write_timestamp(&self.ts_query_set, 0);
 
-        // 执行各个渲染 Pass
+        // T0→T1: Clear WarpBuffer
         self.clear_warp_buffer(&mut encoder);
-        
-        self.run_depth_pass(&mut encoder, &instances_to_draw);
-        encoder.write_timestamp(&self.ts_query_set, 1); // depth 结束
-        
-        self.run_compute_pass(&mut encoder);
-        encoder.write_timestamp(&self.ts_query_set, 2); // compute 结束
+        encoder.write_timestamp(&self.ts_query_set, 1);
 
-        self.run_shadow_pass(&mut encoder);
-        
+        // T1→T2: Depth MRT Pass
+        self.run_depth_pass(&mut encoder, &instances_to_draw);
+        encoder.write_timestamp(&self.ts_query_set, 2);
+
+        // T2→T3: Compute SDF BG
+        self.run_compute_pass(&mut encoder);
+        encoder.write_timestamp(&self.ts_query_set, 3);
+
+        // T3→T4: Shadow Binning (clear + linked-list insert)
+        self.shadow_system.clear_and_bin(&mut encoder, instances_to_draw.len() as u32);
+        encoder.write_timestamp(&self.ts_query_set, 4);
+
+        // T4→T5: Shadow Tracing (per-pixel ray traversal)
+        self.shadow_system.trace_shadow(&mut encoder);
+        encoder.write_timestamp(&self.ts_query_set, 5);
+
+        // T5→T6: AP3 Shading
         self.run_ap3_pass(&mut encoder);
-        encoder.write_timestamp(&self.ts_query_set, 3); // ap3 结束
-        
-        // self.run_forward_pass(&mut encoder, &self.output_texture_view, &instances_to_draw);
-        
+        encoder.write_timestamp(&self.ts_query_set, 6);
+
         if self.debug_mode != 6 {
             self.run_draw_pass(&mut encoder, &view);
         }
-        encoder.write_timestamp(&self.ts_query_set, 4); // draw 结束
-        
+        // T6→T7: Draw Blit
+        encoder.write_timestamp(&self.ts_query_set, 7);
+
         self.run_scaffold_pass(&mut encoder, &view);
-        encoder.write_timestamp(&self.ts_query_set, 5); // scaffold 结束
+        // T7→T8: Scaffold
+        encoder.write_timestamp(&self.ts_query_set, 8);
 
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [self.config.width, self.config.height],
@@ -2926,21 +2944,22 @@ impl<'a> App<'a> {
         };
         self.egui_renderer.update_buffers(&self.device, &self.queue, &mut encoder, &paint_jobs, &screen_descriptor);
         self.run_ui_pass(&mut encoder, &view, &paint_jobs, &screen_descriptor);
-        encoder.write_timestamp(&self.ts_query_set, 6); // ui 结束
+        // T8→T9: UI Overlay
+        encoder.write_timestamp(&self.ts_query_set, 9);
 
         // 处理纹理释放
         for id in &full_output.textures_delta.free {
             self.egui_renderer.free_texture(id);
         }
 
-        // === Resolve Timestamps ===
-        encoder.resolve_query_set(&self.ts_query_set, 0..7, &self.ts_resolve_buffer, 0);
+        // === Resolve Timestamps (0..10) ===
+        encoder.resolve_query_set(&self.ts_query_set, 0..10, &self.ts_resolve_buffer, 0);
         encoder.copy_buffer_to_buffer(
             &self.ts_resolve_buffer,
             0,
             &self.ts_staging_buffer,
             0,
-            8 * 7, // 7 intervals * 8 bytes
+            8 * 10,
         );
 
         let tsp = std::time::Instant::now();
@@ -2948,20 +2967,20 @@ impl<'a> App<'a> {
         output.present();
         let submit_present_ms = tsp.elapsed().as_secs_f32() * 1000.0;
 
-        // === 异步读取 Timestamp 结果 ===
-        let (gpu_depth_ms, gpu_compute_ms, gpu_ap3_ms, gpu_draw_ms, gpu_scaffold_ms, gpu_total_ms) = {
+        // === 异步读取 Timestamp 结果 (10 probes → 9 intervals) ===
+        let (gpu_clear_warp_ms, gpu_depth_ms, gpu_compute_ms, gpu_shadow_bin_ms, gpu_shadow_trace_ms, gpu_ap3_ms, gpu_draw_ms, gpu_scaffold_ms, gpu_ui_ms, gpu_total_ms) = {
             let buffer_slice = self.ts_staging_buffer.slice(..);
             let (tx, rx) = std::sync::mpsc::channel();
             buffer_slice.map_async(wgpu::MapMode::Read, move |result| { tx.send(result).unwrap(); });
             self.device.poll(wgpu::Maintain::Wait);
-            if rx.recv().is_ok() && buffer_slice.get_mapped_range().len() >= 56 {
+            if rx.recv().is_ok() && buffer_slice.get_mapped_range().len() >= 80 {
                 let data = buffer_slice.get_mapped_range();
                 let timestamps: &[u64] = bytemuck::cast_slice(&data);
-                let period_ns = self.queue.get_timestamp_period() as f64; // 纳秒/计数
+                let period_ns = self.queue.get_timestamp_period() as f64;
                 
                 fn ts_diff(a: u64, b: u64, period: f64) -> f32 {
                     if a > b || period <= 0.0 { return 0.0; }
-                    ((b - a) as f64 * period / 1_000_000.0) as f32 // 转换为 ms
+                    ((b - a) as f64 * period / 1_000_000.0) as f32
                 }
                 
                 let p = period_ns;
@@ -2971,10 +2990,14 @@ impl<'a> App<'a> {
                     ts_diff(timestamps[2], timestamps[3], p),
                     ts_diff(timestamps[3], timestamps[4], p),
                     ts_diff(timestamps[4], timestamps[5], p),
-                    ts_diff(timestamps[0], timestamps[6], p),
+                    ts_diff(timestamps[5], timestamps[6], p),
+                    ts_diff(timestamps[6], timestamps[7], p),
+                    ts_diff(timestamps[7], timestamps[8], p),
+                    ts_diff(timestamps[8], timestamps[9], p),
+                    ts_diff(timestamps[0], timestamps[9], p),
                 )
             } else {
-                (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
             }
         };
         self.ts_staging_buffer.unmap();
@@ -2993,16 +3016,20 @@ impl<'a> App<'a> {
             ap3_pass_ms: gpu_ap3_ms,
             draw_pass_ms: gpu_draw_ms,
             scaffold_pass_ms: gpu_scaffold_ms,
-            ui_pass_ms: (gpu_total_ms - gpu_depth_ms - gpu_compute_ms - gpu_ap3_ms - gpu_draw_ms - gpu_scaffold_ms).max(0.0),
+            ui_pass_ms: gpu_ui_ms,
             egui_build_ms,
             buffer_upload_ms,
             surface_acquire_ms,
             submit_present_ms,
+            gpu_clear_warp_ms,
             gpu_depth_ms,
             gpu_compute_ms,
+            gpu_shadow_bin_ms,
+            gpu_shadow_trace_ms,
             gpu_ap3_ms,
             gpu_draw_ms,
             gpu_scaffold_ms,
+            gpu_ui_ms,
             gpu_total_ms,
             depth_draw_calls: instances_to_draw.len() as u32,
             forward_draw_calls: 0,
@@ -3101,9 +3128,12 @@ impl<'a> App<'a> {
                                 ui.label(format!("{:.2} ms ({:.1}%)", ms, frac * 100.0));
                             });
                         }
-                        bar(ui, "Depth Pass", s.depth_pass_ms, total_gpu, egui::Color32::from_rgb(100, 149, 237));
-                        bar(ui, "Compute SDF", s.compute_pass_ms, total_gpu, egui::Color32::from_rgb(255, 165, 0));
-                        bar(ui, "AP3 (Warp)", s.ap3_pass_ms, total_gpu, egui::Color32::from_rgb(186, 85, 211));
+                        bar(ui, "Clear Warp", s.gpu_clear_warp_ms, total_gpu, egui::Color32::from_rgb(120, 120, 120));
+                        bar(ui, "Depth MRT", s.depth_pass_ms, total_gpu, egui::Color32::from_rgb(100, 149, 237));
+                        bar(ui, "Compute SDF", s.compute_pass_ms, total_gpu, egui::Color32::from_rgb(0, 191, 255));
+                        bar(ui, "Shadow Bin", s.gpu_shadow_bin_ms, total_gpu, egui::Color32::from_rgb(255, 127, 80));
+                        bar(ui, "Shadow Trace", s.gpu_shadow_trace_ms, total_gpu, egui::Color32::from_rgb(255, 69, 0));
+                        bar(ui, "AP3 Shading", s.ap3_pass_ms, total_gpu, egui::Color32::from_rgb(186, 85, 211));
                         bar(ui, "Draw Blit", s.draw_pass_ms, total_gpu, egui::Color32::from_rgb(60, 179, 113));
                         bar(ui, "Scaffold", s.scaffold_pass_ms, total_gpu, egui::Color32::from_rgb(230, 180, 40));
                         bar(ui, "UI Overlay", s.ui_pass_ms, total_gpu, egui::Color32::GRAY);
