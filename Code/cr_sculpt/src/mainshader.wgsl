@@ -81,7 +81,7 @@ struct WarpPixel {
 
 // 太阳空间网格分箱（阴影加速）
 const GRID_RES = 1024u;
-const GRID_HALF_SIZE = 400.0;
+const GRID_HALF_SIZE = 1000.0;
 const MAX_SHADOW_LIST_STEPS = 4096u;
 
 struct GridNode {
@@ -421,8 +421,14 @@ fn world_to_sun_grid(w: vec3<f32>) -> vec2<i32> {
     if (abs(L.y) > 0.99) { Up = vec3<f32>(0.0, 0.0, 1.0); }
     let U = normalize(cross(L, Up));
     let V = cross(L, U);
-    let x_proj = dot(w, U);
-    let y_proj = dot(w, V);
+
+    // 【核心改动】将世界坐标 w 偏置到以相机当前 XZ 坐标为中心
+    // 这样无论场景物体多远，只要在相机周围 GRID_HALF_SIZE 范围内，就能获得阴影
+    let camera_anchor = vec3<f32>(params.cam_pos.x, 0.0, params.cam_pos.z);
+    let relative_w = w - camera_anchor;
+
+    let x_proj = dot(relative_w, U);
+    let y_proj = dot(relative_w, V);
     let u = i32(((x_proj / GRID_HALF_SIZE) * 0.5 + 0.5) * f32(GRID_RES));
     let v = i32(((y_proj / GRID_HALF_SIZE) * 0.5 + 0.5) * f32(GRID_RES));
     return vec2<i32>(u, v);
@@ -451,7 +457,14 @@ fn ray_triangle_t(origin: vec3<f32>, dir: vec3<f32>, a: vec3<f32>, b: vec3<f32>,
 fn trace_pixel_shadow(world_pos: vec3<f32>, world_normal: vec3<f32>, source_tri_id: u32) -> f32 {
     let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.5));
     let n = normalize(world_normal);
-    let normal_shadow = mix(0.45, 1.0, smoothstep(0.0, 0.35, dot(n, light_dir)));
+
+    // 【核心优化 1】背光面直接判定为阴影，跳过所有链表和求交计算
+    let cos_theta = dot(n, light_dir);
+    if (cos_theta <= 0.0) {
+        return 0.35;
+    }
+
+    let normal_shadow = mix(0.45, 1.0, smoothstep(0.0, 0.35, cos_theta));
     let origin = world_pos + n * 0.015 + light_dir * 0.02;
 
     if (light_dir.y < -0.001) {
@@ -470,8 +483,8 @@ fn trace_pixel_shadow(world_pos: vec3<f32>, world_normal: vec3<f32>, source_tri_
     while (curr_node_idx != 0u && steps < MAX_SHADOW_LIST_STEPS) {
         let node = grid_nodes[curr_node_idx];
         if (node.packed_tri_id != source_tri_id) {
-            let instance_id = (node.packed_tri_id >> 24u) - 1u;
-            let tri_idx = (node.packed_tri_id & 0x00ffffffu) - 1u;
+            let instance_id = (node.packed_tri_id >> 20u) - 1u;
+            let tri_idx = (node.packed_tri_id & 0x000fffffu) - 1u;
             let instance = instances[instance_id];
             let tri = triangles[tri_idx];
             let a = (instance.model_matrix * tri.v0).xyz;
@@ -504,6 +517,14 @@ fn cs_binning(
     let w0 = (instance.model_matrix * tri.v0).xyz;
     let w1 = (instance.model_matrix * tri.v1).xyz;
     let w2 = (instance.model_matrix * tri.v2).xyz;
+
+    // 【核心优化 2】背向光源的三角形（Back-facing）不可能投射阴影，直接剔除
+    let face_normal = cross(w1 - w0, w2 - w0);
+    let light_dir = normalize(vec3<f32>(0.5, 1.0, 0.5));
+    if (dot(face_normal, light_dir) >= 0.0) {
+        return;
+    }
+
     let g0 = world_to_sun_grid(w0);
     let g1 = world_to_sun_grid(w1);
     let g2 = world_to_sun_grid(w2);
@@ -516,7 +537,16 @@ fn cs_binning(
     let x_max = min(x_max_raw, i32(GRID_RES - 1u));
     let y_min = max(y_min_raw, 0i);
     let y_max = min(y_max_raw, i32(GRID_RES - 1u));
-    let packed_tri_id = ((instance_idx + 1u) << 24u) | (global_tri_idx + 1u);
+
+    // 【核心优化 3】防止超大三角形过度分箱，挤占公共链表池
+    // 注意：GRID_RES=1024 时，同尺寸三角形覆盖格子数是 256 分辨率下的 16 倍，
+    //       因此阈值从 256 放宽到 4096 以容纳巨物表面
+    let binned_area = (x_max - x_min + 1) * (y_max - y_min + 1);
+    if (binned_area > 4096) {
+        return;
+    }
+
+    let packed_tri_id = ((instance_idx + 1u) << 20u) | (global_tri_idx + 1u);
     for (var y = y_min; y <= y_max; y = y + 1) {
         for (var x = x_min; x <= x_max; x = x + 1) {
             let cell_idx = u32(y) * GRID_RES + u32(x);
@@ -545,8 +575,8 @@ fn cs_shadow_trace(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     if (flags > 0u) {
         source_tri_id = warpBuffer[warp_idx].tri_id;
-        let instance_id = (source_tri_id >> 24u) - 1u;
-        let tri_idx = (source_tri_id & 0x00ffffffu) - 1u;
+        let instance_id = (source_tri_id >> 20u) - 1u;
+        let tri_idx = (source_tri_id & 0x000fffffu) - 1u;
         let instance = instances[instance_id];
         let tri = triangles[tri_idx];
         let b = warpBuffer[warp_idx].barycentric.xyz;
@@ -614,7 +644,7 @@ fn cs_ap3(@builtin(global_invocation_id) gid: vec3<u32>) {
             textureStore(output_texture, screen_coord, vec4<f32>(0.02, 0.02, 0.04, 1.0));
         } else {
             let tri_id = warpBuffer[warp_idx].tri_id;
-            let tri_idx = (tri_id & 0x00FFFFFFu) - 1u;
+            let tri_idx = (tri_id & 0x000FFFFFu) - 1u;
             let tri = triangles[tri_idx];
             let b = warpBuffer[warp_idx].barycentric.xyz;
             let sdf_debug = compute_triangle_local_sdf_debug(tri, b);
@@ -632,8 +662,8 @@ fn cs_ap3(@builtin(global_invocation_id) gid: vec3<u32>) {
             textureStore(output_texture, screen_coord, vec4<f32>(0.02, 0.02, 0.04, 1.0));
         } else {
             let tri_id = warpBuffer[warp_idx].tri_id;
-            let instance_id = (tri_id >> 24u) - 1u;
-            let tri_idx = (tri_id & 0x00FFFFFFu) - 1u;
+            let instance_id = (tri_id >> 20u) - 1u;
+            let tri_idx = (tri_id & 0x000FFFFFu) - 1u;
             let instance = instances[instance_id];
             let tri = triangles[tri_idx];
             let b = warpBuffer[warp_idx].barycentric.xyz;
@@ -656,8 +686,8 @@ fn cs_ap3(@builtin(global_invocation_id) gid: vec3<u32>) {
     // --- 最终着色 ---
     if (flags > 0u) {
         let tri_id = warpBuffer[warp_idx].tri_id;
-        let instance_id = (tri_id >> 24u) - 1u;
-        let tri_idx = (tri_id & 0x00FFFFFFu) - 1u;
+        let instance_id = (tri_id >> 20u) - 1u;
+        let tri_idx = (tri_id & 0x000FFFFFu) - 1u;
         let instance = instances[instance_id];
         let tri = triangles[tri_idx];
         let b = warpBuffer[warp_idx].barycentric.xyz;
@@ -919,7 +949,7 @@ fn fs_depth(in: DepthVertexOutput) -> DepthFragmentOutput {
         discard;
     }
 
-    let packed_tri = ((in.instance_id + 1u) << 24u) | (in.triangle_id + 1u);
+    let packed_tri = ((in.instance_id + 1u) << 20u) | (in.triangle_id + 1u);
     let projected = warped_screen_clip(in.world_pos, in.warp_normal);
     if (projected.w > 0.0) {
         let base_target = vec2<i32>(i32(floor(projected.x)), i32(floor(projected.y)));
