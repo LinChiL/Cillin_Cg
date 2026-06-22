@@ -256,4 +256,5 @@ pub struct SceneInstance {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SceneData {
     pub instances: Vec<SceneInstance>,
+
 }

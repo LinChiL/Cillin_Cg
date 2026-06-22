@@ -2180,7 +2180,7 @@ impl<'a> App<'a> {
         let data = buffer_slice.get_mapped_range();
         let picked = bytemuck::from_bytes::<math::WarpPixel>(&data[..pixel_size as usize]);
         let instance_idx = if picked.flags > 0 && picked.tri_id > 0 {
-            Some(((picked.tri_id >> 24) - 1) as usize)
+            Some(((picked.tri_id >> 20) - 1) as usize)
         } else {
             None
         };

@@ -493,6 +493,11 @@ fn trace_pixel_shadow(world_pos: vec3<f32>, world_normal: vec3<f32>, source_tri_
     }
     let cell_idx = u32(g.y) * GRID_RES + u32(g.x);
     var curr_node_idx = atomicLoad(&grid_head[cell_idx]);
+
+    if (curr_node_idx == 0u) {
+        return normal_shadow;
+    }
+
     var steps = 0u;
     while (curr_node_idx != 0u && steps < MAX_SHADOW_LIST_STEPS) {
         let node = grid_nodes[curr_node_idx];
